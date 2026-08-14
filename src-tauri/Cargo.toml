@@ -4,7 +4,7 @@ version = "1.0.28001"
 description = "MCPHub Desktop - A unified hub for MCP servers"
 authors = ["MCPHub Contributors"]
 license = "ISC"
-repository = "https://github.com/samanhappy/mcphub"
+repository = "https://github.com/sky110120/MCPHub-Desktop"
 edition = "2021"
 rust-version = "1.96.0"
 

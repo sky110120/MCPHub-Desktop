@@ -193,7 +193,7 @@ const LoginPage: React.FC = () => {
       {/* Top-right controls */}
       <div className="absolute top-3 right-4 z-20 flex items-center gap-1">
         <a
-          href="https://github.com/skrstop/mcphub-desktop"
+          href="https://github.com/sky110120/MCPHub-Desktop"
           target="_blank"
           rel="noopener noreferrer"
           className="hub-icon-btn"

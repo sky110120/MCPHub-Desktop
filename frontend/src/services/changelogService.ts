@@ -2,7 +2,7 @@ import { ApiResponse, apiGet } from '@/utils/fetchInterceptor';
 import { ChangelogUpdateInfo } from '@/types';
 import type { UpdateInfo } from '@/utils/version';
 
-const RELEASE_BASE = 'https://github.com/skrstop/MCPHub-Desktop/releases';
+const RELEASE_BASE = 'https://github.com/sky110120/MCPHub-Desktop/releases';
 
 /**
  * Build a `ChangelogUpdateInfo` from a Tauri updater result.

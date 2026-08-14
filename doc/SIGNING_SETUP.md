@@ -43,7 +43,7 @@ cat ~/.tauri/mcphub.key.pub
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/skrstop/MCPHub-Desktop/releases/latest/download/latest.json"
+        "https://github.com/sky110120/MCPHub-Desktop/releases/latest/download/latest.json"
       ],
       "pubkey": "你的公钥内容"
     }

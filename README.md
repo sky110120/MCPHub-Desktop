@@ -143,7 +143,7 @@ npm run build # 等价于 tauri build，产物输出至 src-tauri/target/release
 
 ## 安装使用
 
-从 [Releases](https://github.com/skrstop/MCPHub-Desktop/releases) 页面下载对应平台的安装包。
+从 [Releases](https://github.com/sky110120/MCPHub-Desktop/releases) 页面下载对应平台的安装包。
 
 ### macOS
 

@@ -39,7 +39,7 @@ dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHVwZGF0ZSBzaWduaW5nIGtleQpSV1JrTTNad0ZJek1n
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/skrstop/MCPHub-Desktop/releases/latest/download/latest.json"
+        "https://github.com/sky110120/MCPHub-Desktop/releases/latest/download/latest.json"
       ],
       "pubkey": "这里粘贴你的公钥内容"
     }

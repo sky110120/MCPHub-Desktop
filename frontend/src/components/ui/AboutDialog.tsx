@@ -294,7 +294,7 @@ const AboutDialog: React.FC<AboutDialogProps> = ({
               )}
               {tauriUpdate && tauriUpdate.canAutoUpdate === false && (
                 <a
-                  href={tauriUpdate.downloadUrl || 'https://github.com/skrstop/MCPHub-Desktop/releases/latest'}
+                  href={tauriUpdate.downloadUrl || 'https://github.com/sky110120/MCPHub-Desktop/releases/latest'}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="hub-btn primary"
@@ -304,7 +304,7 @@ const AboutDialog: React.FC<AboutDialogProps> = ({
                 </a>
               )}
               <a
-                href={`https://github.com/skrstop/MCPHub-Desktop/releases`}
+                href={`https://github.com/sky110120/MCPHub-Desktop/releases`}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="hub-btn"

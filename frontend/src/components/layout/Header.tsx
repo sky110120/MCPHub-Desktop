@@ -104,7 +104,7 @@ const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
 
       <div className="ml-auto flex items-center gap-1 shrink-0">
         <a
-          href="https://github.com/skrstop/mcphub-desktop"
+          href="https://github.com/sky110120/MCPHub-Desktop"
           target="_blank"
           rel="noopener noreferrer"
           className="hub-icon-btn"

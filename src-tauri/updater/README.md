@@ -106,7 +106,7 @@ git push origin v1.0.17
   "platforms": {
     "darwin-aarch64": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRcm...",
-      "url": "https://github.com/skrstop/MCPHub-Desktop/releases/download/v1.0.18001/MCPHub.Desktop_1.0.18001_aarch64.app.tar.gz"
+      "url": "https://github.com/sky110120/MCPHub-Desktop/releases/download/v1.0.18001/MCPHub.Desktop_1.0.18001_aarch64.app.tar.gz"
     },
     "darwin-x86_64": {
       "signature": "...",

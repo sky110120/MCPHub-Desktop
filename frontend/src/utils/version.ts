@@ -18,7 +18,7 @@ export interface UpdateInfo {
 export type UpdateCheckSource = 'startup' | 'about' | 'manual';
 
 // GitHub Release latest.json URL for fallback version check (Linux)
-const LATEST_JSON_URL = 'https://github.com/skrstop/MCPHub-Desktop/releases/latest/download/latest.json';
+const LATEST_JSON_URL = 'https://github.com/sky110120/MCPHub-Desktop/releases/latest/download/latest.json';
 
 let cachedUpdate: Update | null = null;
 
@@ -121,7 +121,7 @@ const checkFallbackUpdate = async (): Promise<UpdateInfo | null> => {
 
     if (compareVersions(currentVersion, latestVersion) > 0) {
       // New version available — always link to GitHub Releases page for manual download
-      const downloadUrl = 'https://github.com/skrstop/MCPHub-Desktop/releases/latest';
+      const downloadUrl = 'https://github.com/sky110120/MCPHub-Desktop/releases/latest';
 
       logUpdateEvent(
         'info',
