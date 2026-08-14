@@ -61,7 +61,7 @@ sqlx = { version = "0.9", features = [
 ] }
 
 # Authentication
-jsonwebtoken = "11"
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 bcrypt = "0.19"
 
 # UUID generation
