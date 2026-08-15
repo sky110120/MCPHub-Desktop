@@ -33,6 +33,7 @@ const KNOWN_KEYS = new Set<keyof ServerConfig | string>([
   'headers',
   'passthroughHeaders',
   'enabled',
+  'disabled',
   'visibility',
   'enableKeepAlive',
   'keepAliveInterval',
@@ -128,6 +129,9 @@ export const normalizeImportedServers = (parsed: ImportJsonFormat): NormalizeRes
     // Detect the server type using multiple strategies (desktop: lenient detection).
     const detectedType = autoDetectType(config);
     normalizedConfig.type = parseServerType(detectedType);
+    // Accept both `enabled` (mcphub) and `disabled` (Claude Desktop style)
+    // so exported configs round-trip without losing the enabled state.
+    normalizedConfig.enabled = config.enabled ?? !(config.disabled === true);
 
     if (normalizedConfig.type === 'sse' || normalizedConfig.type === 'streamable-http') {
       normalizedConfig.url = config.url;
