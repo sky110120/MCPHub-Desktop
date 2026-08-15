@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use sqlx::{Row, SqlitePool};
 
 /// Current target schema version — bump this when adding new migrations.
-pub const TARGET_VERSION: i64 = 19;
+pub const TARGET_VERSION: i64 = 20;
 
 /// Initialize the schema_version table (create if not exists, read current version).
 /// Handles migration from old `sqlx::migrate!` system (which used `_sqlx_migrations` table).
@@ -123,6 +123,7 @@ async fn apply_migration(pool: &SqlitePool, version: i64) -> Result<()> {
         17 => migrate_v17(pool).await,
         18 => migrate_v18(pool).await,
         19 => migrate_v19(pool).await,
+        20 => migrate_v20(pool).await,
         _ => Err(anyhow!("Unknown migration version: {}", version)),
     }
 }
@@ -268,6 +269,27 @@ async fn migrate_v1(pool: &SqlitePool) -> Result<()> {
 
 /// v1 → v2: Schema fixes
 async fn migrate_v2(pool: &SqlitePool) -> Result<()> {
+    // The v1 schema stored hashed bearer keys (key_hash/user_id/expires_at)
+    // while the service reads a raw token column. Rebuild it so v2 databases
+    // match bearer_key_service.rs and the original schema-fix migration.
+    sqlx::query("DROP TABLE IF EXISTS bearer_keys")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS bearer_keys (
+            id              TEXT PRIMARY KEY,
+            name            TEXT NOT NULL,
+            token           TEXT NOT NULL UNIQUE,
+            enabled         INTEGER NOT NULL DEFAULT 1,
+            access_type     TEXT NOT NULL DEFAULT 'all',
+            allowed_groups  TEXT NOT NULL DEFAULT '[]',
+            allowed_servers TEXT NOT NULL DEFAULT '[]',
+            created_at      TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS activity_log (
             id          TEXT PRIMARY KEY,
@@ -858,6 +880,36 @@ async fn migrate_v19(pool: &SqlitePool) -> Result<()> {
     } else {
         log::info!("[db] migration v19: httpPort already customized or absent, left untouched");
     }
+    Ok(())
+}
+
+/// v19 → v20: Repair `bearer_keys` for databases that were migrated by the
+/// Rust migration system before v2 rebuilt the table.
+///
+/// The old sqlx migration runner applied 0002_schema_fix.sql, but the Rust
+/// migration path's v2 omitted the bearer_keys rebuild. Databases upgraded
+/// through that path therefore kept the v1 columns (key_hash/user_id/expires_at)
+/// and failed every INSERT/SELECT that references `token`. This migration drops
+/// and recreates the table with the schema the service expects.
+async fn migrate_v20(pool: &SqlitePool) -> Result<()> {
+    sqlx::query("DROP TABLE IF EXISTS bearer_keys")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS bearer_keys (
+            id              TEXT PRIMARY KEY,
+            name            TEXT NOT NULL,
+            token           TEXT NOT NULL UNIQUE,
+            enabled         INTEGER NOT NULL DEFAULT 1,
+            access_type     TEXT NOT NULL DEFAULT 'all',
+            allowed_groups  TEXT NOT NULL DEFAULT '[]',
+            allowed_servers TEXT NOT NULL DEFAULT '[]',
+            created_at      TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+    log::info!("[db] migration v20: rebuilt bearer_keys with token column");
     Ok(())
 }
 
