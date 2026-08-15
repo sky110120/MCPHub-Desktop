@@ -112,7 +112,7 @@ const Header: React.FC<HeaderProps> = ({ onToggleSidebar }) => {
           aria-label="GitHub Repository"
           onClick={(e) => {
             e.preventDefault();
-            openExternal('https://github.com/skrstop/mcphub-desktop');
+            openExternal('https://github.com/sky110120/MCPHub-Desktop');
           }}
         >
           <GitHubIcon className="h-4 w-4" />

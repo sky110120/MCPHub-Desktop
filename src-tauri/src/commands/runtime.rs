@@ -912,14 +912,16 @@ fn detect_system_python_version() -> Option<String> {
         let mut c = std::process::Command::new(cmd);
         c.arg("--version")
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .env("PATH", &enhanced_path);
         #[cfg(windows)]
         { c.creation_flags(0x0800_0000); } // CREATE_NO_WINDOW
         if let Ok(output) = c.output()
         {
             if output.status.success() {
-                let raw = String::from_utf8_lossy(&output.stdout);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let raw = if stdout.trim().is_empty() { stderr } else { stdout };
                 // Output like "Python 3.12.8"
                 let ver = raw.trim().strip_prefix("Python ").unwrap_or(raw.trim());
                 let ver = ver.trim();
@@ -1444,4 +1446,3 @@ fn expand_env_vars(input: &str) -> String {
     }
     result
 }
-

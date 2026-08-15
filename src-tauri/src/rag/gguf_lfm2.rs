@@ -205,9 +205,22 @@ impl Lfm2Arch {
     ) -> Result<Tensor> {
         let h = l.attn_norm.forward(x)?;
         let mixer_out = if l.is_attention {
-            self.forward_attention(l.attn.as_ref().expect("attn block"), &h, positions, mask_bias)?
+            self.forward_attention(
+                l.attn
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("LFM2 attention block missing attn fields"))?,
+                &h,
+                positions,
+                mask_bias,
+            )?
         } else {
-            self.forward_shortconv(l.shortconv.as_ref().expect("shortconv block"), &h, mask_2d)?
+            self.forward_shortconv(
+                l.shortconv
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("LFM2 shortconv block missing conv fields"))?,
+                &h,
+                mask_2d,
+            )?
         };
         let h = (&mixer_out + x)?;
         let ffn_out = self.forward_ffn(l, &l.ffn_norm.forward(&h)?)?;

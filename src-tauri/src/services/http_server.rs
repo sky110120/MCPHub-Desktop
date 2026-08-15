@@ -933,10 +933,9 @@ async fn dispatch_mcp(headers: HeaderMap, scope: String, body: Value, fallback_i
                     "serverInfo": {"name": "MCPHub Desktop", "version": env!("CARGO_PKG_VERSION")}
                 }),
             );
-            resp.headers_mut().insert(
-                "mcp-session-id",
-                sid.parse().expect("valid header value"),
-            );
+            if let Ok(hv) = HeaderValue::from_str(&sid) {
+                resp.headers_mut().insert("mcp-session-id", hv);
+            }
             resp
         }
         "ping" => jsonrpc_response(id, json!({})),

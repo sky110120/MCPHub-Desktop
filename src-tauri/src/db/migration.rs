@@ -354,10 +354,15 @@ async fn migrate_v3(pool: &SqlitePool) -> Result<()> {
         .await
         .ok();
 
-    // Migrate existing individual columns into config_json
-    let row = sqlx::query("SELECT * FROM system_config WHERE id = 1")
-        .fetch_optional(pool)
-        .await?;
+    // Migrate existing individual columns into config_json. Avoid SELECT *
+    // here: SQLite may recompile a cached SELECT * after DDL and return more
+    // columns than SQLx's cached metadata, panicking in row.rs (macOS ARM).
+    let row = sqlx::query(
+        "SELECT proxy, registry, log_level, expose_http, http_port, \
+         mcprouter_api_key, mcprouter_base_url FROM system_config WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await?;
 
     if let Some(row) = row {
         let mut config = serde_json::Map::new();
@@ -893,6 +898,32 @@ async fn migrate_v19(pool: &SqlitePool) -> Result<()> {
 /// and failed every INSERT/SELECT that references `token`. This migration drops
 /// and recreates the table with the schema the service expects.
 async fn migrate_v20(pool: &SqlitePool) -> Result<()> {
+    // Preserve any existing rows before rebuilding the table. The old v1
+    // schema cannot be converted to the new raw-token format automatically,
+    // but keeping a backup prevents silent data loss during upgrade.
+    let has_old_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='bearer_keys'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_old_table > 0 {
+        let old_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bearer_keys")
+            .fetch_one(pool)
+            .await?;
+        if old_rows > 0 {
+            sqlx::query("DROP TABLE IF EXISTS bearer_keys_backup_v20")
+                .execute(pool)
+                .await?;
+            sqlx::query("CREATE TABLE bearer_keys_backup_v20 AS SELECT * FROM bearer_keys")
+                .execute(pool)
+                .await?;
+            log::warn!(
+                "[db] migration v20: backed up {} old bearer_keys row(s) to bearer_keys_backup_v20",
+                old_rows
+            );
+        }
+    }
+
     sqlx::query("DROP TABLE IF EXISTS bearer_keys")
         .execute(pool)
         .await?;

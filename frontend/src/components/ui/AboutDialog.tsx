@@ -499,7 +499,7 @@ const AboutDialog: React.FC<AboutDialogProps> = ({
                   target="_blank"
                   rel="noopener noreferrer"
                   className="hub-btn primary"
-                  onClick={(e) => handleExternalClick(e, tauriUpdate.downloadUrl || 'https://github.com/skrstop/MCPHub-Desktop/releases/latest')}
+                  onClick={(e) => handleExternalClick(e, tauriUpdate.downloadUrl || 'https://github.com/sky110120/MCPHub-Desktop/releases/latest')}
                 >
                   <Download className="h-4 w-4" />
                   {t('about.downloadManual')}
@@ -510,17 +510,17 @@ const AboutDialog: React.FC<AboutDialogProps> = ({
                 target="_blank"
                 rel="noopener noreferrer"
                 className="hub-btn"
-                onClick={(e) => handleExternalClick(e, 'https://github.com/skrstop/MCPHub-Desktop/releases')}
+                onClick={(e) => handleExternalClick(e, 'https://github.com/sky110120/MCPHub-Desktop/releases')}
               >
                 {t('about.viewReleaseNotes')}
                 <ArrowUpRight className="h-3.5 w-3.5" />
               </a>
               <a
-                href="https://github.com/skrstop/MCPHub-Desktop"
+                href="https://github.com/sky110120/MCPHub-Desktop"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="hub-btn"
-                onClick={(e) => handleExternalClick(e, 'https://github.com/skrstop/MCPHub-Desktop')}
+                onClick={(e) => handleExternalClick(e, 'https://github.com/sky110120/MCPHub-Desktop')}
               >
                 {t('about.officialWebsite')}
                 <ArrowUpRight className="h-3.5 w-3.5" />

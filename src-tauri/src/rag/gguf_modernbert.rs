@@ -153,10 +153,15 @@ impl ModernBertArch {
         for i in 0..block_count {
             // Layer 0's attn_norm is Identity — the GGUF has no
             // `blk.0.attn_norm.weight` tensor (HF: `nn.Identity()`). Absence → None.
-            let attn_norm = content
-                .tensor(file, &format!("blk.{i}.attn_norm.weight"), device)
-                .ok()
-                .map(|w| RmsNorm::new(w.dequantize(device).unwrap(), eps));
+            let attn_norm = match content.tensor(file, &format!("blk.{i}.attn_norm.weight"), device)
+            {
+                Ok(w) => Some(RmsNorm::new(
+                    w.dequantize(device)
+                        .map_err(|e| anyhow!("dequantize blk.{i}.attn_norm.weight: {e}"))?,
+                    eps,
+                )),
+                Err(_) => None,
+            };
             let is_sliding = i % pattern != 0;
             blocks.push(ModernBertBlock {
                 attn_norm,

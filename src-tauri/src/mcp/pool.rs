@@ -82,43 +82,54 @@ pub(crate) fn build_client(cfg: &ServerConfig) -> Result<McpClient> {
             let openapi_cfg = cfg.openapi.as_ref()
                 .ok_or_else(|| anyhow!("OpenAPI server '{}' missing openapi config", name))?;
 
-            let security = openapi_cfg.security.as_ref().map(|s| {
-                let security_type = s.security_type.clone();
-                match security_type.as_str() {
-                    "apiKey" => {
-                        let ak = s.api_key.as_ref().unwrap();
-                        TransportOpenApiSecurity::ApiKey {
-                            name: ak.name.clone(),
-                            location: ak.location.clone(),
-                            value: ak.value.clone(),
+            let security = match openapi_cfg.security.as_ref() {
+                Some(s) => {
+                    let security_type = s.security_type.clone();
+                    Some(match security_type.as_str() {
+                        "apiKey" => {
+                            let ak = s.api_key.as_ref().ok_or_else(|| {
+                                anyhow!("OpenAPI server '{}' apiKey security missing api_key", name)
+                            })?;
+                            TransportOpenApiSecurity::ApiKey {
+                                name: ak.name.clone(),
+                                location: ak.location.clone(),
+                                value: ak.value.clone(),
+                            }
                         }
-                    }
-                    "http" => {
-                        let h = s.http.as_ref().unwrap();
-                        TransportOpenApiSecurity::Http {
-                            scheme: h.scheme.clone(),
-                            credentials: h.credentials.clone(),
+                        "http" => {
+                            let h = s.http.as_ref().ok_or_else(|| {
+                                anyhow!("OpenAPI server '{}' http security missing http", name)
+                            })?;
+                            TransportOpenApiSecurity::Http {
+                                scheme: h.scheme.clone(),
+                                credentials: h.credentials.clone(),
+                            }
                         }
-                    }
-                    "oauth2" => {
-                        let o = s.oauth2.as_ref().unwrap();
-                        TransportOpenApiSecurity::OAuth2 {
-                            token: o.token.clone(),
+                        "oauth2" => {
+                            let o = s.oauth2.as_ref().ok_or_else(|| {
+                                anyhow!("OpenAPI server '{}' oauth2 security missing oauth2", name)
+                            })?;
+                            TransportOpenApiSecurity::OAuth2 {
+                                token: o.token.clone(),
+                            }
                         }
-                    }
-                    "openIdConnect" => {
-                        let oidc = s.open_id_connect.as_ref().unwrap();
-                        TransportOpenApiSecurity::OpenIdConnect {
-                            url: oidc.url.clone(),
-                            token: oidc.token.clone(),
+                        "openIdConnect" => {
+                            let oidc = s.open_id_connect.as_ref().ok_or_else(|| {
+                                anyhow!("OpenAPI server '{}' openIdConnect security missing open_id_connect", name)
+                            })?;
+                            TransportOpenApiSecurity::OpenIdConnect {
+                                url: oidc.url.clone(),
+                                token: oidc.token.clone(),
+                            }
                         }
-                    }
-                    _ => TransportOpenApiSecurity::Http {
-                        scheme: "bearer".to_string(),
-                        credentials: String::new(),
-                    },
+                        _ => TransportOpenApiSecurity::Http {
+                            scheme: "bearer".to_string(),
+                            credentials: String::new(),
+                        },
+                    })
                 }
-            });
+                None => None,
+            };
 
             // Build passthrough headers from the config
             let mut passthrough_headers = HashMap::new();
