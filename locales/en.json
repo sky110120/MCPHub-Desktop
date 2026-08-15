@@ -107,7 +107,7 @@
     "passwordChanged": "Password changed successfully",
     "passwordChangeError": "Failed to change password",
     "defaultPasswordWarning": "Default Password Security Warning",
-    "defaultPasswordMessage": "You are using the default password (admin123), which poses a security risk. Please change your password immediately to protect your account.",
+    "defaultPasswordMessage": "You are using the default password (admin), which poses a security risk. Please change your password immediately to protect your account.",
     "goToSettings": "Go to Settings",
     "passwordStrengthError": "Password does not meet security requirements",
     "passwordMinLength": "Password must be at least 8 characters long",

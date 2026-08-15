@@ -1,5 +1,7 @@
 # MCPHub Desktop
 
+> 本项目 fork 自 [skrstop/MCPHub-Desktop](https://github.com/skrstop/MCPHub-Desktop)，并针对 macOS ARM（Apple Silicon）环境下遇到的问题进行了修复。
+
 > ## ⚠️ 重要声明（请先阅读）
 >
 > - 仓库内的 [`mcphub-origin/`](./mcphub-origin) 目录 **不属于本项目**，它是第三方开源项目 [samanhappy/mcphub](https://github.com/samanhappy/mcphub) 的源码快照，**版权归原作者 [@samanhappy](https://github.com/samanhappy) 及其贡献者所有**。

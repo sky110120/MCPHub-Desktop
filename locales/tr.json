@@ -106,7 +106,7 @@
     "passwordChanged": "Şifre başarıyla değiştirildi",
     "passwordChangeError": "Şifre değişikliği başarısız oldu",
     "defaultPasswordWarning": "Varsayılan Şifre Güvenlik Uyarısı",
-    "defaultPasswordMessage": "Varsayılan şifreyi (admin123) kullanıyorsunuz, bu bir güvenlik riski oluşturur. Hesabınızı korumak için lütfen şifrenizi hemen değiştirin.",
+    "defaultPasswordMessage": "Varsayılan şifreyi (admin) kullanıyorsunuz, bu bir güvenlik riski oluşturur. Hesabınızı korumak için lütfen şifrenizi hemen değiştirin.",
     "goToSettings": "Ayarlara Git",
     "passwordStrengthError": "Şifre güvenlik gereksinimlerini karşılamıyor",
     "passwordMinLength": "Şifre en az 8 karakter uzunluğunda olmalıdır",

@@ -9,7 +9,7 @@ use anyhow::{anyhow, Result};
 use sqlx::{Row, SqlitePool};
 
 /// Current target schema version — bump this when adding new migrations.
-pub const TARGET_VERSION: i64 = 20;
+pub const TARGET_VERSION: i64 = 21;
 
 /// Initialize the schema_version table (create if not exists, read current version).
 /// Handles migration from old `sqlx::migrate!` system (which used `_sqlx_migrations` table).
@@ -124,6 +124,7 @@ async fn apply_migration(pool: &SqlitePool, version: i64) -> Result<()> {
         18 => migrate_v18(pool).await,
         19 => migrate_v19(pool).await,
         20 => migrate_v20(pool).await,
+        21 => migrate_v21(pool).await,
         _ => Err(anyhow!("Unknown migration version: {}", version)),
     }
 }
@@ -397,7 +398,7 @@ async fn migrate_v3(pool: &SqlitePool) -> Result<()> {
 
 /// v3 → v4: Default admin user
 async fn migrate_v4(pool: &SqlitePool) -> Result<()> {
-    let admin_hash = "$2b$10$68DpNRgEB4V88lMXDK46J.ahxYKObFIUnuff5x2oxkhtaWt2dMUO6";
+    let admin_hash = "$2b$10$nnWTtWLZ98Yfe1HUrkCBF.k9Hhu5kjKTWdBkiJUHF5ba4Y493lXly";
     sqlx::query(
         "INSERT OR IGNORE INTO users (id, username, password_hash, role, created_at, updated_at)
          SELECT 'admin-default', 'admin', ?, 'admin', datetime('now', 'localtime'), datetime('now', 'localtime')
@@ -910,6 +911,30 @@ async fn migrate_v20(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
     log::info!("[db] migration v20: rebuilt bearer_keys with token column");
+    Ok(())
+}
+
+/// v20 → v21: Replace the accidentally seeded default admin password.
+///
+/// `migrate_v4` used a hash for `123456` while the UI/docs advertise `admin`.
+/// Fresh installs now seed the correct `admin` hash; this migration upgrades
+/// existing installs whose admin still uses the old default hash. A user who
+/// changed the password is left untouched because the hash will not match.
+async fn migrate_v21(pool: &SqlitePool) -> Result<()> {
+    const OLD_DEFAULT_HASH: &str = "$2b$10$68DpNRgEB4V88lMXDK46J.ahxYKObFIUnuff5x2oxkhtaWt2dMUO6";
+    const NEW_DEFAULT_HASH: &str = "$2b$10$nnWTtWLZ98Yfe1HUrkCBF.k9Hhu5kjKTWdBkiJUHF5ba4Y493lXly";
+
+    let affected = sqlx::query(
+        "UPDATE users SET password_hash = ?, updated_at = datetime('now', 'localtime') \
+         WHERE username = 'admin' AND password_hash = ?",
+    )
+    .bind(NEW_DEFAULT_HASH)
+    .bind(OLD_DEFAULT_HASH)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    log::info!("[db] migration v21: reset default admin password (affected {})", affected);
     Ok(())
 }
 

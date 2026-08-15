@@ -147,18 +147,16 @@ tree-sitter-go = "0.25"
 tree-sitter-java = "0.23"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
-# Global allocator for RAG. Do NOT enable `override` on macOS: symbol
-# interposition breaks atfork child handlers and can crash Command::spawn
-# with SIGSEGV inside libSystem_atfork_child.
+# Global allocator for RAG. `override` is intentionally not enabled; on macOS
+# ARM symbol interposition breaks atfork child handlers and can crash
+# Command::spawn with SIGSEGV inside libSystem_atfork_child.
 mimalloc = "0.1"
 # Direct dep so `rag::service::stop` can call `libmimalloc_sys::mi_collect`
 # (the `extended`-feature binding) to return freed pages to the OS on RAG
 # disable. Referencing this crate from the lib forces its static archive into
 # the cdylib link — otherwise mimalloc is only pulled via the bin's
 # #[global_allocator] (main.rs), leaving `mi_collect` unresolved in the
-# cdylib. `override` on `mimalloc` (above) enables the `#[used] mi_malloc`
-# that drags in mimalloc's single-object static.c (which also defines
-# mi_collect).
+# cdylib.
 libmimalloc-sys = { version = "0.1", features = ["extended"] }
 
 [target.'cfg(unix)'.dependencies]

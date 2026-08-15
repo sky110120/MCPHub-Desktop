@@ -936,7 +936,7 @@ jobs:
           import os, json, glob
           from datetime import datetime, timezone
 
-          repo     = os.environ['REPO']                 # e.g. skrstop/MCPHub-Desktop
+          repo     = os.environ['REPO']                 # e.g. sky110120/MCPHub-Desktop
           pub_date = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
           print(f'REPO={repo}')
