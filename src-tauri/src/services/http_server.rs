@@ -149,7 +149,7 @@ fn build_oauth_401(headers: &HeaderMap, reason: &str) -> Response {
 // ────────────────────────────────────────────────────────────────────────────
 
 struct ServerHandle {
-    abort_tx: tokio::sync::oneshot::Sender<()>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
     port: u16,
     body_limit_bytes: usize,
 }
@@ -1665,7 +1665,8 @@ pub async fn start(port: u16, body_limit_bytes: usize) -> anyhow::Result<()> {
         detail: None,
     });
 
-    let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut serve_shutdown_rx = shutdown_rx.clone();
 
     // Bound graceful shutdown so a long-lived connection (SSE / Streamable HTTP
     // streams that stay open indefinitely) can't keep the server task alive
@@ -1676,26 +1677,48 @@ pub async fn start(port: u16, body_limit_bytes: usize) -> anyhow::Result<()> {
     const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
     tokio::spawn(async move {
-        let serve = axum::serve(listener, app).with_graceful_shutdown(async {
-            let _ = abort_rx.await;
+        let serve = std::future::IntoFuture::into_future(
+            axum::serve(listener, app).with_graceful_shutdown(async move {
+                let _ = serve_shutdown_rx.changed().await;
+            }),
+        );
+        let mut serve = Box::pin(serve);
+        let mut shutdown = Box::pin(async move {
+            let _ = shutdown_rx.changed().await;
         });
-        match tokio::time::timeout(SHUTDOWN_GRACE, serve).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => log::warn!("[shutdown] HTTP server ended with error: {e}"),
-            Err(_) => {
-                log::warn!(
-                    "[shutdown] HTTP server graceful shutdown exceeded {}s grace period; \
-                     force-closing in-flight (long-lived SSE/HTTP) connections",
-                    SHUTDOWN_GRACE.as_secs()
-                );
-                // The `serve` future was dropped on timeout, aborting the
-                // listener and any remaining in-flight connections.
+
+        // Only start the grace-period timer after a shutdown is requested.
+        // Wrapping the whole `serve` future in `timeout` would force-close the
+        // listener after 10s even with no stop signal (reproduced on macOS ARM).
+        tokio::select! {
+            result = &mut serve => match result {
+                Ok(()) => {}
+                Err(e) => log::warn!("[shutdown] HTTP server ended with error: {e}"),
+            },
+            _ = &mut shutdown => {
+                match tokio::time::timeout(SHUTDOWN_GRACE, &mut serve).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => log::warn!("[shutdown] HTTP server ended with error: {e}"),
+                    Err(_) => {
+                        log::warn!(
+                            "[shutdown] HTTP server graceful shutdown exceeded {}s grace period; \
+                             force-closing in-flight (long-lived SSE/HTTP) connections",
+                            SHUTDOWN_GRACE.as_secs()
+                        );
+                        // The `serve` future was dropped on timeout, aborting the
+                        // listener and any remaining in-flight connections.
+                    }
+                }
             }
         }
         log::info!("MCPHub HTTP server stopped");
     });
 
-    *guard = Some(ServerHandle { abort_tx, port, body_limit_bytes });
+    *guard = Some(ServerHandle {
+        shutdown_tx,
+        port,
+        body_limit_bytes,
+    });
     Ok(())
 }
 
@@ -1703,7 +1726,7 @@ pub async fn start(port: u16, body_limit_bytes: usize) -> anyhow::Result<()> {
 pub async fn stop() {
     let mut guard = handle().lock().await;
     if let Some(h) = guard.take() {
-        let _ = h.abort_tx.send(());
+        let _ = h.shutdown_tx.send(true);
         log::info!("MCPHub HTTP server shutdown requested");
         set_status(HttpServerStatus {
             running: false,
