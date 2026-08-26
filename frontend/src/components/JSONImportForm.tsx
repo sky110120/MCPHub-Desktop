@@ -52,7 +52,11 @@ All servers will be imported in a single efficient batch operation.`;
       const parsed = JSON.parse(input.trim());
 
       // Validate structure
-      if (!parsed.mcpServers || typeof parsed.mcpServers !== 'object') {
+      if (
+        !parsed.mcpServers ||
+        typeof parsed.mcpServers !== 'object' ||
+        Array.isArray(parsed.mcpServers)
+      ) {
         setError(t('jsonImport.invalidFormat'));
         return null;
       }

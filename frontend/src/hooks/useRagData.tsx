@@ -4,7 +4,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useAuth } from '@/contexts/AuthContext';
 import { useToast } from '@/contexts/ToastContext';
 import { isTauri } from '@/utils/tauriClient';
-import { RagChunk, RagDoc, RagDocInfo, RagModelInfo, RagModelLimits, RagPickedFile, RagSettings, RagSearchResult } from '@/types';
+import { BatchPreview, RagChunk, RagDoc, RagDocInfo, RagModelInfo, RagModelLimits, RagPickedFile, RagSettings, RagSearchResult, RagUpdateCheck } from '@/types';
 import {
   listRagDocs,
   getRagSettings,
@@ -16,6 +16,7 @@ import {
   getRagChunks,
   uploadRagDoc,
   pickRagFiles,
+  pickRagFolder,
   openRagFileLocation,
   ragToggle,
   ragStatus,
@@ -26,6 +27,9 @@ import {
   currentRagModel,
   selectRagModel,
   downloadRagModel,
+  checkRagUpdate,
+  previewBatchUpdate,
+  batchUpdateRagDocs,
 } from '@/services/ragService';
 
 /**
@@ -48,6 +52,11 @@ const useRagDataState = () => {
   const { showToast } = useToast();
 
   const [ragDocs, setRagDocs] = useState<RagDocInfo[]>([]);
+  // Monotonic refresh signal for paginated consumers. The paginated query
+  // must react to list mutations without depending on `ragDocs` itself:
+  // `fetchDocs` replaces that array on every request, which would otherwise
+  // make the page continuously re-fetch.
+  const [ragDocsRevision, setRagDocsRevision] = useState(0);
   const [enabled, setEnabled] = useState(false);
   const [initializing, setInitializing] = useState(false);
   // Target state of an in-flight toggle ('on' | 'off' | null) so the loading
@@ -109,14 +118,34 @@ const useRagDataState = () => {
     fileTotal: number;
     message?: string;
   } | null>(null);
+  // Batch-update progress: emitted by the backend's `rag://batch-update-progress`
+  // event during the async re-index pass. `batchUpdateRunning` is true while the
+  // pass is in flight (drives the header button's "查看进度" + spinner). The
+  // progress dialog reads `batchProgress` + `charProgress` for the two bars.
+  // phase: "checking" | "reindexing" | "done" | "error" (error = the batch task
+  // itself failed early, e.g. files_dir/read_dir error; the dialog shows the
+  // failure state instead of a green "complete" checkmark).
+  const [batchUpdateRunning, setBatchUpdateRunning] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<{
+    current: number;
+    total: number;
+    name: string;
+    phase: 'checking' | 'reindexing' | 'done' | 'error';
+  } | null>(null);
   const mounted = useRef(true);
 
   const fetchDocs = useCallback(async () => {
     try {
       const data = await listRagDocs();
-      if (mounted.current) setRagDocs(data);
+      if (mounted.current) {
+        setRagDocs(data);
+        setRagDocsRevision((revision) => revision + 1);
+      }
     } catch {
-      if (mounted.current) setRagDocs([]);
+      if (mounted.current) {
+        setRagDocs([]);
+        setRagDocsRevision((revision) => revision + 1);
+      }
     }
   }, []);
 
@@ -205,6 +234,7 @@ const useRagDataState = () => {
     let unlistenUpload: UnlistenFn | undefined;
     let unlistenReindex: UnlistenFn | undefined;
     let unlistenDownload: UnlistenFn | undefined;
+    let unlistenBatch: UnlistenFn | undefined;
     let cancelled = false;
     listen<{ name: string; charsDone: number; charsTotal: number }>('rag://upload-progress', (event) => {
       const p = event.payload;
@@ -225,6 +255,39 @@ const useRagDataState = () => {
     }).then((un) => {
       if (cancelled) un();
       else unlistenReindex = un;
+    });
+
+    // Batch-update progress: the backend emits one event per doc (checking /
+    // reindexing phases) + a final "done". Drives the batch-progress dialog's
+    // file-level bar; the char-level sub-bar reuses `rag://upload-progress`
+    // above (reindex_doc emits it). On "done" we clear the running flag + refetch
+    // the doc list (chunk counts / version / md5 changed).
+    listen<{ current: number; total: number; name: string; phase: string }>(
+      'rag://batch-update-progress',
+      (event) => {
+        const p = event.payload;
+        if (!p || !mounted.current) return;
+        const phase =
+          p.phase === 'checking' || p.phase === 'reindexing' || p.phase === 'done' || p.phase === 'error'
+            ? (p.phase as 'checking' | 'reindexing' | 'done' | 'error')
+            : 'checking';
+        setBatchProgress({ current: p.current, total: p.total, name: p.name, phase });
+        if (phase === 'done' || phase === 'error') {
+          // Both terminal phases clear the running flag. On done we also refetch
+          // (chunk counts / versions / md5 changed); on error nothing was
+          // processed, so no refetch is needed.
+          setBatchUpdateRunning(false);
+          if (phase === 'done') {
+            // Slight delay so the "完成" state is visible before the dialog clears.
+            setTimeout(() => {
+              if (mounted.current) fetchDocs();
+            }, 600);
+          }
+        }
+      },
+    ).then((un) => {
+      if (cancelled) un();
+      else unlistenBatch = un;
     });
 
     // Model download progress (download.url -> .zip extract). Drives the
@@ -265,6 +328,7 @@ const useRagDataState = () => {
       unlistenUpload?.();
       unlistenReindex?.();
       unlistenDownload?.();
+      unlistenBatch?.();
     };
   }, [fetchModels]);
 
@@ -385,7 +449,6 @@ const useRagDataState = () => {
           // Skip the prompt when there are no documents (nothing to re-embed).
           if (ragDocs.length > 0) setReindexConfirm(true);
           else showToast(t('pages.rag.modelSelected', { name: `model_${size}` }), 'success');
-          showToast(t('pages.rag.modelSelected', { name: `model_${size}` }), 'success');
         }
       } catch (err) {
         if (mounted.current) {
@@ -452,7 +515,7 @@ const useRagDataState = () => {
   );
 
   const upload = useCallback(
-    async (files: RagPickedFile[], tags: string[] = []) => {
+    async (files: RagPickedFile[], tags: string[] = [], method: 'symlink' | 'copy' = 'symlink') => {
       if (files.length === 0) return { success: 0, failed: 0 };
       setUploading(true);
       setUploadProgress({ current: 0, total: files.length, name: files[0].name });
@@ -470,7 +533,7 @@ const useRagDataState = () => {
           // once its embedding begins).
           setCharProgress({ name: files[i].name, charsDone: 0, charsTotal: 0 });
           try {
-            await uploadRagDoc(files[i].path, tags);
+            await uploadRagDoc(files[i].path, tags, method);
             success++;
           } catch (err) {
             failed++;
@@ -506,21 +569,33 @@ const useRagDataState = () => {
     }
   }, []);
 
-  // Update an existing document in place: overwrite its content + meta (id
-  // preserved, tags preserved) + re-embed its vectors. Drives the SAME
-  // upload-progress overlay as `upload` (file-level 1/1 + the backend's
-  // `rag://upload-progress` char-level events emitted from reindex_doc), so
-  // the user sees both progress bars while the new content is re-embedded.
-  // Caller picks the file (via pickFiles) and passes the path + display name.
-  // Requires RAG enabled (re-embeds).
+  // Pick a folder: the backend opens the OS folder picker and scans the
+  // folder's immediate file children (non-recursive). Returns the same shape
+  // as `pickFiles` so the upload loop + dedup merge identically.
+  const pickFolder = useCallback(async (): Promise<RagPickedFile[]> => {
+    try {
+      return await pickRagFolder();
+    } catch {
+      return [];
+    }
+  }, []);
+
+  // Update an existing document in place. `mode`:
+  //   'original' -> re-read the recorded original_path + re-index (the "from
+  //                original" button). filePath is ignored.
+  //   'file'     -> read a freshly-picked filePath + overwrite (the "manual
+  //                upload" button); it becomes the recorded original_path.
+  // Drives the SAME upload-progress overlay as `upload` (file-level 1/1 + the
+  // backend's `rag://upload-progress` char-level events emitted from
+  // reindex_doc), so the user sees both progress bars. Requires RAG enabled.
   const updateDoc = useCallback(
-    async (id: string, filePath: string, name: string) => {
+    async (id: string, name: string, opts: { mode: 'original' | 'file'; filePath?: string }) => {
       setUploading(true);
       setUpdatingDoc(true);
       setUploadProgress({ current: 0, total: 1, name });
       setCharProgress({ name, charsDone: 0, charsTotal: 0 });
       try {
-        await updateRagDoc(id, filePath);
+        await updateRagDoc(id, opts);
         setUploadProgress({ current: 1, total: 1, name });
         await fetchDocs();
       } finally {
@@ -532,6 +607,34 @@ const useRagDataState = () => {
     },
     [fetchDocs],
   );
+
+  // Single-doc update check: classify the recorded original's state so the
+  // UpdateDialog renders the right branch. Cheap (one md5, no embedding).
+  const checkUpdate = useCallback(async (id: string): Promise<RagUpdateCheck> => {
+    return await checkRagUpdate(id);
+  }, []);
+
+  // Batch-update preview: aggregate counts for the confirm dialog. No embedding.
+  const getBatchPreview = useCallback(async (): Promise<BatchPreview> => {
+    return await previewBatchUpdate();
+  }, []);
+
+  // Start the background batch update. Returns immediately; progress arrives
+  // via `rag://batch-update-progress` (consumed by the listener below). The
+  // header button flips to "查看进度" + spinner while `batchUpdateRunning` is
+  // true; re-clicking just re-opens the progress dialog (no re-trigger — the
+  // backend CAS-guards, and the frontend short-circuits).
+  const batchUpdate = useCallback(async () => {
+    if (batchUpdateRunning) return;
+    setBatchUpdateRunning(true);
+    setBatchProgress({ current: 0, total: 0, name: '', phase: 'checking' });
+    try {
+      await batchUpdateRagDocs();
+    } catch (err) {
+      if (mounted.current) setBatchUpdateRunning(false);
+      throw err;
+    }
+  }, [batchUpdateRunning]);
 
   const remove = useCallback(
     async (id: string) => {
@@ -618,6 +721,7 @@ const useRagDataState = () => {
   return {
     t,
     ragDocs,
+    ragDocsRevision,
     enabled,
     initializing,
     togglingTo,
@@ -645,6 +749,7 @@ const useRagDataState = () => {
     toggleEnabled,
     upload,
     pickFiles,
+    pickFolder,
     updateDoc,
     remove,
     removeMany,
@@ -659,6 +764,12 @@ const useRagDataState = () => {
     search,
     setTags,
     updateSettings,
+    // Import-method feature: single-doc update check + batch update.
+    checkUpdate,
+    getBatchPreview,
+    batchUpdate,
+    batchUpdateRunning,
+    batchProgress,
     refresh: fetchDocs,
   };
 };
@@ -675,4 +786,3 @@ export const useRagData = () => {
   if (!ctx) throw new Error('useRagData must be used within a RagDataProvider');
   return ctx;
 };
-

@@ -378,11 +378,11 @@ const ServerCard = ({
     if (!canManage) return;
     try {
       // For OpenAPI servers, copy the OpenAPI spec JSON instead of MCP settings
-      if (server.type === 'openapi') {
-        let spec = server.openapi?.schema;
+      if (server.config?.type === 'openapi') {
+        let spec = server.config.openapi?.schema;
         // URL mode: fetch the spec from the URL
-        if (!spec && server.openapi?.url) {
-          const resp = await fetch(server.openapi.url);
+        if (!spec && server.config.openapi?.url) {
+          const resp = await fetch(server.config.openapi.url);
           if (!resp.ok) {
             showToast(t('common.copyFailed') || 'Copy failed', 'error');
             return;

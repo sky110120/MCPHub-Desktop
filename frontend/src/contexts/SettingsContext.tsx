@@ -95,6 +95,7 @@ interface BetterAuthOidcConfig {
 
 interface BetterAuthConfig {
   enabled: boolean;
+  baseUrl: string;
   basePath: string;
   trustedOrigins: string[];
   providers: {
@@ -216,6 +217,7 @@ const DEFAULT_OIDC_SCOPES = ['openid', 'profile', 'email'];
 
 const getDefaultBetterAuthConfig = (): BetterAuthConfig => ({
   enabled: true,
+  baseUrl: '',
   basePath: '/api/auth/better',
   trustedOrigins: [],
   providers: {
@@ -254,6 +256,7 @@ const normalizeBetterAuthConfig = (
 
   return {
     enabled: config?.enabled ?? defaults.enabled,
+    baseUrl: config?.baseUrl?.trim() || defaults.baseUrl,
     basePath: config?.basePath?.trim() || defaults.basePath,
     trustedOrigins: normalizeStringArray(config?.trustedOrigins, defaults.trustedOrigins),
     providers: {
@@ -282,6 +285,7 @@ const mergeBetterAuthConfig = (
   const nextConfig: Partial<BetterAuthConfig> = {
     ...current,
     ...updates,
+    baseUrl: updates.baseUrl ?? current.baseUrl,
     trustedOrigins: updates.trustedOrigins ?? current.trustedOrigins,
     providers: {
       ...current.providers,
@@ -411,7 +415,7 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
       const data: ApiResponse<SystemSettings> = await apiGet('/settings');
 
       if (data.success && data.data?.systemConfig) {
-        const routing = data.data.systemConfig.routing || {};
+        const routing: Partial<RoutingConfig> = data.data.systemConfig.routing || {};
         setRoutingConfig({
           enableGlobalRoute: routing.enableGlobalRoute ?? true,
           enableGroupNameRoute: routing.enableGroupNameRoute ?? true,

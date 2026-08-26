@@ -16,7 +16,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, OnceLock},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// Holds a live client + last known status + cached tools
 struct PoolEntry {
@@ -39,8 +39,71 @@ type Pool = Arc<RwLock<HashMap<String, PoolEntry>>>;
 
 static POOL: OnceLock<Pool> = OnceLock::new();
 
+type ConnectionGenerations = Arc<Mutex<HashMap<String, u64>>>;
+
+static CONNECTION_GENERATIONS: OnceLock<ConnectionGenerations> = OnceLock::new();
+
 fn pool() -> &'static Pool {
     POOL.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
+}
+
+fn connection_generations() -> &'static ConnectionGenerations {
+    CONNECTION_GENERATIONS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+}
+
+async fn next_connection_generation(name: &str) -> u64 {
+    let mut generations = connection_generations().lock().await;
+    let generation = generations.entry(name.to_string()).or_insert(0);
+    *generation = generation.saturating_add(1);
+    *generation
+}
+
+async fn invalidate_connection(name: &str) {
+    let _ = next_connection_generation(name).await;
+}
+
+async fn is_current_connection(name: &str, generation: u64) -> bool {
+    let generations = connection_generations().lock().await;
+    generations.get(name).copied().unwrap_or(0) == generation
+}
+
+async fn invalidate_all_connections() {
+    let mut generations = connection_generations().lock().await;
+    for generation in generations.values_mut() {
+        *generation = generation.saturating_add(1);
+    }
+}
+
+/// Publish a pool entry only if no newer lifecycle operation invalidated this
+/// connection attempt. Holding the generation lock while taking the pool lock
+/// makes the check and insert atomic with `disconnect_server`'s invalidation.
+/// A failed publish returns the entry so an already-connected transport can be
+/// explicitly disconnected instead of being dropped as a stale child process.
+async fn insert_if_current(
+    name: &str,
+    generation: u64,
+    entry: PoolEntry,
+) -> Result<(), PoolEntry> {
+    let generations = connection_generations().lock().await;
+    if generations.get(name).copied().unwrap_or(0) != generation {
+        return Err(entry);
+    }
+    let mut map = pool().write().await;
+    map.insert(name.to_string(), entry);
+    Ok(())
+}
+
+fn cancelled_status(name: &str) -> ServerStatus {
+    ServerStatus {
+        name: name.to_string(),
+        connected: false,
+        starting: false,
+        start_on_demand: false,
+        tool_count: 0,
+        error: Some("connection cancelled by a newer lifecycle operation".to_string()),
+        last_connected: None,
+        server_version: None,
+    }
 }
 
 /// Build a McpClient from a ServerConfig
@@ -187,6 +250,7 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
     // awake on-demand server kills the old process before re-inserting the
     // sleeping placeholder below).
     disconnect_server(&name).await.ok();
+    let connection_generation = next_connection_generation(&name).await;
 
     // 1a. On-demand stdio servers skip startup connect: insert a "sleeping"
     // placeholder (client None, connected false, start_on_demand true) and
@@ -222,9 +286,7 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
     let start_msg = format!("[{}] Starting connection (type={:?})...", name, cfg.server_type);
     log::info!("{}", start_msg);
     app_logger::log_to_db("info", &start_msg);
-    {
-        let mut map = pool().write().await;
-        map.insert(name.clone(), PoolEntry {
+    if insert_if_current(&name, connection_generation, PoolEntry {
             client: None,
             status: ServerStatus {
                 name: name.clone(),
@@ -239,7 +301,8 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
             tools: vec![],
             per_session_client,
             start_on_demand: false,
-        });
+        }).await.is_err() {
+        return cancelled_status(&name);
     }
 
     // 2. Build client + connect with retry for transient failures
@@ -247,6 +310,10 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
     let mut last_error = String::new();
 
     for attempt in 1..=MAX_RETRIES {
+        if !is_current_connection(&name, connection_generation).await {
+            return cancelled_status(&name);
+        }
+
         // Build client
         let mut entry_client = match build_client(cfg) {
             Ok(c) => c,
@@ -270,8 +337,15 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
                     last_connected: None,
                     server_version: None,
                 };
-                let mut map = pool().write().await;
-                map.insert(name.clone(), PoolEntry { client: None, status: status.clone(), tools: vec![], per_session_client, start_on_demand: false });
+                if insert_if_current(&name, connection_generation, PoolEntry {
+                    client: None,
+                    status: status.clone(),
+                    tools: vec![],
+                    per_session_client,
+                    start_on_demand: false,
+                }).await.is_err() {
+                    return cancelled_status(&name);
+                }
                 return status;
             }
         };
@@ -284,7 +358,47 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
 
         match connect_result {
             Ok(Ok(())) => {
-                let tools = entry_client.list_tools().await.unwrap_or_default();
+                if !is_current_connection(&name, connection_generation).await {
+                    let _ = entry_client.disconnect().await;
+                    return cancelled_status(&name);
+                }
+                let tools = match entry_client.list_tools().await {
+                    Ok(tools) => tools,
+                    Err(e) => {
+                        let error = format!("Tool discovery failed: {}", e);
+                        log::error!("[{}] {}", name, error);
+                        app_logger::log_to_db("error", &format!("[{}] {}", name, error));
+                        let _ = entry_client.disconnect().await;
+                        if progress::is_package_manager(&cfg.command) {
+                            progress::emit_install_progress(&ServerInstallProgress {
+                                server: name.clone(),
+                                phase: "error".to_string(),
+                                progress: None,
+                                message: Some(error.clone()),
+                            });
+                        }
+                        let status = ServerStatus {
+                            name: name.clone(),
+                            connected: false,
+                            starting: false,
+                            start_on_demand: false,
+                            tool_count: 0,
+                            error: Some(error),
+                            last_connected: None,
+                            server_version: None,
+                        };
+                        if insert_if_current(&name, connection_generation, PoolEntry {
+                            client: None,
+                            status: status.clone(),
+                            tools: vec![],
+                            per_session_client,
+                            start_on_demand: false,
+                        }).await.is_err() {
+                            return cancelled_status(&name);
+                        }
+                        return status;
+                    }
+                };
                 let tool_count = tools.len();
                 // Capture the server-reported version before moving the client
                 // into the pool, for a best-effort "update available" check.
@@ -300,14 +414,19 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
                     last_connected,
                     server_version: running_version.clone(),
                 };
-                let mut map = pool().write().await;
-                map.insert(name.clone(), PoolEntry {
+                let publish_result = insert_if_current(&name, connection_generation, PoolEntry {
                     client: Some(entry_client),
                     status: status.clone(),
                     tools,
                     per_session_client,
                     start_on_demand: false,
-                });
+                }).await;
+                if let Err(mut stale_entry) = publish_result {
+                    if let Some(mut client) = stale_entry.client.take() {
+                        let _ = client.disconnect().await;
+                    }
+                    return cancelled_status(&name);
+                }
                 let conn_msg = if attempt > 1 {
                     format!("[{}] Connected ({} tools) after {} attempts", name, tool_count, attempt)
                 } else {
@@ -336,6 +455,10 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
             }
             Ok(Err(e)) => {
                 last_error = e.to_string();
+                // A failed handshake may already have spawned a stdio child.
+                // Explicitly disconnect before retrying or returning so the
+                // child tree is reaped instead of relying on Drop behavior.
+                let _ = entry_client.disconnect().await;
                 // Retry on transient errors (child process exited unexpectedly)
                 if attempt < MAX_RETRIES && last_error.contains("child process exited") {
                     let retry_msg = format!(
@@ -369,8 +492,15 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
                     last_connected: None,
                     server_version: None,
                 };
-                let mut map = pool().write().await;
-                map.insert(name.clone(), PoolEntry { client: None, status: status.clone(), tools: vec![], per_session_client, start_on_demand: false });
+                if insert_if_current(&name, connection_generation, PoolEntry {
+                    client: None,
+                    status: status.clone(),
+                    tools: vec![],
+                    per_session_client,
+                    start_on_demand: false,
+                }).await.is_err() {
+                    return cancelled_status(&name);
+                }
                 return status;
             }
             Err(_elapsed) => {
@@ -397,8 +527,15 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
                     last_connected: None,
                     server_version: None,
                 };
-                let mut map = pool().write().await;
-                map.insert(name.clone(), PoolEntry { client: None, status: status.clone(), tools: vec![], per_session_client, start_on_demand: false });
+                if insert_if_current(&name, connection_generation, PoolEntry {
+                    client: None,
+                    status: status.clone(),
+                    tools: vec![],
+                    per_session_client,
+                    start_on_demand: false,
+                }).await.is_err() {
+                    return cancelled_status(&name);
+                }
                 return status;
             }
         }
@@ -426,8 +563,15 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
         last_connected: None,
         server_version: None,
     };
-    let mut map = pool().write().await;
-    map.insert(name.clone(), PoolEntry { client: None, status: status.clone(), tools: vec![], per_session_client, start_on_demand: false });
+    if insert_if_current(&name, connection_generation, PoolEntry {
+        client: None,
+        status: status.clone(),
+        tools: vec![],
+        per_session_client,
+        start_on_demand: false,
+    }).await.is_err() {
+        return cancelled_status(&name);
+    }
     status
 }
 
@@ -436,6 +580,9 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
 /// actual disconnect I/O happens after the lock is released so that read
 /// operations are not blocked during the network round-trip.
 pub async fn disconnect_server(name: &str) -> Result<()> {
+    // Invalidate an in-flight connect before removing its placeholder. A slow
+    // handshake must not publish a stale client after a disable/reload/delete.
+    invalidate_connection(name).await;
     log::info!("[{}] Disconnecting...", name);
     app_logger::log_to_db("info", &format!("[{}] Disconnecting...", name));
     // Tear down any per-session isolated upstream clients for this server too
@@ -483,6 +630,7 @@ pub async fn disconnect_all() {
     // processes are killed via kill_process_tree rather than relying on
     // kill_on_drop at process exit.
     super::on_demand::cleanup_all_on_demand().await;
+    invalidate_all_connections().await;
 
     let entries: Vec<(String, PoolEntry)> = {
         let mut map = pool().write().await;
@@ -527,6 +675,19 @@ pub async fn is_per_session_client(name: &str) -> bool {
 
 /// List all tools across connected servers (returns cached list, no network call)
 pub async fn list_all_tools() -> Vec<Tool> {
+    let on_demand_names: Vec<String> = {
+        let map = pool().read().await;
+        map.iter()
+            .filter(|(_, entry)| entry.start_on_demand && entry.tools.is_empty())
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+    for name in on_demand_names {
+        if let Err(e) = super::on_demand::prime_on_demand_server(&name).await {
+            log::warn!("[{}] Failed to prime on-demand tools: {}", name, e);
+        }
+    }
+
     let map = pool().read().await;
     map.values()
         .filter(|e| e.status.connected || (e.start_on_demand && !e.tools.is_empty()))
@@ -542,6 +703,16 @@ pub async fn list_tools_for(server_name: &str) -> Result<Vec<Tool>> {
     if server_name == crate::rag::service::BUILTIN_SERVER_NAME {
         return Ok(crate::rag::service::builtin_tools());
     }
+    let needs_prime = {
+        let map = pool().read().await;
+        map.get(server_name)
+            .map(|entry| entry.start_on_demand && entry.tools.is_empty())
+            .ok_or_else(|| anyhow!("Server '{}' not connected", server_name))?
+    };
+    if needs_prime {
+        super::on_demand::prime_on_demand_server(server_name).await?;
+    }
+
     let map = pool().read().await;
     let entry = map.get(server_name).ok_or_else(|| anyhow!("Server '{}' not connected", server_name))?;
     Ok(entry.tools.clone())

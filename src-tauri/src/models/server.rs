@@ -97,6 +97,22 @@ fn default_openapi_version() -> String {
     "3.1.0".to_string()
 }
 
+/// Proxychains4 proxy configuration for STDIO servers (upstream field kept for
+/// config round-tripping; the desktop runtime does not yet spawn proxychains).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxychainsConfig {
+    pub enabled: Option<bool>,
+    /// socks4 | socks5 | http
+    #[serde(rename = "type")]
+    pub proxy_type: Option<String>,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub config_path: Option<String>,
+}
+
 /// Full server configuration stored in DB / returned to frontend
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -139,6 +155,10 @@ pub struct ServerConfig {
     /// `idleTimeoutMs`.
     #[serde(default)]
     pub idle_timeout_ms: Option<u64>,
+    /// Proxychains4 proxy configuration (stdio, Linux/macOS). Round-tripped
+    /// from the frontend so an edit of any other field does not drop it.
+    #[serde(default)]
+    pub proxy: Option<ProxychainsConfig>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -220,4 +240,16 @@ pub struct ServerInfo {
     /// only for the builtin "mcphub-desktop" server.
     #[serde(default)]
     pub resources: Vec<crate::models::resource::BuiltinResource>,
+}
+
+/// A page of server-search results: the items on the current page + the total
+/// matching count. `page` is 1-based (matches the dashboard list's semantics).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerPage {
+    pub items: Vec<ServerInfo>,
+    /// Total matching servers across all pages (NOT just this page).
+    pub total: u64,
+    pub page: u32,
+    pub page_size: u32,
 }

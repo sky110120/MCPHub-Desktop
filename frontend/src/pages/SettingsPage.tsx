@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { emit } from '@tauri-apps/api/event';
@@ -7,6 +7,7 @@ import { Switch } from '@/components/ui/ToggleGroup';
 import { MultiSelect } from '@/components/ui/MultiSelect';
 import RuntimeVersionManager from '@/components/RuntimeVersionManager';
 import { useSettingsData } from '@/hooks/useSettingsData';
+import { searchGroups } from '@/services/groupService';
 import { useToast } from '@/contexts/ToastContext';
 import { PermissionChecker } from '@/components/PermissionChecker';
 import { PERMISSIONS } from '@/constants/permissions';
@@ -32,6 +33,11 @@ interface BearerKeyRowProps {
   loading: boolean;
   availableServers: { value: string; label: string }[];
   availableGroups: { value: string; label: string }[];
+  searchGroups: (
+    searchKey: string,
+    page: number,
+    pageSize: number,
+  ) => Promise<{ items: { value: string; label: string }[]; total: number }>;
   isAdmin: boolean;
   onSave: (
     id: string,
@@ -51,6 +57,7 @@ const BearerKeyRow: React.FC<BearerKeyRowProps> = ({
   loading,
   availableServers,
   availableGroups,
+  searchGroups: searchGroupsFn,
   isAdmin,
   onSave,
   onDelete,
@@ -241,6 +248,7 @@ const BearerKeyRow: React.FC<BearerKeyRowProps> = ({
                     options={isGroupsMode ? availableGroups : availableServers}
                     selected={isGroupsMode ? selectedGroups : selectedServers}
                     onChange={isGroupsMode ? setSelectedGroups : setSelectedServers}
+                    searchFn={isGroupsMode ? searchGroupsFn : undefined}
                     placeholder={
                       isGroupsMode
                         ? t('settings.selectGroups') || 'Select groups...'
@@ -262,6 +270,7 @@ const BearerKeyRow: React.FC<BearerKeyRowProps> = ({
                       options={availableGroups}
                       selected={selectedGroups}
                       onChange={setSelectedGroups}
+                      searchFn={searchGroupsFn}
                       placeholder={t('settings.selectGroups') || 'Select groups...'}
                       disabled={loading}
                     />
@@ -423,7 +432,7 @@ const SettingsPage: React.FC = () => {
   const { showToast } = useToast();
   const { allServers: servers } = useServerContext(); // Use allServers for settings (not paginated)
   const { groups } = useGroupData();
-  const { auth } = useAuth();
+  const { auth, reloadAuth, exitGuestMode } = useAuth();
   const isAdmin = auth.user?.isAdmin === true;
 
   const [installConfig, setInstallConfig] = useState<{
@@ -504,6 +513,7 @@ const SettingsPage: React.FC = () => {
   });
 
   const [tempBetterAuthConfig, setTempBetterAuthConfig] = useState<{
+    baseUrl: string;
     basePath: string;
     trustedOrigins: string;
     oidcProviderId: string;
@@ -511,6 +521,7 @@ const SettingsPage: React.FC = () => {
     oidcScopes: string;
     oidcPrompt: string;
   }>({
+    baseUrl: '',
     basePath: '/api/auth/better',
     trustedOrigins: '',
     oidcProviderId: 'oidc',
@@ -668,6 +679,7 @@ const SettingsPage: React.FC = () => {
   useEffect(() => {
     if (betterAuthConfig) {
       setTempBetterAuthConfig({
+        baseUrl: betterAuthConfig.baseUrl || '',
         basePath: betterAuthConfig.basePath || '/api/auth/better',
         trustedOrigins: betterAuthConfig.trustedOrigins?.join(', ') || '',
         oidcProviderId: betterAuthConfig.providers.oidc.providerId || 'oidc',
@@ -770,8 +782,24 @@ const SettingsPage: React.FC = () => {
     // exposeHttp and httpPort are top-level config, not inside routing
     if (key === 'exposeHttp' || key === 'httpPort') {
       await updateSystemConfig({ [key]: value });
-    } else {
-      await updateRoutingConfig(key, value);
+      return;
+    }
+    await updateRoutingConfig(key, value);
+
+    // skipAuth toggle drives the auth mode for the whole app:
+    //  - ON  → reload auth so the public-config check admits a guest session,
+    //          effectively switching into guest mode live (no re-login needed).
+    //  - OFF → the guest session is no longer valid; clear local auth state
+    //          (skipAuth already persisted above by updateRoutingConfig) and
+    //          drop to the login page so the user must authenticate (or
+    //          re-enable guest) to continue.
+    if (key === 'skipAuth') {
+      if (value === true) {
+        await reloadAuth();
+      } else {
+        await exitGuestMode({ skipServerUpdate: true });
+        navigate('/login');
+      }
     }
   };
 
@@ -953,6 +981,7 @@ const SettingsPage: React.FC = () => {
 
   const handleBetterAuthTextChange = (
     key:
+      | 'baseUrl'
       | 'basePath'
       | 'trustedOrigins'
       | 'oidcProviderId'
@@ -975,6 +1004,7 @@ const SettingsPage: React.FC = () => {
 
   const handleSaveBetterAuthConfig = async () => {
     const updates: Parameters<typeof updateBetterAuthConfigBatch>[0] = {};
+    const normalizedBaseUrl = tempBetterAuthConfig.baseUrl.trim();
     const normalizedBasePath = tempBetterAuthConfig.basePath.trim() || '/api/auth/better';
     const normalizedTrustedOrigins = parseCommaSeparated(tempBetterAuthConfig.trustedOrigins) || [];
     const normalizedProviderId = tempBetterAuthConfig.oidcProviderId.trim() || 'oidc';
@@ -982,6 +1012,10 @@ const SettingsPage: React.FC = () => {
     const normalizedScopes =
       parseCommaSeparated(tempBetterAuthConfig.oidcScopes) || [...DEFAULT_OIDC_SCOPES];
     const normalizedPrompt = tempBetterAuthConfig.oidcPrompt.trim();
+
+    if (normalizedBaseUrl !== (betterAuthConfig.baseUrl || '')) {
+      updates.baseUrl = normalizedBaseUrl;
+    }
 
     if (normalizedBasePath !== betterAuthConfig.basePath) {
       updates.basePath = normalizedBasePath;
@@ -1333,6 +1367,20 @@ const SettingsPage: React.FC = () => {
     value: group.name,
     label: group.name,
   }));
+
+  // Backend paginated search backing the group MultiSelect dropdowns (SQL
+  // LIKE + LIMIT/OFFSET; `availableGroups` above stays as the selected-label
+  // fallback). Stable identity so MultiSelect's effect deps don't churn.
+  const groupSearchFn = useCallback(
+    async (searchKey: string, page: number, pageSize: number) => {
+      const res = await searchGroups(searchKey, page, pageSize);
+      return {
+        items: res.items.map((g) => ({ value: g.name, label: g.name })),
+        total: res.total,
+      };
+    },
+    [],
+  );
 
   // Reset selected arrays when accessType changes
   useEffect(() => {
@@ -1721,6 +1769,7 @@ const SettingsPage: React.FC = () => {
                           loading={loading}
                           availableServers={availableServers}
                           availableGroups={availableGroups}
+                          searchGroups={groupSearchFn}
                           isAdmin={isAdmin}
                           onSave={handleSaveExistingBearerKey}
                           onDelete={handleDeleteExistingBearerKey}
@@ -3086,6 +3135,26 @@ const SettingsPage: React.FC = () => {
                   disabled={loading}
                   checked={betterAuthConfig.enabled}
                   onCheckedChange={(checked) => handleBetterAuthToggle({ enabled: checked })}
+                />
+              </div>
+
+              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <div className="mb-2">
+                  <h3 className="font-medium text-gray-700">
+                    {t('settings.betterAuthBaseUrl') || 'Base URL'}
+                  </h3>
+                  <p className="text-sm text-gray-500">
+                    {t('settings.betterAuthBaseUrlDescription') ||
+                      'Public base URL used to build Better Auth redirect URIs. Falls back to the install base URL when empty; the BETTER_AUTH_URL environment variable takes precedence.'}
+                  </p>
+                </div>
+                <input
+                  type="text"
+                  value={tempBetterAuthConfig.baseUrl}
+                  onChange={(e) => handleBetterAuthTextChange('baseUrl', e.target.value)}
+                  placeholder="https://mcphub.example.com"
+                  className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
+                  disabled={loading}
                 />
               </div>
 

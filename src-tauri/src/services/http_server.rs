@@ -150,6 +150,7 @@ fn build_oauth_401(headers: &HeaderMap, reason: &str) -> Response {
 
 struct ServerHandle {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    stopped_rx: tokio::sync::watch::Receiver<bool>,
     port: u16,
     body_limit_bytes: usize,
 }
@@ -180,6 +181,8 @@ pub fn parse_body_limit(s: &str) -> usize {
 }
 
 static SERVER_HANDLE: OnceLock<Arc<Mutex<Option<ServerHandle>>>> = OnceLock::new();
+
+const HTTP_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn handle() -> &'static Arc<Mutex<Option<ServerHandle>>> {
     SERVER_HANDLE.get_or_init(|| Arc::new(Mutex::new(None)))
@@ -363,10 +366,16 @@ async fn check_bearer_auth(headers: &HeaderMap) -> Result<Option<BearerKey>, Res
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if !auth.starts_with("Bearer ") {
+    let mut auth_parts = auth.split_whitespace();
+    let Some(scheme) = auth_parts.next() else {
         return Err(build_oauth_401(headers, "missing"));
+    };
+    let Some(token) = auth_parts.next() else {
+        return Err(build_oauth_401(headers, "missing"));
+    };
+    if !scheme.eq_ignore_ascii_case("Bearer") || auth_parts.next().is_some() {
+        return Err(build_oauth_401(headers, "invalid"));
     }
-    let token = &auth[7..];
     match bearer_key_service::find_by_token(token).await {
         Ok(Some(key)) if key.enabled => Ok(Some(key)),
         _ => Err(build_oauth_401(headers, "invalid")),
@@ -418,7 +427,10 @@ async fn get_allowed_servers(key: Option<&BearerKey>) -> Option<HashSet<String>>
             }
             Some(servers)
         }
-        _ => None,
+        // Never treat malformed or future access types as unrestricted. A
+        // bearer key with an unknown scope is safer when denied than when it
+        // silently receives full server access.
+        _ => Some(HashSet::new()),
     }
 }
 
@@ -1606,8 +1618,14 @@ pub async fn start(port: u16, body_limit_bytes: usize) -> anyhow::Result<()> {
             log::info!("HTTP server already running on port {}", port);
             return Ok(());
         }
-        // Port or body limit changed — stop old instance
+        // Port or body limit changed — stop the old instance and wait until its
+        // listener is gone before binding the replacement. Binding first would
+        // either fail on the same port or leave the old listener orphaned when
+        // the handle is overwritten.
         log::info!("HTTP server config changed, restarting...");
+        if let Some(old) = guard.take() {
+            stop_handle(old).await;
+        }
     }
 
     let app = build_router(body_limit_bytes);
@@ -1674,8 +1692,7 @@ pub async fn start(port: u16, body_limit_bytes: usize) -> anyhow::Result<()> {
     // shutdown for long-lived connections): give in-flight requests a grace
     // period to finish, then force-close by dropping the serve future (which
     // aborts the listener + remaining connections) instead of waiting forever.
-    const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
-
+    let (stopped_tx, stopped_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         let serve = std::future::IntoFuture::into_future(
             axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -1696,14 +1713,14 @@ pub async fn start(port: u16, body_limit_bytes: usize) -> anyhow::Result<()> {
                 Err(e) => log::warn!("[shutdown] HTTP server ended with error: {e}"),
             },
             _ = &mut shutdown => {
-                match tokio::time::timeout(SHUTDOWN_GRACE, &mut serve).await {
+                match tokio::time::timeout(HTTP_SHUTDOWN_GRACE, &mut serve).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => log::warn!("[shutdown] HTTP server ended with error: {e}"),
                     Err(_) => {
                         log::warn!(
                             "[shutdown] HTTP server graceful shutdown exceeded {}s grace period; \
                              force-closing in-flight (long-lived SSE/HTTP) connections",
-                            SHUTDOWN_GRACE.as_secs()
+                            HTTP_SHUTDOWN_GRACE.as_secs()
                         );
                         // The `serve` future was dropped on timeout, aborting the
                         // listener and any remaining in-flight connections.
@@ -1712,10 +1729,12 @@ pub async fn start(port: u16, body_limit_bytes: usize) -> anyhow::Result<()> {
             }
         }
         log::info!("MCPHub HTTP server stopped");
+        let _ = stopped_tx.send(true);
     });
 
     *guard = Some(ServerHandle {
         shutdown_tx,
+        stopped_rx,
         port,
         body_limit_bytes,
     });
@@ -1726,16 +1745,42 @@ pub async fn start(port: u16, body_limit_bytes: usize) -> anyhow::Result<()> {
 pub async fn stop() {
     let mut guard = handle().lock().await;
     if let Some(h) = guard.take() {
-        let _ = h.shutdown_tx.send(true);
-        log::info!("MCPHub HTTP server shutdown requested");
-        set_status(HttpServerStatus {
-            running: false,
-            port: h.port,
-            error: None,
-            error_kind: None,
-            detail: None,
-        });
+        stop_handle(h).await;
     }
+}
+
+/// Signal one HTTP server task to stop and wait for it to release its listener.
+/// The receiver is a watch channel rather than a one-shot notification so the
+/// wait also succeeds when the task had already exited before the caller began
+/// waiting.
+async fn stop_handle(h: ServerHandle) {
+    let port = h.port;
+    let mut stopped_rx = h.stopped_rx;
+    let _ = h.shutdown_tx.send(true);
+    log::info!("MCPHub HTTP server shutdown requested");
+
+    if !*stopped_rx.borrow() {
+        let wait = async move {
+            while stopped_rx.changed().await.is_ok() && !*stopped_rx.borrow() {}
+        };
+        if tokio::time::timeout(HTTP_SHUTDOWN_GRACE + std::time::Duration::from_secs(1), wait)
+            .await
+            .is_err()
+        {
+            log::warn!(
+                "HTTP server on port {} did not confirm shutdown within the grace period",
+                port
+            );
+        }
+    }
+
+    set_status(HttpServerStatus {
+        running: false,
+        port,
+        error: None,
+        error_kind: None,
+        detail: None,
+    });
 }
 
 /// Returns the current port if the server is running.
@@ -1806,5 +1851,27 @@ pub async fn sync_with_config() {
             }
         }
         Err(e) => log::warn!("Could not read config for HTTP server sync: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unknown_bearer_scope_denies_all_servers() {
+        let key = BearerKey {
+            id: "id".to_string(),
+            name: "invalid-scope".to_string(),
+            token: "token".to_string(),
+            enabled: true,
+            access_type: "future-scope".to_string(),
+            allowed_groups: vec![],
+            allowed_servers: vec![],
+            created_at: String::new(),
+        };
+
+        let allowed = get_allowed_servers(Some(&key)).await;
+        assert_eq!(allowed, Some(HashSet::new()));
     }
 }

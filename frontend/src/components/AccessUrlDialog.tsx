@@ -15,7 +15,8 @@ interface AccessUrlDialogProps {
  */
 const AccessUrlDialog: React.FC<AccessUrlDialogProps> = ({ open, onClose }) => {
   const { t } = useTranslation();
-  const { exposeHttp, httpPort, routingConfig } = useSettingsData();
+  const { routingConfig } = useSettingsData();
+  const { exposeHttp, httpPort } = routingConfig;
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   const baseUrl = useMemo(() => `http://localhost:${httpPort}`, [httpPort]);
@@ -197,4 +198,3 @@ const AccessUrlDialog: React.FC<AccessUrlDialogProps> = ({ open, onClose }) => {
 };
 
 export default AccessUrlDialog;
-

@@ -20,12 +20,22 @@ export function buildChangelogFromTauriUpdate(update: UpdateInfo): ChangelogUpda
     hasUpdate: true,
     entries: update.notes
       ? [{
+          product: 'mcphub',
           version: update.version,
+          tagName: `v${update.version}`,
+          publishedAt: new Date().toISOString(),
+          url: releaseUrl,
+          changelogUrl: releaseUrl,
           title: update.version,
           summary: update.notes,
           highlights: [],
-          changelogUrl: releaseUrl,
-          url: releaseUrl,
+          fixes: [],
+          breakingChanges: [],
+          upgradeNotes: [],
+          categories: ['feature'],
+          locale: 'en',
+          bodyMarkdown: update.notes,
+          isStructured: false,
         }]
       : [],
     totalUpdateCount: 1,
@@ -60,4 +70,3 @@ export function shouldShowUpdateBadge(info: ChangelogUpdateInfo | null): boolean
 function normalizeLocale(value?: string): 'en' | 'zh' {
   return value?.toLowerCase().startsWith('zh') ? 'zh' : 'en';
 }
-

@@ -51,7 +51,9 @@ const KNOWN_KEYS = new Set<keyof ServerConfig | string>([
 /**
  * Parse server type from string, handling various formats
  */
-function parseServerType(typeStr: string | undefined): string {
+type NormalizedServerType = NonNullable<ServerConfig['type']>;
+
+function parseServerType(typeStr: string | undefined): NormalizedServerType {
   if (!typeStr) return 'stdio';
 
   const normalized = typeStr
@@ -129,15 +131,26 @@ export const normalizeImportedServers = (parsed: ImportJsonFormat): NormalizeRes
     // Detect the server type using multiple strategies (desktop: lenient detection).
     const detectedType = autoDetectType(config);
     normalizedConfig.type = parseServerType(detectedType);
+    // Preserve fields shared by the web and desktop server models. The old
+    // normalizer rebuilt only transport-specific fields, so descriptions and
+    // persisted connection options disappeared during import.
+    normalizedConfig.description = config.description;
+    normalizedConfig.options = config.options;
+    normalizedConfig.headers = config.headers;
+    normalizedConfig.passthroughHeaders = config.passthroughHeaders;
+    normalizedConfig.enableKeepAlive = config.enableKeepAlive;
+    normalizedConfig.keepAliveInterval = config.keepAliveInterval;
+    normalizedConfig.perSessionClient = config.perSessionClient;
+    normalizedConfig.visibility = config.visibility;
+    normalizedConfig.tools = config.tools;
+    normalizedConfig.prompts = config.prompts;
+    normalizedConfig.proxy = config.proxy;
     // Accept both `enabled` (mcphub) and `disabled` (Claude Desktop style)
     // so exported configs round-trip without losing the enabled state.
     normalizedConfig.enabled = config.enabled ?? !(config.disabled === true);
 
     if (normalizedConfig.type === 'sse' || normalizedConfig.type === 'streamable-http') {
       normalizedConfig.url = config.url;
-      if (config.headers) {
-        normalizedConfig.headers = config.headers;
-      }
       if (config.oauth) {
         normalizedConfig.oauth = config.oauth;
       }
@@ -150,10 +163,19 @@ export const normalizeImportedServers = (parsed: ImportJsonFormat): NormalizeRes
       }
     } else if (normalizedConfig.type === 'openapi') {
       normalizedConfig.openapi = config.openapi;
+      if (!config.openapi || (!config.openapi.url && !config.openapi.schema)) {
+        issues.push({
+          name,
+          message: `"openapi" servers require an "openapi.url" or "openapi.schema" field.`,
+        });
+        continue;
+      }
     } else {
       normalizedConfig.type = 'stdio';
       normalizedConfig.command = config.command;
       normalizedConfig.args = config.args || [];
+      normalizedConfig.startOnDemand = config.startOnDemand;
+      normalizedConfig.idleTimeoutMs = config.idleTimeoutMs;
       if (config.env) {
         normalizedConfig.env = config.env;
       }

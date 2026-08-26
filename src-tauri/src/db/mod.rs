@@ -1,10 +1,11 @@
 pub mod migration;
 
 use anyhow::Result;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
-use std::str::FromStr;
-use std::sync::OnceLock;
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    SqlitePool,
+};
+use std::{str::FromStr, sync::OnceLock, time::Duration};
 use tauri::{AppHandle, Manager};
 
 static DB_POOL: OnceLock<SqlitePool> = OnceLock::new();
@@ -27,12 +28,25 @@ pub async fn initialize(app: &AppHandle) -> Result<()> {
     // SQLx caches prepared statements by SQL text; SQLite recompiles SELECT *
     // after DDL and can then return more columns than SQLx's cached metadata,
     // which panics in row.rs during migration (seen on macOS ARM).
-    let options = SqliteConnectOptions::from_str(&db_url)?.statement_cache_capacity(0);
-
     // Foreign keys are intentionally OFF. Cleanup of child rows (e.g.
     // skill_exports when a skill is deleted) is done explicitly in code via
     // transactions (more flexible than ON DELETE CASCADE — lets us pick what
     // to clean per operation).
+    //
+    // PRAGMA tuning on every pooled connection:
+    //   - journal_mode=WAL: lets readers proceed concurrently with a writer
+    //     (default "delete" rollback journal is single-writer and serializes
+    //     all access, which caused SQLITE_BUSY under RAG + logging contention).
+    //   - busy_timeout=5000ms: instead of immediately returning "database is
+    //     locked" (code 5) when another writer holds the lock, wait up to 5s.
+    //     This was the root cause of `upsert_doc_sql` failing when the user
+    //     added RAG tags while app_log/activity_log writes were in flight,
+    //     leaving the rag_tags mirror empty.
+    let options = SqliteConnectOptions::from_str(&db_url)?
+        .statement_cache_capacity(0)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_millis(5000));
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(options)

@@ -1,7 +1,17 @@
 use crate::{db, models::bearer_key::{BearerKey, BearerKeyPayload}};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use sqlx::Row;
 use uuid::Uuid;
+
+fn validate_access_type(access_type: &str) -> Result<()> {
+    match access_type {
+        "all" | "groups" | "servers" | "custom" => Ok(()),
+        other => Err(anyhow!(
+            "Unsupported bearer key access type '{}'; expected all, groups, servers, or custom",
+            other
+        )),
+    }
+}
 
 pub async fn list_all() -> Result<Vec<BearerKey>> {
     let rows = sqlx::query(
@@ -60,6 +70,7 @@ pub async fn find_by_token(token: &str) -> Result<Option<BearerKey>> {
 }
 
 pub async fn create(payload: &BearerKeyPayload) -> Result<BearerKey> {
+    validate_access_type(&payload.access_type)?;
     let id = Uuid::new_v4().to_string();
     // Generate a random 32-byte bearer token
     let token = format!("mcphub_{}", Uuid::new_v4().simple());
@@ -98,6 +109,7 @@ pub async fn create(payload: &BearerKeyPayload) -> Result<BearerKey> {
 }
 
 pub async fn update(id: &str, payload: &BearerKeyPayload) -> Result<Option<BearerKey>> {
+    validate_access_type(&payload.access_type)?;
     let groups_json = serde_json::to_string(&payload.allowed_groups)?;
     let servers_json = serde_json::to_string(&payload.allowed_servers)?;
 
