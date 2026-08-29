@@ -1449,7 +1449,7 @@ PY
 - **批量进度 error phase**：`rag://batch-update-progress` 的 phase 增加 `"error"`（任务早期失败）；前端 useRagData 接受并清 running（不 refetch），BatchUpdateDialog 渲染 ⚠️ 失败态。
 - **i18n**：`batchUpdateFailed`/`contentUnavailableView`/`contentUnavailableOpen` 三个新键（4 语言，rag keys=179）。「查看/打开」置灰 tooltip 用通用文案（覆盖 symlink 原始丢失与 copy 拷贝丢失两种成因）。
 
-### 3.13 RAG 文档详情分页与可选自动更新（桌面端 1.0.32003）
+### 3.13 RAG 文档详情分页与可选自动更新（桌面端 1.0.32004）
 - `RagDoc` 的详情读取增加 UTF-8 安全分页字段：`truncated`、`nextOffset`、`contentTotalBytes`；旧的 `get_rag_doc` 全量接口继续保留给 MCP/兼容调用。
 - 新增 `get_rag_doc_paged` 和 `get_rag_chunks_paged` Tauri 命令，以及对应的 REST-to-IPC 路由。文档详情默认按 200 KiB 加载，分片详情每页 5 条。
 - RAG 设置增加 `autoUpdateEnabled`、`autoUpdateIntervalSecs`、`docLoadChunkKb`。桌面端自动更新默认关闭，只有用户显式开启后才定时检查原始文件。
@@ -1960,7 +1960,7 @@ npm run build
 - [X]  更新检查日志（`log_event` Tauri command 写入 `app_log`，前端 `[update]` 全流程日志：检查/新版本/已最新/失败/安装；日志页按来源 `update` 可过滤；详见 3.4.7）
 - [X]  release notes Markdown 渲染（`Markdown` 组件 react-markdown+remark-gfm；notes 即 `doc/upgrade/{version}.md` 全文；详见 3.4.7）
 - [X]  安装进度可视化（下载百分比进度条 + 已下载/总字节 + 实时下载速度 EMA；安装阶段 indeterminate spinner；按钮文案随阶段切换；详见 3.4.8）
-- [X]  版本号同步（`tauri.conf.json` / `Cargo.toml` / `Cargo.lock` / 根 `package.json` / 根 `package-lock.json` / `frontend/package.json` / `frontend/package-lock.json`；当前 1.0.32003；详见 3.4.7 / 3.13）
+- [X]  版本号同步（`tauri.conf.json` / `Cargo.toml` / `Cargo.lock` / 根 `package.json` / 根 `package-lock.json` / `frontend/package.json` / `frontend/package-lock.json`；当前 1.0.32004；详见 3.4.7 / 3.13）
 - [X]  stdio 服务器按需启动（startOnDemand：跳过启动连接、首次工具调用懒建进程、空闲超时自动关闭、缓存工具保留；详见 3.8）
 - [X]  stdio 连接错误包含上游 stderr（`stderr_tail` 滚动缓存拼接进 handshake 失败 error；详见 3.9）
 - [X]  编辑服务器避免无谓重连 + proxy 持久化（镜像上游 #1055：`update_server` 比对连接相关字段，仅访问/元数据变更时保留实时连接；`ServerConfig.proxy` + DB v22 持久化使前端 round-trip 生效；详见 3.11）
