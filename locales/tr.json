@@ -642,7 +642,21 @@
       "pathExists": "Bu dosya zaten içe aktarılmış",
       "batchUpdateFailed": "Toplu güncelleme başarısız - günlüklere bakın",
       "contentUnavailableView": "Belge içeriği okunamıyor",
-      "contentUnavailableOpen": "Dosya konumu açılamıyor"
+      "contentUnavailableOpen": "Dosya konumu açılamıyor",
+      "docUpdateSection": "Belge güncelleme ve yükleme",
+      "autoUpdateEnabled": "Belgeleri zamanlanmış olarak otomatik güncelle",
+      "autoUpdateHint": "Orijinal dosyaları arka planda düzenli olarak denetler ve değişen belgeleri yeniden indeksler. Manuel toplu güncelleme ile aynı ilerleme durumunu kullanır.",
+      "autoUpdateInterval": "Denetim aralığı (dakika)",
+      "autoUpdateIntervalHint": "Orijinal dosyaları her N dakikada bir denetler. Aralık: 1–1440 dakika.",
+      "unitMinutes": "dk",
+      "docLoadChunkKb": "Sayfa başına belge yükleme boyutu (KB)",
+      "docLoadChunkKbHint": "Büyük belgeler sayfa sayfa yüklenir. Devam etmek için Daha fazla yükle seçeneğini kullanın. Aralık: 10–65536 KB.",
+      "viewLoadedHint": "Yüklendi {{loaded}} / toplam {{total}}",
+      "viewLoadMore": "Daha fazla yükle",
+      "viewLoadMoreHint": "Sonraki içerik sayfasını yükle",
+      "chunksShownCount": "Yüklendi {{shown}} / {{total}} parça",
+      "chunksLoadMore": "{{count}} tane daha yükle",
+      "chunksAllLoaded": "Tüm parçalar yüklendi"
     }
   },
   "logs": {

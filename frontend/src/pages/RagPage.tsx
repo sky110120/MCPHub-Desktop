@@ -34,13 +34,17 @@ import { useToast } from '@/contexts/ToastContext';
 import { useRagData } from '@/hooks/useRagData';
 import { getRagTools, ragDocSearchPaged, ragTagSearchPaged } from '@/services/ragService';
 import type { BatchPreview, RagUpdateCheck } from '@/types';
-import { RagDoc, RagDocInfo, RagModelInfo, RagPickedFile, RagSettings, RagTagStat } from '@/types';
+import { RagChunk, RagDoc, RagDocInfo, RagModelInfo, RagPickedFile, RagSettings, RagTagStat } from '@/types';
 
 const formatSize = (bytes: number): string => {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 };
+
+// The backend pages document content by UTF-8 byte offset, not JavaScript
+// string length. Keep the loaded-size hint consistent with that contract.
+const utf8Bytes = (value: string): number => new TextEncoder().encode(value).length;
 
 // ─── 导入方式（软链接 / 文件拷贝）—— 已接真实后端 ───
 // 阶段 0 UI 预览已完成并定稿，mock 开关置 false 后所有交互走真实后端。
@@ -118,6 +122,8 @@ const RagPage: React.FC = () => {
     modelLimits,
     viewedDoc,
     viewLoading,
+    loadMoreView,
+    viewMoreLoading,
     searchResults,
     searching,
     uploading,
@@ -143,8 +149,11 @@ const RagPage: React.FC = () => {
     closeView,
     chunksDoc,
     chunksList,
+    chunksTotal,
     chunksLoading,
+    chunksMoreLoading,
     viewChunks,
+    loadMoreChunks,
     closeChunks,
     openLocation,
     search,
@@ -957,15 +966,17 @@ const RagPage: React.FC = () => {
       {viewedDoc && (
         <ViewDialog
           doc={viewedDoc}
+          moreLoading={viewMoreLoading}
+          onLoadMore={loadMoreView}
           onClose={closeView}
           onSaveTags={async (tags) => {
             await setTags(viewedDoc.id, tags);
-            await view(viewedDoc.id);
           }}
         />
       )}
 
-      {/* View chunks dialog - lists all chunks (index + text) of a doc */}
+      {/* View chunks dialog - loads chunks incrementally to keep large indexes
+          from creating a large WebView render tree at once. */}
       {chunksDoc && (
         <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
           <div className="bg-white dark:bg-gray-800 rounded-xl shadow-2xl max-w-2xl w-full mx-4 border border-gray-100 dark:border-gray-700 max-h-[85vh] flex flex-col">
@@ -977,46 +988,16 @@ const RagPage: React.FC = () => {
                 <X size={16} />
               </button>
             </div>
-            <div className="flex-1 overflow-y-auto p-5 space-y-3">
-              {chunksLoading ? (
-                <div className="flex items-center justify-center py-12">
-                  <Loader2 size={22} className="animate-spin" style={{ color: 'var(--hub-ink-3)' }} />
-                </div>
-              ) : chunksList.length === 0 ? (
-                <p className="text-[13px] text-center py-12" style={{ color: 'var(--hub-ink-3)' }}>
-                  {t('pages.rag.chunksEmpty')}
-                </p>
-              ) : (
-                chunksList.map((c) => (
-                  <div
-                    key={c.chunkIndex}
-                    className="rounded-lg border p-3"
-                    style={{ borderColor: 'var(--hub-line-2)', background: 'var(--hub-bg-2)' }}
-                  >
-                    <div className="flex items-center justify-between mb-2">
-                      <span
-                        className="hub-mono text-[11px] px-2 py-0.5 rounded"
-                        style={{ background: 'var(--hub-line)', color: 'var(--hub-ink-2)' }}
-                      >
-                        #{c.chunkIndex + 1}
-                      </span>
-                      <span className="hub-mono text-[11px]" style={{ color: 'var(--hub-ink-3)' }}>
-                        {t('pages.rag.chunkTokens', { count: c.chunkText.length })}
-                      </span>
-                    </div>
-                    <pre
-                      className="text-[12px] whitespace-pre-wrap break-words"
-                      style={{ color: 'var(--hub-ink)', fontFamily: 'inherit', margin: 0 }}
-                    >
-                      {c.chunkText}
-                    </pre>
-                  </div>
-                ))
-              )}
-            </div>
+            <ChunksScrollList
+              chunks={chunksList}
+              total={chunksTotal}
+              loading={chunksLoading}
+              moreLoading={chunksMoreLoading}
+              onLoadMore={loadMoreChunks}
+            />
             <div className="flex items-center justify-between p-5 border-t border-[var(--hub-line-2)]">
               <span className="text-[12px] hub-mono" style={{ color: 'var(--hub-ink-3)' }}>
-                {t('pages.rag.chunksCount', { count: chunksList.length })}
+                {t('pages.rag.chunksShownCount', { shown: chunksList.length, total: chunksTotal })}
               </span>
               <button onClick={closeChunks} className="hub-btn">
                 {t('pages.rag.close')}
@@ -1804,6 +1785,15 @@ const SearchSettingsDialog: React.FC<{
   const [chunkSize, setChunkSize] = useState(initial.chunkSize === 0 ? resolvedSize : initial.chunkSize);
   const [chunkOverlap, setChunkOverlap] = useState(initial.chunkOverlap === 0 ? resolvedOverlap : initial.chunkOverlap);
   const [chunkAuto, setChunkAuto] = useState(initial.chunkSize === 0);
+  // Background source update is opt-in on desktop. The backend clamps the
+  // interval to 60 seconds through 24 hours; the UI edits whole minutes.
+  const [autoUpdateEnabled, setAutoUpdateEnabled] = useState(initial.autoUpdateEnabled ?? false);
+  const [autoUpdateIntervalMin, setAutoUpdateIntervalMin] = useState(
+    Math.max(1, Math.min(1440, Math.round((initial.autoUpdateIntervalSecs ?? 300) / 60))),
+  );
+  const [docLoadChunkKb, setDocLoadChunkKb] = useState(
+    Math.max(10, Math.min(65_536, initial.docLoadChunkKb || 200)),
+  );
   const sum = vectorWeight + keywordWeight;
 
   const handleVectorChange = (v: number) => {
@@ -1910,6 +1900,53 @@ const SearchSettingsDialog: React.FC<{
               </p>
             </div>
           </div>
+          <div className="border-t border-[var(--hub-line-2)] pt-4 space-y-4">
+            <p className="text-[12px] font-medium" style={{ color: 'var(--hub-ink-2)' }}>
+              {t('pages.rag.docUpdateSection')}
+            </p>
+            <div>
+              <label className="flex items-center gap-2 text-[13px] cursor-pointer" style={{ color: 'var(--hub-ink)' }}>
+                <input
+                  type="checkbox"
+                  checked={autoUpdateEnabled}
+                  onChange={(e) => setAutoUpdateEnabled(e.target.checked)}
+                  style={{ accentColor: 'var(--hub-accent)' }}
+                />
+                {t('pages.rag.autoUpdateEnabled')}
+              </label>
+              <p className="mt-1 text-[12px]" style={{ color: 'var(--hub-ink-3)' }}>
+                {t('pages.rag.autoUpdateHint')}
+              </p>
+            </div>
+            <div style={autoUpdateEnabled ? undefined : { opacity: 0.5, pointerEvents: 'none' }}>
+              <NumericSlider
+                label={t('pages.rag.autoUpdateInterval')}
+                value={autoUpdateIntervalMin}
+                min={1}
+                max={1440}
+                step={1}
+                unit={t('pages.rag.unitMinutes')}
+                onChange={setAutoUpdateIntervalMin}
+              />
+              <p className="mt-1 text-[12px]" style={{ color: 'var(--hub-ink-3)' }}>
+                {t('pages.rag.autoUpdateIntervalHint')}
+              </p>
+            </div>
+            <div>
+              <NumericSlider
+                label={t('pages.rag.docLoadChunkKb')}
+                value={docLoadChunkKb}
+                min={10}
+                max={65_536}
+                step={10}
+                unit="KB"
+                onChange={(value) => setDocLoadChunkKb(Math.max(10, Math.min(65_536, value)))}
+              />
+              <p className="mt-1 text-[12px]" style={{ color: 'var(--hub-ink-3)' }}>
+                {t('pages.rag.docLoadChunkKbHint')}
+              </p>
+            </div>
+          </div>
         </div>
         <div className="flex items-center justify-end gap-2 p-5 border-t border-[var(--hub-line-2)]">
           <button onClick={onClose} className="hub-btn">
@@ -1925,6 +1962,9 @@ const SearchSettingsDialog: React.FC<{
                 // Auto: send 0 so the backend resolves per loaded model.
                 chunkSize: chunkAuto ? 0 : chunkSize,
                 chunkOverlap: chunkAuto ? 0 : chunkOverlap,
+                autoUpdateEnabled,
+                autoUpdateIntervalSecs: autoUpdateIntervalMin * 60,
+                docLoadChunkKb,
               })
             }
             className="hub-btn primary"
@@ -2472,9 +2512,11 @@ const TagEditor: React.FC<{ tags: string[]; onChange: (tags: string[]) => void }
  *  with the full new list on every change. */
 const ViewDialog: React.FC<{
   doc: RagDoc;
+  moreLoading: boolean;
+  onLoadMore: () => void;
   onClose: () => void;
   onSaveTags: (tags: string[]) => Promise<void>;
-}> = ({ doc, onClose, onSaveTags }) => {
+}> = ({ doc, moreLoading, onLoadMore, onClose, onSaveTags }) => {
   const { t } = useTranslation();
   const [tags, setTags] = useState<string[]>(doc.tags || []);
   const [busy, setBusy] = useState(false);
@@ -2634,6 +2676,29 @@ const ViewDialog: React.FC<{
               raw={mode === 'source'}
             />
           </div>
+          {doc.truncated && (
+            <div
+              className="flex items-center justify-between gap-2 rounded-lg border px-3"
+              style={{ borderColor: 'var(--hub-line-2)', background: 'var(--hub-surface)', padding: '8px 12px' }}
+            >
+              <span className="text-[12px] hub-mono" style={{ color: 'var(--hub-ink-3)' }}>
+                {t('pages.rag.viewLoadedHint', {
+                  loaded: formatSize(utf8Bytes(doc.content)),
+                  total: formatSize(doc.contentTotalBytes ?? 0),
+                })}
+              </span>
+              <button
+                type="button"
+                onClick={onLoadMore}
+                disabled={moreLoading}
+                className="hub-btn sm inline-flex items-center gap-1"
+                title={t('pages.rag.viewLoadMoreHint')}
+              >
+                {moreLoading ? <Loader2 size={13} className="animate-spin" /> : <ChevronDown size={13} />}
+                {t('pages.rag.viewLoadMore')}
+              </button>
+            </div>
+          )}
         </div>
         <div className="flex items-center justify-end gap-2 p-5 border-t border-[var(--hub-line-2)]">
           <button onClick={onClose} className="hub-btn">
@@ -2641,6 +2706,91 @@ const ViewDialog: React.FC<{
           </button>
         </div>
       </div>
+    </div>
+  );
+};
+
+/** Scrollable chunk list with automatic loading near the bottom and a manual
+ * fallback button for short containers or browsers that do not emit a useful
+ * final scroll event. */
+const ChunksScrollList: React.FC<{
+  chunks: RagChunk[];
+  total: number;
+  loading: boolean;
+  moreLoading: boolean;
+  onLoadMore: () => void;
+}> = ({ chunks, total, loading, moreLoading, onLoadMore }) => {
+  const { t } = useTranslation();
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const hasMore = chunks.length < total;
+
+  const handleScroll = useCallback(() => {
+    const element = scrollRef.current;
+    if (!element || loading || moreLoading || !hasMore) return;
+    if (element.scrollHeight - element.scrollTop - element.clientHeight < 40) {
+      onLoadMore();
+    }
+  }, [loading, moreLoading, hasMore, onLoadMore]);
+
+  return (
+    <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto p-5 space-y-3">
+      {loading ? (
+        <div className="flex items-center justify-center py-12">
+          <Loader2 size={22} className="animate-spin" style={{ color: 'var(--hub-ink-3)' }} />
+        </div>
+      ) : chunks.length === 0 ? (
+        <p className="text-[13px] text-center py-12" style={{ color: 'var(--hub-ink-3)' }}>
+          {t('pages.rag.chunksEmpty')}
+        </p>
+      ) : (
+        <>
+          {chunks.map((chunk) => (
+            <div
+              key={chunk.chunkIndex}
+              className="rounded-lg border p-3"
+              style={{ borderColor: 'var(--hub-line-2)', background: 'var(--hub-bg-2)' }}
+            >
+              <div className="flex items-center justify-between mb-2">
+                <span
+                  className="hub-mono text-[11px] px-2 py-0.5 rounded"
+                  style={{ background: 'var(--hub-line)', color: 'var(--hub-ink-2)' }}
+                >
+                  #{chunk.chunkIndex + 1}
+                </span>
+                <span className="hub-mono text-[11px]" style={{ color: 'var(--hub-ink-3)' }}>
+                  {t('pages.rag.chunkTokens', { count: chunk.chunkText.length })}
+                </span>
+              </div>
+              <pre
+                className="text-[12px] whitespace-pre-wrap break-words"
+                style={{ color: 'var(--hub-ink)', fontFamily: 'inherit', margin: 0 }}
+              >
+                {chunk.chunkText}
+              </pre>
+            </div>
+          ))}
+          {hasMore ? (
+            <div className="flex items-center justify-center py-3">
+              {moreLoading ? (
+                <Loader2 size={16} className="animate-spin" style={{ color: 'var(--hub-ink-3)' }} />
+              ) : (
+                <button type="button" className="hub-btn sm" onClick={onLoadMore}>
+                  <ChevronDown size={13} />
+                  {t('pages.rag.chunksLoadMore', { count: Math.min(5, total - chunks.length) })}
+                </button>
+              )}
+            </div>
+          ) : (
+            <div
+              className="flex items-center justify-center gap-1.5 text-[11px] py-3"
+              style={{ color: 'var(--hub-ink-3)' }}
+            >
+              <Check size={12} />
+              {t('pages.rag.chunksAllLoaded')}
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 };

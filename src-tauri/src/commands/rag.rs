@@ -4,8 +4,8 @@
 use tauri::AppHandle;
 
 use crate::models::rag::{
-    BatchPreview, RagDoc, RagDocInfo, RagPickedFile, RagSearchResult, RagSettings, RagStatus,
-    RagTagPage, RagTagStat, RagUpdateCheck,
+    BatchPreview, RagChunkPage, RagDoc, RagDocInfo, RagPickedFile, RagSearchResult, RagSettings,
+    RagStatus, RagTagPage, RagTagStat, RagUpdateCheck,
 };
 use crate::rag::service;
 
@@ -29,11 +29,37 @@ pub async fn get_rag_doc(app: AppHandle, id: String) -> Result<Option<RagDoc>, S
     service::get_doc(&app, &id).await.map_err(|e| e.to_string())
 }
 
+/// Read one UTF-8-safe page of document content for the View dialog.
+/// `limit_bytes = 0` uses the configured document page size.
+#[tauri::command]
+pub async fn get_rag_doc_paged(
+    app: AppHandle,
+    id: String,
+    offset_bytes: u64,
+    limit_bytes: u64,
+) -> Result<Option<RagDoc>, String> {
+    service::get_doc_paged(&app, &id, offset_bytes, limit_bytes)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Read a document's chunks (index + text, no embeddings) for the "view
 /// chunks" dialog. Requires RAG enabled (chunks live in lancedb).
 #[tauri::command]
 pub async fn get_rag_chunks(id: String) -> Result<Vec<crate::models::rag::RagChunk>, String> {
     service::get_doc_chunks(&id).await.map_err(|e| e.to_string())
+}
+
+/// Read a bounded page of document chunks for the View chunks dialog.
+#[tauri::command]
+pub async fn get_rag_chunks_paged(
+    id: String,
+    offset: u32,
+    page_size: u32,
+) -> Result<RagChunkPage, String> {
+    service::get_doc_chunks_paged(&id, offset, page_size)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Open the OS multi-file picker (no extension filter — validation is
@@ -234,8 +260,10 @@ pub async fn rag_tools() -> Result<Vec<serde_json::Value>, String> {
 }
 
 #[tauri::command]
-pub async fn save_rag_settings(settings: RagSettings) -> Result<(), String> {
-    service::save_settings(settings).await.map_err(|e| e.to_string())
+pub async fn save_rag_settings(app: AppHandle, settings: RagSettings) -> Result<(), String> {
+    service::save_settings_and_rearm(&app, settings)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

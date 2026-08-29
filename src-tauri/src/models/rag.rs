@@ -32,6 +32,17 @@ pub struct RagSettings {
     /// value is an explicit override. Default 0 (auto).
     #[serde(default = "default_chunk_overlap")]
     pub chunk_overlap: u32,
+    /// Periodically check recorded source files and re-index changed docs.
+    /// Desktop defaults this to false so background disk scanning is opt-in.
+    #[serde(default = "default_auto_update_enabled")]
+    pub auto_update_enabled: bool,
+    /// Auto-update interval in seconds. Clamped by the service to 60..86400.
+    #[serde(default = "default_auto_update_interval_secs")]
+    pub auto_update_interval_secs: u64,
+    /// Maximum content loaded per document-detail request, in KiB.
+    /// Clamped by the service to 10..65536.
+    #[serde(default = "default_doc_load_chunk_kb")]
+    pub doc_load_chunk_kb: u32,
 }
 
 fn default_vector_weight() -> f32 {
@@ -60,6 +71,15 @@ fn default_chunk_overlap() -> u32 {
     // 0 = "auto" — resolved per loaded model (deploy.json `chunkOverlap`, else 100).
     0
 }
+fn default_auto_update_enabled() -> bool {
+    false
+}
+fn default_auto_update_interval_secs() -> u64 {
+    300
+}
+fn default_doc_load_chunk_kb() -> u32 {
+    200
+}
 
 /// Default content version (1) for legacy docs whose `.meta` predates the
 /// `version` field (serde fills it for missing/corrupt values). Referenced by
@@ -79,6 +99,9 @@ impl Default for RagSettings {
             score_threshold: 0.65,
             chunk_size: 0,
             chunk_overlap: 0,
+            auto_update_enabled: false,
+            auto_update_interval_secs: 300,
+            doc_load_chunk_kb: 200,
         }
     }
 }
@@ -176,6 +199,15 @@ pub struct RagDoc {
     /// still has its copy, so view works.
     #[serde(default)]
     pub content_available: bool,
+    /// Whether `content` is only a prefix of the full document.
+    #[serde(default)]
+    pub truncated: bool,
+    /// UTF-8 byte offset immediately after the returned content.
+    #[serde(default)]
+    pub next_offset: u64,
+    /// Full decoded document size in UTF-8 bytes.
+    #[serde(default)]
+    pub content_total_bytes: u64,
 }
 
 /// A search result fragment.
@@ -196,6 +228,16 @@ pub struct RagSearchResult {
 pub struct RagChunk {
     pub chunk_index: i64,
     pub chunk_text: String,
+}
+
+/// A page of document chunks for the RAG detail dialog.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RagChunkPage {
+    pub items: Vec<RagChunk>,
+    pub total: u64,
+    pub offset: u32,
+    pub page_size: u32,
 }
 
 /// A tag with the number of documents that carry it.

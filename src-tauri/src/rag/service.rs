@@ -22,8 +22,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::models::rag::{
-    BatchPreview, RagDoc, RagDocInfo, RagDocPage, RagPickedFile, RagSearchResult, RagSettings,
-    RagStatus, RagTagPage, RagTagStat, RagUpdateCheck,
+    BatchPreview, RagChunkPage, RagDoc, RagDocInfo, RagDocPage, RagPickedFile, RagSearchResult,
+    RagSettings, RagStatus, RagTagPage, RagTagStat, RagUpdateCheck,
 };
 use crate::rag::chunker::chunk_document;
 use crate::rag::embedder::{
@@ -145,6 +145,12 @@ fn emit_batch_update_progress(app: &AppHandle, current: u32, total: u32, name: &
 /// progress dialog instead of re-triggering, but this is the backend guard).
 static BATCH_UPDATE_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Generation for the optional scheduled update loop. Incrementing it retires
+/// the previous loop without cancelling a Tokio task while it holds a model or
+/// database lock.
+static AUTO_UPDATE_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Serializes all doc-mutating operations (update from original/file, MCP
 /// rag_file_update, delete, set-tags) so concurrent read-modify-write of the
@@ -962,10 +968,12 @@ pub async fn start(app: &AppHandle) -> Result<()> {
     } else {
         rag_log("info", "RAG enabled (model + vector DB ready)");
     }
+    restart_auto_update_timer(app);
     Ok(())
 }
 
 pub async fn stop() {
+    AUTO_UPDATE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let rss_before = crate::rag::embedder::process_rss_mib().unwrap_or(0);
     let mut guard = runtime().lock().await;
     if let Some(rt) = guard.take() {
@@ -1908,8 +1916,38 @@ pub async fn search_docs_paged(
     })
 }
 
-/// Get the full content of a document (for the View dialog).
+/// Get the full content of a document for MCP and legacy callers.
 pub async fn get_doc(app: &AppHandle, id: &str) -> Result<Option<RagDoc>> {
+    match get_doc_inner(app, id, None).await? {
+        Some((doc, _)) => Ok(Some(doc)),
+        None => Ok(None),
+    }
+}
+
+/// Read a document in a UTF-8 byte window. A zero limit uses the configured
+/// detail page size. The returned metadata reports whether more content exists.
+pub async fn get_doc_paged(
+    app: &AppHandle,
+    id: &str,
+    offset_bytes: u64,
+    limit_bytes: u64,
+) -> Result<Option<RagDoc>> {
+    let limit = if limit_bytes == 0 {
+        (get_settings().await.unwrap_or_default().doc_load_chunk_kb as u64) * 1024
+    } else {
+        limit_bytes
+    };
+    match get_doc_inner(app, id, Some((offset_bytes, limit))).await? {
+        Some((doc, _)) => Ok(Some(doc)),
+        None => Ok(None),
+    }
+}
+
+async fn get_doc_inner(
+    app: &AppHandle,
+    id: &str,
+    range: Option<(u64, u64)>,
+) -> Result<Option<(RagDoc, u64)>> {
     let dir = files_dir(app)?;
     let meta_path = dir.join(format!("{}.meta", id));
     let Ok(meta_bytes) = std::fs::read(&meta_path) else {
@@ -1937,30 +1975,59 @@ pub async fn get_doc(app: &AppHandle, id: &str) -> Result<Option<RagDoc>> {
         Ok(content) => (content, true),
         Err(_) => (String::new(), false),
     };
-    Ok(Some(RagDoc {
-        id: meta.id,
-        name: meta.name.clone(),
-        size: meta.size,
-        content,
-        uploaded_at: meta.uploaded_at,
-        tags: meta.tags,
-        chunk_count: meta.chunk_count,
-        file_type: meta
-            .file_type
-            .clone()
-            .unwrap_or_else(|| file_type_label(&meta.name)),
-        method: meta.method.clone().unwrap_or_default(),
-        original_path: meta.original_path.clone().unwrap_or_default(),
-        lost_original,
-        content_available,
-    }))
+    let total_bytes = content.len() as u64;
+    let (content, truncated, next_offset) = match range {
+        Some((offset, limit)) => slice_utf8_window(&content, offset, limit),
+        None => (content, false, total_bytes),
+    };
+    Ok(Some((
+        RagDoc {
+            id: meta.id,
+            name: meta.name.clone(),
+            size: meta.size,
+            content,
+            uploaded_at: meta.uploaded_at,
+            tags: meta.tags,
+            chunk_count: meta.chunk_count,
+            file_type: meta
+                .file_type
+                .clone()
+                .unwrap_or_else(|| file_type_label(&meta.name)),
+            method: meta.method.clone().unwrap_or_default(),
+            original_path: meta.original_path.clone().unwrap_or_default(),
+            lost_original,
+            content_available,
+            truncated,
+            next_offset,
+            content_total_bytes: total_bytes,
+        },
+        total_bytes,
+    )))
 }
 
-/// Read a document's chunks (index + text, no embeddings) for the "view chunks"
-/// dialog. Returns chunks ordered by `chunk_index`. Requires RAG enabled
-/// (chunks live in lancedb). Returns an empty vec if the doc has no chunks
-/// (not yet indexed / model swapped + not re-indexed).
+/// Read all chunks for MCP and legacy callers.
 pub async fn get_doc_chunks(id: &str) -> Result<Vec<crate::models::rag::RagChunk>> {
+    let (items, _) = get_doc_chunks_inner(id, 0, u32::MAX).await?;
+    Ok(items)
+}
+
+/// Read a page of chunks for the RAG detail dialog.
+pub async fn get_doc_chunks_paged(id: &str, offset: u32, page_size: u32) -> Result<RagChunkPage> {
+    let page_size = page_size.clamp(1, 200);
+    let (items, total) = get_doc_chunks_inner(id, offset, page_size).await?;
+    Ok(RagChunkPage {
+        items,
+        total,
+        offset,
+        page_size,
+    })
+}
+
+async fn get_doc_chunks_inner(
+    id: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<(Vec<crate::models::rag::RagChunk>, u64)> {
     let guard = runtime().lock().await;
     let Some(rt) = guard.as_ref() else {
         return Err(anyhow!(
@@ -1969,13 +2036,17 @@ pub async fn get_doc_chunks(id: &str) -> Result<Vec<crate::models::rag::RagChunk
     };
     let mut records = rt.db.read_chunks_by_doc(id).await?;
     records.sort_by_key(|r| r.chunk_index);
-    Ok(records
+    let total = records.len() as u64;
+    let items = records
         .into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
         .map(|r| crate::models::rag::RagChunk {
             chunk_index: r.chunk_index,
             chunk_text: r.chunk_text,
         })
-        .collect())
+        .collect();
+    Ok((items, total))
 }
 
 /// Open the OS multi-file picker. No extension filter — validation is
@@ -3882,6 +3953,88 @@ async fn run_batch_update(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
+// ── scheduled source update ────────────────────────────────────────────────
+
+/// Start one optional source-file update loop. A generation lets settings
+/// changes and RAG shutdown retire the previous loop without aborting a task
+/// while it holds the runtime or metadata lock.
+pub fn restart_auto_update_timer(app: &AppHandle) {
+    let generation = AUTO_UPDATE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let settings = match get_settings().await {
+                Ok(settings) => settings,
+                Err(e) => {
+                    rag_log("warn", format!("auto-update settings read failed: {}", e));
+                    return;
+                }
+            };
+            if !settings.auto_update_enabled || !is_enabled() {
+                return;
+            }
+
+            let total = std::time::Duration::from_secs(settings.auto_update_interval_secs);
+            let slice = std::time::Duration::from_millis(500);
+            let mut waited = std::time::Duration::ZERO;
+            while waited < total {
+                let step = slice.min(total - waited);
+                tokio::time::sleep(step).await;
+                waited += step;
+                if AUTO_UPDATE_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                    return;
+                }
+            }
+
+            if !is_enabled() {
+                return;
+            }
+            if BATCH_UPDATE_RUNNING
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_err()
+            {
+                continue;
+            }
+
+            struct RunningGuard;
+            impl Drop for RunningGuard {
+                fn drop(&mut self) {
+                    BATCH_UPDATE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _guard = RunningGuard;
+
+            let preview = match preview_batch_update(&app).await {
+                Ok(preview) => preview,
+                Err(e) => {
+                    rag_log("warn", format!("auto-update preview failed: {}", e));
+                    continue;
+                }
+            };
+            if preview.to_update == 0 {
+                continue;
+            }
+
+            rag_log(
+                "info",
+                format!(
+                    "auto-update: {} of {} document(s) changed, re-indexing",
+                    preview.to_update, preview.total
+                ),
+            );
+            if let Err(e) = run_batch_update(&app).await {
+                rag_log("error", format!("auto-update failed: {:#}", e));
+                emit_batch_update_progress(&app, 0, 0, "", "error");
+            }
+        }
+    });
+}
+
 // ── search ─────────────────────────────────────────────────────────────────
 
 /// Hybrid search: vector nearest-neighbor + keyword (term) matching, merged
@@ -4087,10 +4240,27 @@ pub async fn get_settings() -> Result<RagSettings> {
             .and_then(|v| v.as_u64())
             .map(|v| v as u32)
             .unwrap_or(d.chunk_overlap),
+        auto_update_enabled: rag
+            .get("autoUpdateEnabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(d.auto_update_enabled),
+        auto_update_interval_secs: rag
+            .get("autoUpdateIntervalSecs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(d.auto_update_interval_secs)
+            .clamp(60, 86_400),
+        doc_load_chunk_kb: rag
+            .get("docLoadChunkKb")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
+            .unwrap_or(d.doc_load_chunk_kb)
+            .clamp(10, 65_536),
     })
 }
 
 pub async fn save_settings(settings: RagSettings) -> Result<()> {
+    let interval = settings.auto_update_interval_secs.clamp(60, 86_400);
+    let doc_load_chunk_kb = settings.doc_load_chunk_kb.clamp(10, 65_536);
     let patch = json!({
         "rag": {
             "vectorWeight": settings.vector_weight as f64,
@@ -4098,14 +4268,44 @@ pub async fn save_settings(settings: RagSettings) -> Result<()> {
             "maxResults": settings.max_results,
             "scoreThreshold": settings.score_threshold as f64,
             "chunkSize": settings.chunk_size,
-            "chunkOverlap": settings.chunk_overlap
+            "chunkOverlap": settings.chunk_overlap,
+            "autoUpdateEnabled": settings.auto_update_enabled,
+            "autoUpdateIntervalSecs": interval,
+            "docLoadChunkKb": doc_load_chunk_kb
         }
     });
     crate::services::config_service::update(&patch).await?;
     Ok(())
 }
 
+/// Persist RAG settings and immediately apply auto-update changes.
+pub async fn save_settings_and_rearm(app: &AppHandle, settings: RagSettings) -> Result<()> {
+    save_settings(settings).await?;
+    restart_auto_update_timer(app);
+    Ok(())
+}
+
 // ── helpers ─────────────────────────────────────────────────────────────────
+
+/// Return a UTF-8-safe byte window and the offset immediately after it.
+/// Offsets from the UI are expected to be character boundaries, but backing
+/// off and extending to boundaries makes the command safe for arbitrary input.
+fn slice_utf8_window(content: &str, offset_bytes: u64, limit_bytes: u64) -> (String, bool, u64) {
+    let total = content.len() as u64;
+    let mut start = offset_bytes.min(total) as usize;
+    while start > 0 && !content.is_char_boundary(start) {
+        start -= 1;
+    }
+
+    let available = content.len().saturating_sub(start);
+    let requested = (limit_bytes as usize).min(available);
+    let mut end = start.saturating_add(requested);
+    while end < content.len() && !content.is_char_boundary(end) {
+        end += 1;
+    }
+
+    (content[start..end].to_string(), end < content.len(), end as u64)
+}
 
 /// Sniff whether `bytes` look like plain text (vs binary). Content-based — we
 /// don't trust the file extension (text extensions can't be exhaustively
@@ -4265,5 +4465,24 @@ mod tests {
         let content = read_file_content(&path, "test.txt").unwrap();
         assert_eq!(content, original);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn slice_utf8_window_preserves_character_boundaries() {
+        let content = "a中b😀c";
+        let (first, truncated, next) = slice_utf8_window(content, 0, 3);
+        assert_eq!(first, "a中");
+        assert!(truncated);
+        assert_eq!(next, "a中".len() as u64);
+
+        let (second, truncated, next) = slice_utf8_window(content, next, 3);
+        assert_eq!(second, "b😀");
+        assert!(truncated);
+        assert_eq!(next, "a中b😀".len() as u64);
+
+        let (last, truncated, next) = slice_utf8_window(content, next, 3);
+        assert_eq!(last, "c");
+        assert!(!truncated);
+        assert_eq!(next, content.len() as u64);
     }
 }

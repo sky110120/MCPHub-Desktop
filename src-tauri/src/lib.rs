@@ -478,7 +478,9 @@ pub fn run() {
             commands::rag::rag_status,
             commands::rag::list_rag_docs,
             commands::rag::get_rag_doc,
+            commands::rag::get_rag_doc_paged,
             commands::rag::get_rag_chunks,
+            commands::rag::get_rag_chunks_paged,
             commands::rag::pick_rag_files,
             commands::rag::pick_rag_folder,
             commands::rag::upload_rag_doc,
@@ -506,4 +508,3 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running MCPHub application");
 }
-

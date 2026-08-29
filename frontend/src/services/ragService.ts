@@ -3,6 +3,7 @@ import {
   RagDoc,
   RagDocInfo,
   RagChunk,
+  RagChunkPage,
   RagPickedFile,
   RagSettings,
   RagSearchResult,
@@ -38,9 +39,24 @@ export const listRagDocs = async (): Promise<RagDocInfo[]> => {
   return response.data || [];
 };
 
-/** Get the full content of a document (for the View dialog). */
+/** Get the full content of a document (for MCP and legacy callers). */
 export const getRagDoc = async (id: string): Promise<RagDoc | null> => {
   const response: ApiResponse<RagDoc | null> = await apiGet(`/rag/docs/${encodeURIComponent(id)}`);
+  if (!response.success) throw new Error(response.message || 'Failed to get RAG doc');
+  return response.data ?? null;
+};
+
+/** Read one UTF-8-safe page of document content for the View dialog. */
+export const getRagDocPaged = async (
+  id: string,
+  offsetBytes: number,
+  limitBytes: number,
+): Promise<RagDoc | null> => {
+  const response: ApiResponse<RagDoc | null> = await apiPost('/rag/docs/get-paged', {
+    id,
+    offsetBytes,
+    limitBytes,
+  });
   if (!response.success) throw new Error(response.message || 'Failed to get RAG doc');
   return response.data ?? null;
 };
@@ -51,6 +67,21 @@ export const getRagChunks = async (id: string): Promise<RagChunk[]> => {
   const response: ApiResponse<RagChunk[]> = await apiPost('/rag/docs/chunks', { id });
   if (!response.success) throw new Error(response.message || 'Failed to get RAG chunks');
   return response.data ?? [];
+};
+
+/** Read a bounded page of document chunks for the View chunks dialog. */
+export const getRagChunksPaged = async (
+  id: string,
+  offset: number,
+  pageSize: number,
+): Promise<RagChunkPage> => {
+  const response: ApiResponse<RagChunkPage> = await apiPost('/rag/docs/chunks-paged', {
+    id,
+    offset,
+    pageSize,
+  });
+  if (!response.success) throw new Error(response.message || 'Failed to get RAG chunks');
+  return response.data ?? { items: [], total: 0, offset, pageSize };
 };
 
 /**
@@ -212,12 +243,22 @@ export const ragDocSearchPaged = async (
   return response.data ?? { items: [], total: 0, page, pageSize };
 };
 
-/** Get RAG search settings (weights + max results). */
+/** Get RAG search settings (weights + max results + background update settings). */
 export const getRagSettings = async (): Promise<RagSettings> => {
   const response: ApiResponse<RagSettings> = await apiGet('/rag/settings');
   if (!response.success) throw new Error(response.message || 'Failed to get RAG settings');
   return (
-    response.data ?? { vectorWeight: 0.9, keywordWeight: 0.1, maxResults: 20, scoreThreshold: 0.65, chunkSize: 0, chunkOverlap: 0 }
+    response.data ?? {
+      vectorWeight: 0.9,
+      keywordWeight: 0.1,
+      maxResults: 20,
+      scoreThreshold: 0.65,
+      chunkSize: 0,
+      chunkOverlap: 0,
+      autoUpdateEnabled: false,
+      autoUpdateIntervalSecs: 300,
+      docLoadChunkKb: 200,
+    }
   );
 };
 

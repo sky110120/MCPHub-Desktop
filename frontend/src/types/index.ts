@@ -271,6 +271,12 @@ export interface RagDoc {
    *  exists; copy = the rag/files copy exists). View/open-location are gated
    *  on this — a copy doc whose original vanished still has its copy. */
   contentAvailable?: boolean;
+  /** Whether `content` is only the currently loaded page. */
+  truncated?: boolean;
+  /** UTF-8 byte offset to use when loading the next content page. */
+  nextOffset?: number;
+  /** Full decoded document size in UTF-8 bytes. */
+  contentTotalBytes?: number;
 }
 
 // Document metadata for the list view (no content).
@@ -345,6 +351,12 @@ export interface RagSettings {
   /** Chunk overlap in tokens. `0` = "auto" — use the model's deploy.json
    * `chunkOverlap` (else 100). A positive value is an explicit override. */
   chunkOverlap: number;
+  /** Periodic source-file check and re-index. Disabled by default on desktop. */
+  autoUpdateEnabled: boolean;
+  /** Auto-update interval in seconds. Backend clamps this to 60..86400. */
+  autoUpdateIntervalSecs: number;
+  /** Content loaded per document-detail page in KiB. */
+  docLoadChunkKb: number;
 }
 
 /** Model context window (tokens), read from the model's config.json. */
@@ -364,6 +376,14 @@ export interface RagModelLimits {
 export interface RagChunk {
   chunkIndex: number;
   chunkText: string;
+}
+
+/** A bounded page of document chunks. */
+export interface RagChunkPage {
+  items: RagChunk[];
+  total: number;
+  offset: number;
+  pageSize: number;
 }
 
 // A single search result fragment returned by a similarity search.

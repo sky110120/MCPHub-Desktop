@@ -642,7 +642,21 @@
       "pathExists": "Ce fichier a déjà été importé",
       "batchUpdateFailed": "Échec de la mise à jour par lot - voir les logs",
       "contentUnavailableView": "Impossible de lire le contenu du document",
-      "contentUnavailableOpen": "Impossible d'ouvrir l'emplacement du fichier"
+      "contentUnavailableOpen": "Impossible d'ouvrir l'emplacement du fichier",
+      "docUpdateSection": "Mise à jour et chargement des documents",
+      "autoUpdateEnabled": "Mettre automatiquement à jour les documents",
+      "autoUpdateHint": "Vérifie périodiquement les fichiers originaux en arrière-plan et réindexe les documents modifiés. Utilise le même état de progression que la mise à jour par lot manuelle.",
+      "autoUpdateInterval": "Intervalle de vérification (minutes)",
+      "autoUpdateIntervalHint": "Vérifie les fichiers originaux toutes les N minutes. Plage : 1–1440 minutes.",
+      "unitMinutes": "min",
+      "docLoadChunkKb": "Taille de chargement par page (Ko)",
+      "docLoadChunkKbHint": "Les gros documents sont chargés page par page. Utilisez Charger plus pour continuer. Plage : 10–65536 Ko.",
+      "viewLoadedHint": "Chargé {{loaded}} / {{total}} au total",
+      "viewLoadMore": "Charger plus",
+      "viewLoadMoreHint": "Charger la page suivante",
+      "chunksShownCount": "Chargés {{shown}} / {{total}} fragments",
+      "chunksLoadMore": "Charger {{count}} de plus",
+      "chunksAllLoaded": "Tous les fragments sont chargés"
     }
   },
   "logs": {

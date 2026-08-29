@@ -674,7 +674,21 @@
       "tagAddNew": "Add \"{{tag}}\"",
       "batchUpdateFailed": "Batch update failed - see the logs",
       "contentUnavailableView": "Cannot read document content",
-      "contentUnavailableOpen": "Cannot open file location"
+      "contentUnavailableOpen": "Cannot open file location",
+      "docUpdateSection": "Document update and loading",
+      "autoUpdateEnabled": "Automatically update documents on a schedule",
+      "autoUpdateHint": "Periodically checks original files in the background and re-indexes documents whose content changed. Uses the same progress state as manual batch update.",
+      "autoUpdateInterval": "Check interval (minutes)",
+      "autoUpdateIntervalHint": "Check original files every N minutes. Range: 1–1440 minutes.",
+      "unitMinutes": "min",
+      "docLoadChunkKb": "Document load size per page (KB)",
+      "docLoadChunkKbHint": "Large documents load one page at a time. Use Load more to continue reading. Range: 10–65536 KB.",
+      "viewLoadedHint": "Loaded {{loaded}} / {{total}} total",
+      "viewLoadMore": "Load more",
+      "viewLoadMoreHint": "Load the next page of content",
+      "chunksShownCount": "Loaded {{shown}} / {{total}} chunks",
+      "chunksLoadMore": "Load {{count}} more",
+      "chunksAllLoaded": "All chunks loaded"
     }
   },
   "logs": {

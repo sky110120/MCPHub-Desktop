@@ -676,7 +676,21 @@
       "tagAddNew": "添加“{{tag}}”",
       "batchUpdateFailed": "批量更新失败，请查看日志",
       "contentUnavailableView": "无法读取文档内容",
-      "contentUnavailableOpen": "无法打开文件位置"
+      "contentUnavailableOpen": "无法打开文件位置",
+      "docUpdateSection": "文档更新与加载",
+      "autoUpdateEnabled": "自动定时更新文档",
+      "autoUpdateHint": "后台定时检查原始文件，有变化的文档自动重新索引。与手动批量更新共用进度状态。",
+      "autoUpdateInterval": "检查间隔（分钟）",
+      "autoUpdateIntervalHint": "每 N 分钟检查一次原始文件。范围：1–1440 分钟。",
+      "unitMinutes": "分钟",
+      "docLoadChunkKb": "文档每次加载大小（KB）",
+      "docLoadChunkKbHint": "大文档按页加载，可点击“加载更多”继续阅读。范围：10–65536 KB。",
+      "viewLoadedHint": "已加载 {{loaded}} / 全部 {{total}}",
+      "viewLoadMore": "加载更多",
+      "viewLoadMoreHint": "继续加载下一页内容",
+      "chunksShownCount": "已加载 {{shown}} / 共 {{total}} 片",
+      "chunksLoadMore": "加载更多 {{count}} 片",
+      "chunksAllLoaded": "全部分片已加载"
     }
   },
   "logs": {

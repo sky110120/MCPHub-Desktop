@@ -12,8 +12,8 @@ import {
   saveRagSettings,
   deleteRagDoc,
   updateRagDoc,
-  getRagDoc,
-  getRagChunks,
+  getRagDocPaged,
+  getRagChunksPaged,
   uploadRagDoc,
   pickRagFiles,
   pickRagFolder,
@@ -67,15 +67,29 @@ const useRagDataState = () => {
   // `initializing` (toggle on/off) so the switch can show "切换中" instead of
   // "开启中". Either flag grays out the page.
   const [switchingModel, setSwitchingModel] = useState(false);
-  const [settings, setSettings] = useState<RagSettings>({ vectorWeight: 0.9, keywordWeight: 0.1, maxResults: 20, scoreThreshold: 0.65, chunkSize: 0, chunkOverlap: 0 });
+  const [settings, setSettings] = useState<RagSettings>({
+    vectorWeight: 0.9,
+    keywordWeight: 0.1,
+    maxResults: 20,
+    scoreThreshold: 0.65,
+    chunkSize: 0,
+    chunkOverlap: 0,
+    autoUpdateEnabled: false,
+    autoUpdateIntervalSecs: 300,
+    docLoadChunkKb: 200,
+  });
   const [modelLimits, setModelLimits] = useState<RagModelLimits>({ maxContext: 2048 });
   const [viewedDoc, setViewedDoc] = useState<RagDoc | null>(null);
   const [viewLoading, setViewLoading] = useState(false);
-  // "View chunks" dialog: the doc whose chunks are shown + the loaded chunks +
-  // a loading flag while fetching (RAG must be enabled to read lancedb).
+  // True while the next page of a viewed document is loading.
+  const [viewMoreLoading, setViewMoreLoading] = useState(false);
+  // "View chunks" dialog: the doc whose chunks are shown + loaded chunks +
+  // the backend-reported total.
   const [chunksDoc, setChunksDoc] = useState<RagDocInfo | null>(null);
   const [chunksList, setChunksList] = useState<RagChunk[]>([]);
+  const [chunksTotal, setChunksTotal] = useState(0);
   const [chunksLoading, setChunksLoading] = useState(false);
+  const [chunksMoreLoading, setChunksMoreLoading] = useState(false);
   const [searchResults, setSearchResults] = useState<RagSearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -283,6 +297,11 @@ const useRagDataState = () => {
               if (mounted.current) fetchDocs();
             }, 600);
           }
+        } else {
+          // Auto-update runs in the backend without a frontend trigger. Treat
+          // its progress events like manual batch-update events so the shared
+          // progress dialog and header state stay accurate.
+          setBatchUpdateRunning(true);
         }
       },
     ).then((un) => {
@@ -656,28 +675,59 @@ const useRagDataState = () => {
     [fetchDocs],
   );
 
+  // Load only the first page for the View dialog. The backend applies the
+  // configured docLoadChunkKb when limitBytes is zero.
   const view = useCallback(async (id: string) => {
     setViewLoading(true);
     try {
-      const doc = await getRagDoc(id);
-      setViewedDoc(doc);
+      const doc = await getRagDocPaged(id, 0, 0);
+      if (mounted.current) setViewedDoc(doc);
     } finally {
-      setViewLoading(false);
+      if (mounted.current) setViewLoading(false);
     }
   }, []);
 
+  const viewFetchingRef = useRef(false);
+  const loadMoreView = useCallback(async () => {
+    const doc = viewedDoc;
+    if (!doc?.truncated || viewFetchingRef.current) return;
+    viewFetchingRef.current = true;
+    setViewMoreLoading(true);
+    try {
+      const next = await getRagDocPaged(doc.id, doc.nextOffset ?? 0, 0);
+      if (next && mounted.current) {
+        setViewedDoc((previous) => {
+          if (!previous || previous.id !== next.id) return previous;
+          return {
+            ...next,
+            content: previous.content + next.content,
+            // Keep the local tag edit visible while the page request is in
+            // flight; tag persistence is handled by the existing callback.
+            tags: previous.tags,
+          };
+        });
+      }
+    } finally {
+      viewFetchingRef.current = false;
+      if (mounted.current) setViewMoreLoading(false);
+    }
+  }, [viewedDoc]);
+
   const closeView = useCallback(() => setViewedDoc(null), []);
 
-  // Fetch a document's chunks (for the "view chunks" dialog). RAG must be
-  // enabled (chunks live in lancedb); the backend errors otherwise - we surface
-  // it as a toast and don't open the dialog.
+  const CHUNKS_PAGE_SIZE = 5;
+  // Load the first chunk page. Further pages are fetched on scroll-to-bottom.
   const viewChunks = useCallback(async (doc: RagDocInfo) => {
     setChunksLoading(true);
     setChunksList([]);
+    setChunksTotal(0);
     setChunksDoc(doc);
     try {
-      const chunks = await getRagChunks(doc.id);
-      if (mounted.current) setChunksList(chunks);
+      const page = await getRagChunksPaged(doc.id, 0, CHUNKS_PAGE_SIZE);
+      if (mounted.current) {
+        setChunksList(page.items);
+        setChunksTotal(page.total);
+      }
     } catch (e) {
       showToast(e instanceof Error ? e.message : 'Failed to load chunks', 'error');
       if (mounted.current) setChunksDoc(null);
@@ -686,9 +736,31 @@ const useRagDataState = () => {
     }
   }, [showToast]);
 
+  const chunksFetchingRef = useRef(false);
+  const loadMoreChunks = useCallback(async () => {
+    const doc = chunksDoc;
+    if (!doc || chunksLoading || chunksMoreLoading || chunksList.length >= chunksTotal) return;
+    if (chunksFetchingRef.current) return;
+    chunksFetchingRef.current = true;
+    setChunksMoreLoading(true);
+    try {
+      const page = await getRagChunksPaged(doc.id, chunksList.length, CHUNKS_PAGE_SIZE);
+      if (mounted.current) {
+        setChunksList((previous) => [...previous, ...page.items]);
+        setChunksTotal(page.total);
+      }
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : 'Failed to load chunks', 'error');
+    } finally {
+      chunksFetchingRef.current = false;
+      if (mounted.current) setChunksMoreLoading(false);
+    }
+  }, [chunksDoc, chunksLoading, chunksMoreLoading, chunksList.length, chunksTotal, showToast]);
+
   const closeChunks = useCallback(() => {
     setChunksDoc(null);
     setChunksList([]);
+    setChunksTotal(0);
   }, []);
 
   const openLocation = useCallback(async (id: string) => {
@@ -708,6 +780,9 @@ const useRagDataState = () => {
   const setTags = useCallback(
     async (id: string, tags: string[]) => {
       await setRagTags(id, tags);
+      if (mounted.current) {
+        setViewedDoc((previous) => (previous?.id === id ? { ...previous, tags } : previous));
+      }
       await fetchDocs();
     },
     [fetchDocs],
@@ -730,6 +805,8 @@ const useRagDataState = () => {
     modelLimits,
     viewedDoc,
     viewLoading,
+    loadMoreView,
+    viewMoreLoading,
     searchResults,
     searching,
     uploading,
@@ -757,8 +834,11 @@ const useRagDataState = () => {
     closeView,
     chunksDoc,
     chunksList,
+    chunksTotal,
     chunksLoading,
+    chunksMoreLoading,
     viewChunks,
+    loadMoreChunks,
     closeChunks,
     openLocation,
     search,
