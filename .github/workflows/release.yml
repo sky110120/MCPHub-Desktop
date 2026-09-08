@@ -402,8 +402,13 @@ jobs:
           BUNDLE_DIR="$RELEASE_DIR/bundle"
 
           echo "=== Source: src-tauri/runtimes/uv/python/ ==="
-          ls -la src-tauri/runtimes/uv/python/ 2>/dev/null | head -5
-          PY_SRC=$(find src-tauri/runtimes/uv/python -name "python*" -type f 2>/dev/null | wc -l)
+          if [ -d "src-tauri/runtimes/uv/python" ]; then
+            ls -la src-tauri/runtimes/uv/python/
+            PY_SRC=$(find src-tauri/runtimes/uv/python -name "python*" -type f | wc -l)
+          else
+            echo "Source runtime directory not found"
+            PY_SRC=0
+          fi
           echo "python* files in source: $PY_SRC"
           echo ""
 
@@ -762,7 +767,12 @@ jobs:
             echo "⚠️  No dist-artifacts directory found"
           fi
           echo ""
-          SIG_COUNT=$(find src-tauri/target/${{ matrix.target }}/release/bundle -name "*.sig" -type f 2>/dev/null | wc -l | tr -d ' ')
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          if [ -d "$BUNDLE_DIR" ]; then
+            SIG_COUNT=$(find "$BUNDLE_DIR" -name "*.sig" -type f | wc -l | tr -d ' ')
+          else
+            SIG_COUNT=0
+          fi
           echo "=== Signature files (.sig) found: $SIG_COUNT ==="
           if [ "$SIG_COUNT" -eq 0 ]; then
             echo "⚠️  WARNING: No .sig files found. Auto-update will NOT work for this platform."
