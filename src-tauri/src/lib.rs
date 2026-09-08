@@ -174,7 +174,8 @@ pub fn run() {
     // crash.log. stderr-only until `setup()` resolves the app data dir.
     install_crash_hook();
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
+        // External links use the app's `open_external_url` command rather than
+        // the shell plugin, avoiding its macOS fork path.
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())

@@ -7,6 +7,7 @@ import './i18n';
 // Setup fetch interceptors
 import './utils/setupInterceptors';
 import { loadRuntimeConfig } from './utils/runtime';
+import { installExternalLinkInterceptor } from './utils/externalLink';
 
 /** Remove the splash loading screen (index.html) with a fade-out animation */
 function removeSplash() {
@@ -46,6 +47,7 @@ function setupProductionContextMenuGuard() {
 
 // Load runtime configuration before starting the app
 async function initializeApp() {
+  installExternalLinkInterceptor();
   try {
     console.log('Loading runtime configuration...');
     const config = await loadRuntimeConfig();

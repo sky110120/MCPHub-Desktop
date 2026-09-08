@@ -287,16 +287,12 @@ const useRagDataState = () => {
             : 'checking';
         setBatchProgress({ current: p.current, total: p.total, name: p.name, phase });
         if (phase === 'done' || phase === 'error') {
-          // Both terminal phases clear the running flag. On done we also refetch
-          // (chunk counts / versions / md5 changed); on error nothing was
-          // processed, so no refetch is needed.
+          // A failed batch can still have changed documents before the error,
+          // so refresh after either terminal phase.
           setBatchUpdateRunning(false);
-          if (phase === 'done') {
-            // Slight delay so the "完成" state is visible before the dialog clears.
-            setTimeout(() => {
-              if (mounted.current) fetchDocs();
-            }, 600);
-          }
+          setTimeout(() => {
+            if (mounted.current) fetchDocs();
+          }, phase === 'done' ? 600 : 0);
         } else {
           // Auto-update runs in the backend without a frontend trigger. Treat
           // its progress events like manual batch-update events so the shared
@@ -616,8 +612,8 @@ const useRagDataState = () => {
       try {
         await updateRagDoc(id, opts);
         setUploadProgress({ current: 1, total: 1, name });
-        await fetchDocs();
       } finally {
+        await fetchDocs();
         setUploading(false);
         setUpdatingDoc(false);
         setUploadProgress(null);
@@ -657,8 +653,11 @@ const useRagDataState = () => {
 
   const remove = useCallback(
     async (id: string) => {
-      await deleteRagDoc(id);
-      await fetchDocs();
+      try {
+        await deleteRagDoc(id);
+      } finally {
+        await fetchDocs();
+      }
     },
     [fetchDocs],
   );
@@ -667,10 +666,21 @@ const useRagDataState = () => {
   // delete also reclaims lancedb vectors on the backend (see delete_doc).
   const removeMany = useCallback(
     async (ids: string[]) => {
-      for (const id of ids) {
-        await deleteRagDoc(id);
+      const failures: string[] = [];
+      try {
+        for (const id of ids) {
+          try {
+            await deleteRagDoc(id);
+          } catch (error) {
+            failures.push(`${id}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      } finally {
+        await fetchDocs();
       }
-      await fetchDocs();
+      if (failures.length > 0) {
+        throw new Error(`Failed to delete ${failures.length} of ${ids.length} document(s): ${failures.join('; ')}`);
+      }
     },
     [fetchDocs],
   );

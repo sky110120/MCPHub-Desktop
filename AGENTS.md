@@ -1457,6 +1457,12 @@ PY
 - `DynamicForm` 禁止 `__proto__`、`constructor`、`prototype` 作为动态路径字段，防止不可信 MCP schema 造成原型污染。
 - 上游 `v1.0.32003` 的迁移回退、HTTP 生命周期改动、mimalloc override、GGUF panic 改动和发布矩阵扩展不适用于桌面端，禁止直接覆盖本地实现。
 
+### 3.14 上游稳定性修复选择性同步（2026-09-08）
+- 移除 `tauri-plugin-shell` 及全部 `shell:*` capability；所有普通 `target="_blank"` 链接由 `frontend/src/utils/externalLink.ts` 的 document 级拦截器转到 `open_external_url`，避免 macOS 外链触发 shell 插件的 fork 路径。
+- RAG 删除和 MCP 同名文档覆盖不再同步等待 LanceDB `optimize()`；`schedule_deferred_prune` 以 generation 合并突发变更，后台回收空间且保证 prune 期间的新删除会进入下一轮。
+- 前端 RAG 单条/批量删除、单条更新和批量更新错误终态均在 `finally` 或终态后刷新列表，避免部分失败后显示陈旧元数据。
+- 上游 FTS/OCR/递归导入、配置字段重命名与 v24/v25 迁移未直接合并：当前桌面端已有不同语义的 v24/v25，后续必须单独编号迁移并做兼容读取。
+
 ---
 
 ---

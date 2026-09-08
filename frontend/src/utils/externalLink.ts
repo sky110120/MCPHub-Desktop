@@ -25,3 +25,22 @@ export const openExternal = async (url: string): Promise<void> => {
   }
   window.open(url, '_blank', 'noopener,noreferrer');
 };
+
+/** Route plain target=_blank links through the native external URL command. */
+export function installExternalLinkInterceptor(): void {
+  if (!isTauri()) return;
+  document.addEventListener('click', (event) => {
+    if (event.defaultPrevented) return;
+    let node = event.target as HTMLElement | null;
+    while (node) {
+      if (node instanceof HTMLAnchorElement) {
+        if (node.target === '_blank' && /^(https?|mailto|tel):/.test(node.href)) {
+          event.preventDefault();
+          void openExternal(node.href);
+        }
+        return;
+      }
+      node = node.parentElement;
+    }
+  });
+}

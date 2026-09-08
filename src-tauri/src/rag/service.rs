@@ -164,6 +164,85 @@ async fn meta_lock() -> &'static Mutex<()> {
     META_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+#[derive(Default)]
+struct DeferredPruneState {
+    generation: u64,
+    running: bool,
+}
+
+impl DeferredPruneState {
+    fn request(&mut self) -> bool {
+        self.generation = self.generation.wrapping_add(1);
+        if self.running {
+            false
+        } else {
+            self.running = true;
+            true
+        }
+    }
+
+    fn complete(&mut self, observed_generation: u64) -> bool {
+        if self.generation == observed_generation {
+            self.running = false;
+            false
+        } else {
+            true
+        }
+    }
+}
+
+static DEFERRED_PRUNE_STATE: OnceLock<std::sync::Mutex<DeferredPruneState>> = OnceLock::new();
+
+fn deferred_prune_state() -> &'static std::sync::Mutex<DeferredPruneState> {
+    DEFERRED_PRUNE_STATE.get_or_init(|| std::sync::Mutex::new(DeferredPruneState::default()))
+}
+
+/// Coalesce expensive LanceDB pruning outside mutation IPC calls.
+fn schedule_deferred_prune() {
+    let should_spawn = {
+        let mut state = deferred_prune_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.request()
+    };
+    if !should_spawn {
+        return;
+    }
+
+    tauri::async_runtime::spawn(async {
+        loop {
+            let observed_generation = {
+                deferred_prune_state()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .generation
+            };
+
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            let result = {
+                let guard = runtime().lock().await;
+                match guard.as_ref() {
+                    Some(rt) => rt.db.optimize().await,
+                    None => Ok(()),
+                }
+            };
+            if let Err(e) = result {
+                rag_log("warn", format!("deferred LanceDB prune failed: {:#}", e));
+            }
+
+            let should_continue = {
+                let mut state = deferred_prune_state()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.complete(observed_generation)
+            };
+            if !should_continue {
+                break;
+            }
+        }
+    });
+}
+
 /// Atomically write a `.meta` file: write to `{path}.tmp` then rename over the
 /// target. Rename-on-same-filesystem is atomic on all supported platforms, so
 /// a crash mid-write can never leave a truncated/half JSON that would make the
@@ -2973,8 +3052,9 @@ pub async fn create_doc_from_content(
             for sid in &stale_ids {
                 let _ = rt.db.delete_by_doc(sid).await;
             }
-            let _ = rt.db.optimize().await;
         }
+        drop(guard);
+        schedule_deferred_prune();
     }
     // The new document is fully indexed before stale metadata/files are
     // removed. Never delete the shared `{file_name}` path now owned by the new
@@ -3671,16 +3751,16 @@ pub async fn delete_doc(app: &AppHandle, id: &str) -> Result<()> {
     let _meta_guard = meta_lock().await.lock().await;
     let dir = files_dir(app)?;
 
-    // Remove the doc's chunks from lancedb + prune the freed space. Refuse if
-    // RAG is off so we never delete the files while leaving orphan vectors.
+    // Remove the doc's chunks from lancedb. Pruning is deferred so this IPC
+    // returns promptly after the document is no longer queryable.
     {
         let guard = runtime().lock().await;
         let rt = guard
             .as_ref()
             .ok_or_else(|| anyhow!("RAG is not enabled - turn on RAG before deleting documents"))?;
         rt.db.delete_by_doc(id).await?;
-        rt.db.optimize().await?;
     }
+    schedule_deferred_prune();
 
     // Content file is `dir/{id}` for uploads, `dir/{meta.name}` for
     // rag_file_create docs - read the meta to resolve the human-readable name.
@@ -4484,5 +4564,20 @@ mod tests {
         assert_eq!(last, "c");
         assert!(!truncated);
         assert_eq!(next, content.len() as u64);
+    }
+
+    #[test]
+    fn deferred_prune_repeats_after_mutation_during_prune() {
+        let mut state = DeferredPruneState::default();
+        assert!(state.request());
+        let first_generation = state.generation;
+
+        assert!(!state.request());
+        let second_generation = state.generation;
+        assert!(state.complete(first_generation));
+        assert!(state.running);
+
+        assert!(!state.complete(second_generation));
+        assert!(!state.running);
     }
 }
