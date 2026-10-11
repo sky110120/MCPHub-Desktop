@@ -6,8 +6,10 @@ pub mod commands;
 pub mod db;
 pub mod mcp;
 pub mod models;
+pub mod mv;
 pub mod rag;
 pub mod services;
+pub mod smart_routing;
 pub mod tray;
 
 use std::path::PathBuf;
@@ -176,6 +178,8 @@ pub fn run() {
     tauri::Builder::default()
         // External links use the app's `open_external_url` command rather than
         // the shell plugin, avoiding its macOS fork path.
+        // tauri-plugin-shell stays unregistered: its injected target=_blank
+        // handler uses a fork-based opener that is unsafe with mimalloc on macOS.
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -244,23 +248,47 @@ pub fn run() {
             // installer launch) - the sender would drop and recv() return None.
             // Handle both the Err case and the task-panic case explicitly so the
             // reason lands in crash.log instead of vanishing.
-            match rx.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    write_crash_log("fatal", &format!("Database initialization failed: {e}"));
+            // A timeout guard turns a hung init (file lock held by AV scan /
+            // network disk) into a diagnosable crash-log exit instead of a
+            // window that never appears with no trace at all.
+            const DB_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+            let recv_res = rx.recv_timeout(DB_INIT_TIMEOUT);
+            match recv_res {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    write_crash_log(
+                        "fatal",
+                        "Database initialization timed out after 120s (file lock held by another process / slow disk?).",
+                    );
                     std::process::exit(1);
                 }
-                Err(_) => {
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     // The db::initialize task panicked; the panic hook already
                     // wrote the backtrace to crash.log.
                     write_crash_log("fatal", "Database initialization task panicked (see panic entry above).");
                     std::process::exit(1);
                 }
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    write_crash_log("fatal", &format!("Database initialization failed: {e}"));
+                    std::process::exit(1);
+                }
             }
-
             // Initialize database log writer (+ file mirror under <app_data_dir>/logs/)
             services::app_logger::init(app.path().app_data_dir().ok());
             services::app_logger::log_to_db("info", "Application started, database initialized");
+
+            // Reconcile FTS5 full-text tables (§4.2: rebuild 5 entity tables;
+            // drift self-healing). Fire-and-forget — a slow first build must not
+            // block startup, and failures fall back to LIKE search (§4.4).
+            {
+                let app_handle_fts = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = &app_handle_fts; // handle reserved for future progress events
+                    services::fts_service::rebuild_all().await;
+                    // app_log 存量回填（升级后首次启动 fts_app_log 为空时一次性回填）
+                    services::fts_service::backfill_app_log_if_empty().await;
+                });
+            }
 
             // Log the enhanced PATH at startup (after DB is ready so it's persisted)
             {
@@ -304,15 +332,65 @@ pub fn run() {
                 }
                 services::http_server::maybe_start().await;
 
-                // Auto-restore RAG if it was enabled before restart. Reads the
-                // persisted `rag.enabled` intent; if true, load the embedding
-                // model + open the vector DB so /mcp rag_search/rag_get work
-                // immediately. The frontend syncs the switch via rag_status.
-                if rag::service::config_enabled().await {
+                // Git data source: sweep crash leftovers of the persistent
+                // clone swap ({hash}.old / {hash}.new dirs). Cheap one-dir
+                // read; safe regardless of RAG enable state.
+                rag::git::sweep_stale_dirs(&app_handle2);
+
+                // Auto-restore the shared mv runtime if either consumer was
+                // enabled before restart: `rag.enabled` (RAG full runtime:
+                // model + rag_chunk table + MCP tools) or `smartRouting.enabled`
+                // (mv model preload only — the Smart Routing indexing/search
+                // features arrive in Phase 3, but the model must be up so the
+                // 【模型和向量】status shows running immediately after boot).
+                let rag_was = rag::service::config_enabled().await;
+                let sr_was = mv::smart_routing_config_enabled().await;
+                if rag_was || sr_was {
                     let app_for_rag = app_handle2.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = rag::service::start(&app_for_rag).await {
-                            log::error!("[RAG] auto-start on boot failed: {:#}", e);
+                        if rag_was {
+                            if let Err(e) = rag::service::start(&app_for_rag).await {
+                                log::error!("[RAG] auto-start on boot failed: {:#}", e);
+                            }
+                            // start() re-arms the auto doc-update timer itself on
+                            // success; on failure arm it anyway so it retries via
+                            // the next manual enable (its ticks no-op while RAG is
+                            // off, so this is cheap).
+                            rag::service::restart_auto_update_timer(&app_for_rag);
+                        } else if let Err(e) = mv::ensure_started("smart", &app_for_rag).await {
+                            log::error!("[mv] smart-only auto-start on boot failed: {:#}", e);
+                        }
+                        // Smart Routing index restore (Phase 3): cheap when the
+                        // tool sets are unchanged (hash skip-check), full rebuild
+                        // after a model swap (table dim check).
+                        //
+                        // WAIT for the mv model before reindexing: the RAG
+                        // branch above loads the model as a spawned task chain
+                        // — reindex_all's `mv::is_running()` gate returns
+                        // false while the model is still loading, the boot
+                        // reindex silently no-ops ("mv runtime not running",
+                        // previously only log::warn! — invisible in the log
+                        // page), and the builtin server's rows never land.
+                        // Poll up to 3 minutes; skip quietly if SR got
+                        // disabled meanwhile.
+                        if sr_was {
+                            let mut waited = 0u32;
+                            while !crate::mv::is_running() && waited < 180 {
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                waited += 1;
+                            }
+                            if crate::mv::is_running() {
+                                match smart_routing::index::reindex_all().await {
+                                    Ok(n) => {
+                                        log::info!("[smart] boot reindex done: {n} servers indexed");
+                                        let _ = crate::services::app_logger::log_to_db("info", &format!("[smart] boot reindex done: {n} servers indexed"));
+                                    }
+                                    Err(e) => {
+                                        log::warn!("[smart] boot reindex failed: {}", e);
+                                        let _ = crate::services::app_logger::log_to_db("warn", &format!("[smart] boot reindex failed: {e:#}"));
+                                    }
+                                }
+                            }
                         }
                     });
                 }
@@ -339,6 +417,14 @@ pub fn run() {
             // Minimize to tray on close instead of quitting
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                // A RAG import in progress must NOT keep grinding in the
+                // hidden webview (the frontend upload loop survives a window
+                // hide): ask it to stop at the next file boundary. Only the
+                // files that actually finished importing stay in the doc
+                // list; the rest are left un-imported for the user to retry.
+                if rag::service::import_session_active() {
+                    rag::service::request_import_cancel(window.app_handle());
+                }
                 let _ = window.hide();
             }
         })
@@ -388,6 +474,9 @@ pub fn run() {
             commands::config::update_system_config,
             commands::config::get_settings,
             commands::config::get_public_config,
+            commands::smart_routing::smart_routing_status,
+            commands::smart_routing::smart_routing_reindex,
+            commands::smart_routing::smart_routing_performance,
             commands::config::import_settings,
             commands::config::export_settings,
             commands::config::save_settings_json,
@@ -398,6 +487,7 @@ pub fn run() {
             commands::logs::log_event,
             commands::logs::get_activity_available,
             commands::logs::get_activity_filters,
+            commands::logs::get_activity_filter_options,
             commands::logs::get_activity_stats,
             commands::logs::get_tool_activities,
             commands::logs::clear_tool_activities,
@@ -431,6 +521,7 @@ pub fn run() {
             // Registry proxy commands
             commands::registry::list_registry_servers,
             commands::registry::get_registry_server_versions,
+            commands::registry::get_registry_server_version,
             // Cloud/MCPRouter commands
             commands::cloud::list_cloud_servers,
             commands::cloud::get_cloud_server_tools,
@@ -438,11 +529,15 @@ pub fn run() {
             commands::server_tool_config::toggle_server_item,
             commands::server_tool_config::update_server_item_description,
             commands::server_tool_config::reset_server_item_description,
+            commands::server_tool_config::set_server_tool_pinned,
+            commands::server_tool_config::list_server_tool_pins,
             commands::server_tool_config::list_server_item_configs,
             // HTTP server management
             commands::http_server::start_http_server,
             commands::http_server::stop_http_server,
             commands::http_server::get_http_server_status,
+            commands::http_server::detect_port_occupier,
+            commands::http_server::kill_port_occupier,
             // Runtime version management
             commands::runtime::list_node_versions,
             commands::runtime::list_python_versions,
@@ -477,6 +572,7 @@ pub fn run() {
             // RAG — toggle/status/list/get/pick+upload/delete/search/tags/settings/open-location
             commands::rag::rag_toggle,
             commands::rag::rag_status,
+            commands::rag::get_ocr_status,
             commands::rag::list_rag_docs,
             commands::rag::get_rag_doc,
             commands::rag::get_rag_doc_paged,
@@ -484,7 +580,11 @@ pub fn run() {
             commands::rag::get_rag_chunks_paged,
             commands::rag::pick_rag_files,
             commands::rag::pick_rag_folder,
+            commands::rag::pick_rag_git_repo,
+            commands::rag::cancel_rag_git_pick,
             commands::rag::upload_rag_doc,
+            commands::rag::begin_rag_import_session,
+            commands::rag::end_rag_import_session,
             commands::rag::update_rag_doc,
             commands::rag::delete_rag_doc,
             commands::rag::rag_search_command,
@@ -496,7 +596,12 @@ pub fn run() {
             commands::rag::rag_model_limits,
             commands::rag::rag_tools,
             commands::rag::set_rag_tags,
+            commands::rag::list_rag_excluded_paths,
+            commands::rag::set_rag_excluded_paths,
+            commands::rag::get_rag_git_clone_dir,
+            commands::rag::set_rag_source_alias,
             commands::rag::open_rag_file_location,
+            commands::rag::open_rag_doc_source_file,
             commands::rag::rag_reindex_all,
             commands::rag::rag_list_models,
             commands::rag::rag_current_model,
@@ -505,6 +610,9 @@ pub fn run() {
             commands::rag::check_rag_update,
             commands::rag::preview_batch_update,
             commands::rag::batch_update_rag_docs,
+            commands::rag::get_git_source_errors,
+            commands::rag::refresh_rag_source,
+            commands::rag::preview_rag_source_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MCPHub application");

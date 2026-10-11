@@ -32,17 +32,44 @@ pub struct RagSettings {
     /// value is an explicit override. Default 0 (auto).
     #[serde(default = "default_chunk_overlap")]
     pub chunk_overlap: u32,
-    /// Periodically check recorded source files and re-index changed docs.
-    /// Desktop defaults this to false so background disk scanning is opt-in.
+    /// Auto doc update: periodically (every `auto_update_interval_secs`) check
+    /// every doc's recorded original for md5 changes and re-index the changed
+    /// ones in the background — the same pass as the manual "批量更新" button.
+    /// Desktop default is false so background filesystem scans are opt-in.
     #[serde(default = "default_auto_update_enabled")]
     pub auto_update_enabled: bool,
-    /// Auto-update interval in seconds. Clamped by the service to 60..86400.
+    /// Auto-update check interval in seconds. Default 300 (5 minutes). Clamped
+    /// to [60, 86400] at read time so a bad persisted value can't busy-loop.
     #[serde(default = "default_auto_update_interval_secs")]
     pub auto_update_interval_secs: u64,
-    /// Maximum content loaded per document-detail request, in KiB.
-    /// Clamped by the service to 10..65536.
+    /// Doc-detail page size in KiB: how much content `get_rag_doc_paged`
+    /// returns per call (the View dialog loads this much up front, then the
+    /// "load more" button fetches the next page). Default 200. Clamped to
+    /// [10, 65536] at read time (the upload cap is 64 MiB).
     #[serde(default = "default_doc_load_chunk_kb")]
     pub doc_load_chunk_kb: u32,
+    /// Auto-sync NEW files appearing in folder/git data sources during update
+    /// checks (batch/auto). Off (default) = only re-index the files that were
+    /// selected at import time; on = newly added source files are imported
+    /// automatically too (removal sync always runs).
+    #[serde(default)]
+    pub source_sync_add_enabled: bool,
+    /// Auto-remove docs whose source file vanished from the data source
+    /// during update checks. On (default) = vanished docs are deleted
+    /// automatically; off = docs are kept and only flagged "lost original"
+    /// in the UI.
+    #[serde(default = "default_source_sync_remove_enabled")]
+    pub source_sync_remove_enabled: bool,
+}
+
+fn default_source_sync_remove_enabled() -> bool {
+    true
+}
+
+/// `skip_serializing_if` helper for `BatchPreview.excluded` (u32): omit the
+/// field from the wire when 0 so older frontends / API consumers see no change.
+fn u32_is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 fn default_vector_weight() -> f32 {
@@ -75,9 +102,11 @@ fn default_auto_update_enabled() -> bool {
     false
 }
 fn default_auto_update_interval_secs() -> u64 {
+    // 5 minutes between auto-update scans.
     300
 }
 fn default_doc_load_chunk_kb() -> u32 {
+    // 200 KiB per doc-detail page — keeps the View dialog cheap on huge docs.
     200
 }
 
@@ -102,6 +131,8 @@ impl Default for RagSettings {
             auto_update_enabled: false,
             auto_update_interval_secs: 300,
             doc_load_chunk_kb: 200,
+            source_sync_add_enabled: false,
+            source_sync_remove_enabled: true,
         }
     }
 }
@@ -167,6 +198,32 @@ pub struct RagDocInfo {
     /// the user view its imported copy.
     #[serde(default)]
     pub content_available: bool,
+    /// True iff the doc's recorded original_path is in the user's exclusion
+    /// registry (`config_json.rag.excludedPaths`). Excluded docs are ignored
+    /// by ALL update paths — batch preview/run, the auto-update tick, and the
+    /// single-doc "check original" — and their source files are never
+    /// re-imported by the source-level sync (add or remove). The UI shows a
+    /// badge + a toggle to re-include. `#[serde(default)]` keeps the field out
+    /// of the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub excluded: bool,
+    /// Data-source display fields (kind + label + root + rel dir chain +
+    /// git url/branch), filled by `classify_source` at read time. Legacy
+    /// docs (no `source` in meta) classify as kind "file" — the tree view
+    /// groups them under the "file pick" node. `source_kind` is one of
+    /// "file" | "folder" | "git" | "tool".
+    #[serde(default)]
+    pub source_kind: String,
+    #[serde(default)]
+    pub source_label: String,
+    #[serde(default)]
+    pub source_root: String,
+    #[serde(default)]
+    pub rel_path: String,
+    #[serde(default)]
+    pub git_url: String,
+    #[serde(default)]
+    pub git_branch: String,
 }
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -199,15 +256,40 @@ pub struct RagDoc {
     /// still has its copy, so view works.
     #[serde(default)]
     pub content_available: bool,
-    /// Whether `content` is only a prefix of the full document.
+    /// True iff `content` is only a PREFIX of the full document (paged read,
+    /// `get_rag_doc_paged`). False for the unpaged `get_rag`. When true the UI
+    /// shows the "load more" button; each click fetches the next
+    /// `doc_load_chunk_kb` slice.
     #[serde(default)]
     pub truncated: bool,
-    /// UTF-8 byte offset immediately after the returned content.
+    /// UTF-8 byte offset of the END of the returned `content` within the full
+    /// decoded document. For the next page the frontend passes this back as
+    /// the read offset. Equals the full length when `truncated` is false.
     #[serde(default)]
     pub next_offset: u64,
-    /// Full decoded document size in UTF-8 bytes.
+    /// Total size of the full decoded content in UTF-8 bytes (independent of
+    /// how much was returned this call) — lets the UI show
+    /// "已加载 X / 全部 Y KB" without an extra round-trip.
     #[serde(default)]
     pub content_total_bytes: u64,
+    /// Data-source display fields — same semantics as `RagDocInfo`.
+    #[serde(default)]
+    pub source_kind: String,
+    #[serde(default)]
+    pub source_label: String,
+    #[serde(default)]
+    pub source_root: String,
+    #[serde(default)]
+    pub rel_path: String,
+    #[serde(default)]
+    pub git_url: String,
+    #[serde(default)]
+    pub git_branch: String,
+    /// True iff the doc's original_path is in the exclusion registry (see
+    /// `RagDocInfo.excluded`). `#[serde(default)]` keeps it off the wire when
+    /// false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub excluded: bool,
 }
 
 /// A search result fragment.
@@ -230,12 +312,17 @@ pub struct RagChunk {
     pub chunk_text: String,
 }
 
-/// A page of document chunks for the RAG detail dialog.
+/// A page of a document's chunks (for the paginated "view chunks" dialog):
+/// the chunks on this page + the total chunk count so the UI knows when all
+/// pages are loaded. `offset` is the 0-based index of the first returned
+/// chunk; `page_size` is the per-page cap actually applied.
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct RagChunkPage {
     pub items: Vec<RagChunk>,
+    /// Total chunks across all pages (NOT just this page).
     pub total: u64,
+    /// Index of the first returned chunk (0-based).
     pub offset: u32,
     pub page_size: u32,
 }
@@ -282,6 +369,111 @@ pub struct RagPickedFile {
     pub name: String,
 }
 
+/// A picked/scan candidate file with its size, for the grouped folder-scan
+/// result (the Upload dialog shows sizes + a total in its summary bar).
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RagScanFile {
+    pub path: String,
+    pub name: String,
+    /// File size in bytes (0 if metadata failed — the file is still listed).
+    pub size: u64,
+    /// Path relative to the scan root ("" for root-level files). Carried into
+    /// each imported doc's `DocSource.rel_path` so the tree view can place it
+    /// under the right directory chain. Empty for multi-file picks.
+    #[serde(default)]
+    pub rel_path: String,
+    /// The canonical registry path this scan file resolves to, used by the
+    /// import dialog's exclusion feature: the UI checks/sets this path in the
+    /// global exclusion registry, and the update pipeline compares it against
+    /// the doc's `original_path`. Empty for multi-file picks (no root). For
+    /// git scans this is stamped by `git_pick_inner` AFTER the temp->persistent
+    /// mapping (the path the doc's original_path will record), so excluding a
+    /// git file in the dialog also blocks its future sync re-import.
+    #[serde(default)]
+    pub match_path: String,
+}
+
+/// Git source remote info attached to a doc's `DocSource` (kind = "git").
+/// Auth credentials are deliberately NOT stored here — they live in the
+/// app's local credential file.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GitSource {
+    pub url: String,
+    pub branch: Option<String>,
+    /// Commit sha at the time of the import/sync that produced this doc
+    /// (display only; update detection re-fetches and re-hashes files).
+    pub commit: Option<String>,
+    /// Sub-directory inside the repo the doc came from (reserved; not
+    /// exposed in the UI yet — the whole repo is scanned).
+    pub subdir: Option<String>,
+}
+
+/// Where a document came from ("data source"). Serialized into the doc's
+/// `{id}.meta` JSON (no DB column — RAG docs don't live in DB tables). Legacy
+/// metas without a `source` field deserialize as `None` and are classified as
+/// kind "file" at read time (`classify_source`), so the tree view groups all
+/// pre-existing docs under the "file pick" source node.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DocSource {
+    /// "file" | "folder" | "git" | "tool"
+    pub kind: String,
+    /// Display label for the source node in the tree view: file = parent
+    /// dir (or "文件选择" fallback), folder = chosen folder path, git =
+    /// `url @ branch`, tool = "MCP 工具".
+    #[serde(default)]
+    pub label: String,
+    /// Source root: absolute dir for file/folder, clone dir for git.
+    #[serde(default)]
+    pub root: Option<String>,
+    /// Directory chain relative to `root` ("/"-separated, "" = root level).
+    #[serde(default)]
+    pub rel_path: Option<String>,
+    /// Present only when kind = "git".
+    #[serde(default)]
+    pub git: Option<GitSource>,
+}
+
+/// One folder group in a recursive folder-scan result: the folder's path
+/// relative to the scanned root ("" for the root itself) + the import
+/// candidates it contains (already filtered by the same rules as the flat
+/// scan: extension catalog + content sniff + not hidden).
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RagScanGroup {
+    /// Folder path relative to the scan root; "" for the root's own files.
+    pub rel_path: String,
+    pub files: Vec<RagScanFile>,
+}
+
+/// Result of a folder scan (recursive or flat) for the Upload dialog's grouped
+/// tree view. Flat scans return a single group (the root). The frontend folds
+/// multi-file picks into a single pseudo-group too, so all three entry points
+/// share one rendering.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RagFolderScan {
+    /// Absolute path of the scanned folder ("" for multi-file picks).
+    pub root: String,
+    /// HEAD commit sha of the scanned git clone (git data source only; None
+    /// for file/folder scans). Display-only — update detection is md5-based.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// Number of sub-directories that were skipped by folder_ignore.json
+    /// (recursive scans only; 0 for flat scans).
+    pub skipped_dirs: u32,
+    /// Number of candidate files dropped because they exceeded the scan cap.
+    /// 0 unless `truncated` is true.
+    pub skipped_files: u32,
+    pub groups: Vec<RagScanGroup>,
+    /// True iff the scan stopped early at the candidate cap
+    /// (`SCAN_FOLDER_FILE_CAP`);
+    /// the summary shows a warning and suggests picking a smaller folder.
+    pub truncated: bool,
+}
+
 /// Result of an upload batch.
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -303,6 +495,17 @@ pub struct RagStatus {
     /// true until `reindex_all` completes. Cleared on disable.
     #[serde(default)]
     pub needs_reindex: bool,
+    /// Embedding dimension of the currently loaded model (real value from the
+    /// GGUF at load time). `None` while nothing is loaded. Drives the
+    /// 【模型和向量】status line "运行中：<model> · <dim> 维 · <device>".
+    #[serde(default)]
+    pub embed_dim: Option<u32>,
+    /// True when the SHARED mv runtime is running (model loaded for ANY
+    /// consumer — RAG or Smart Routing). The 【模型和向量】card keys its
+    /// "running" display off this so the model can be up while RAG itself is
+    /// off. Additive field; existing consumers ignore it.
+    #[serde(default)]
+    pub mv_running: bool,
 }
 
 /// Single-doc update check result (drives the per-row UpdateDialog branches):
@@ -324,6 +527,16 @@ pub struct RagUpdateCheck {
     /// True iff symlink method + original_path missing (UI: only manual-upload
     /// is offered).
     pub lost_original: bool,
+    /// True iff the doc's original_path is in the user's exclusion registry —
+    /// update checks report it as "excluded" so the UpdateDialog can explain
+    /// why auto-update is off and offer to re-include. `#[serde(default)]`
+    /// keeps it off the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub excluded: bool,
+    /// Git source refresh failure for this doc's repo (address changed /
+    /// credentials revoked). None = repo refreshed fine or doc isn't git.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_error: Option<GitSourceError>,
 }
 
 /// Batch-update preview: classification counts over all docs, shown in the
@@ -342,4 +555,56 @@ pub struct BatchPreview {
     /// Docs whose original_path is missing on disk (skipped; user can manually
     /// upload to overwrite).
     pub lost: u32,
+    /// Files detected in folder/git sources that no doc references yet ->
+    /// will be imported by the batch (source-level sync).
+    pub added: u32,
+    /// Docs whose recorded original_path is under a KNOWN source root
+    /// (folder/git) but no longer present in a fresh scan of that source ->
+    /// will be deleted by the batch (source-level sync).
+    pub removed: u32,
+    /// Docs in the user's exclusion registry — deliberately ignored by this
+    /// batch (no re-index, no source-sync add/remove). Shown as its own stat
+    /// card so the counts add up visually. `#[serde(default)]` keeps it off
+    /// the wire when 0.
+    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    pub excluded: u32,
+    /// Per-repo refresh failures (address changed / credentials revoked /
+    /// network down). `label` = repo url @ branch, `auth` = true means the
+    /// fix is credentials (re-pick in the import dialog), false = network /
+    /// not-found (address may have moved). Empty when every repo refreshed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub git_errors: Vec<GitSourceError>,
+}
+
+/// One git repo's refresh failure, surfaced to the UI so the user can fix the
+/// source (re-enter credentials / update the URL) instead of silently getting
+/// stale md5 checks.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GitSourceError {
+    /// Repo URL (no credentials).
+    pub url: String,
+    /// Branch as recorded on the source (may be empty = remote default).
+    pub branch: String,
+    /// True = auth problem (401/403/credentials) -> re-enter credentials;
+    /// false = other (not found / network) -> URL may have changed or be
+    /// unreachable.
+    pub auth: bool,
+    /// Short error detail (already stripped of the GIT_AUTH_REQUIRED prefix).
+    pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RagSettings;
+
+    #[test]
+    fn auto_update_is_opt_in_for_defaults_and_legacy_settings() {
+        assert!(!RagSettings::default().auto_update_enabled);
+
+        let legacy: RagSettings = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.auto_update_enabled);
+        assert!(!legacy.source_sync_add_enabled);
+        assert!(legacy.source_sync_remove_enabled);
+    }
 }

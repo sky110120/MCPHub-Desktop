@@ -83,16 +83,19 @@ impl OpenapiTransport {
         }
 
         if let Some(ref url) = self.config.spec_url {
-            // Fetch spec from URL
+            // Fetch spec from URL (bounded: 30s total + 32MB body cap).
             log::info!("[{}] Fetching OpenAPI spec from URL: {}", self.server_name, url);
-            let client = reqwest::Client::new();
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
             let mut req = client.get(url);
 
             // Add the same static/security headers used by tool calls so a
             // protected spec endpoint can be downloaded as well.
             if let Some(headers) = self.build_default_headers()? {
                 for (k, v) in &headers {
-                    log::debug!("[{}] Adding OpenAPI spec header: {}", self.server_name, k);
+                    log::debug!("[{}] Adding OpenAPI spec header: {} (len={})", self.server_name, k, v.as_bytes().len());
                     req = req.header(k, v);
                 }
             }
@@ -111,7 +114,37 @@ impl OpenapiTransport {
                     resp.status()
                 ));
             }
-            let spec: Value = resp.json().await?;
+
+            // Cap the download size: specs come from user-configured URLs —
+            // an unbounded body read is a memory-exhaustion hazard.
+            const MAX_SPEC_BYTES: usize = 32 * 1024 * 1024;
+            if let Some(len) = resp.content_length() {
+                if len as usize > MAX_SPEC_BYTES {
+                    return Err(anyhow!(
+                        "OpenAPI spec from {} exceeds the {}MB size limit ({} bytes)",
+                        url,
+                        MAX_SPEC_BYTES / (1024 * 1024),
+                        len
+                    ));
+                }
+            }
+            // Stream with a hard cap: `bytes()` buffers the WHOLE body before
+            // the length check runs — a chunked (no content-length) malicious
+            // server could allocate gigabytes inside the 30s timeout window.
+            let mut body: Vec<u8> = Vec::new();
+            let mut stream = resp;
+            while let Some(chunk) = stream.chunk().await? {
+                if body.len() + chunk.len() > MAX_SPEC_BYTES {
+                    return Err(anyhow!(
+                        "OpenAPI spec from {} exceeds the {}MB size limit (>{} bytes streamed)",
+                        url,
+                        MAX_SPEC_BYTES / (1024 * 1024),
+                        body.len() + chunk.len()
+                    ));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let spec: Value = serde_json::from_slice(&body)?;
             log::info!("[{}] OpenAPI spec fetched successfully", self.server_name);
             return Ok(spec);
         }
@@ -122,71 +155,70 @@ impl OpenapiTransport {
         ))
     }
 
-    /// Build the default headers used by generated OpenAPI tools.
-    ///
-    /// `rmcp-openapi` does not infer the configured desktop security fields
-    /// from this wrapper's model, so translate the supported header-based
-    /// schemes explicitly before generating the tool collection. Explicit
-    /// headers win over derived security headers.
+    /// Build outbound headers. Explicit and passthrough headers take priority
+    /// over credentials derived from the configured security scheme.
     fn build_default_headers(&self) -> Result<Option<HeaderMap>> {
         let mut headers = HeaderMap::new();
-        for (k, v) in &self.config.headers {
-            insert_header(&mut headers, k, v)?;
+        for (name, value) in &self.config.headers {
+            insert_header(&mut headers, name, value)?;
         }
-        for (k, v) in &self.config.passthrough_headers {
-            if !headers.contains_key(k) {
-                insert_header(&mut headers, k, v)?;
+        for (name, value) in &self.config.passthrough_headers {
+            if !headers.contains_key(name) {
+                insert_header(&mut headers, name, value)?;
             }
         }
 
         if let Some(security) = &self.config.security {
-            match security {
-                OpenApiSecurity::ApiKey { name, location, value } => {
-                    if location.eq_ignore_ascii_case("header") {
-                        if !headers.contains_key(name) {
-                            insert_header(&mut headers, name, value)?;
-                        }
-                    } else if location.eq_ignore_ascii_case("cookie") {
-                        let cookie = format!("{}={}", name, value);
-                        if let Some(existing) = headers.get("cookie") {
-                            let existing = existing.to_str().map_err(|e| {
-                                anyhow!("invalid existing Cookie header: {}", e)
-                            })?;
-                            if !existing.split(';').any(|part| part.trim().starts_with(&format!("{}=", name))) {
-                                let combined = format!("{}; {}", existing, cookie);
+            let malformed = match security {
+                OpenApiSecurity::ApiKey { name, value, .. } => name.trim().is_empty() || value.is_empty(),
+                OpenApiSecurity::Http { credentials, .. } => credentials.trim().is_empty(),
+                OpenApiSecurity::OAuth2 { token }
+                | OpenApiSecurity::OpenIdConnect { token, .. } => token.trim().is_empty(),
+            };
+            if malformed {
+                log::warn!("[{}] OpenAPI security credentials are empty; skipping derived auth header", self.server_name);
+            } else {
+                match security {
+                    OpenApiSecurity::ApiKey { name, location, value } => {
+                        if location.eq_ignore_ascii_case("header") {
+                            if !headers.contains_key(name) {
+                                insert_header(&mut headers, name, value)?;
+                            }
+                        } else if location.eq_ignore_ascii_case("cookie") {
+                            let cookie = format!("{}={}", name, value);
+                            if let Some(existing) = headers.get("cookie") {
+                                let existing = existing.to_str().map_err(|e| anyhow!("invalid existing Cookie header: {}", e))?;
+                                if !existing.split(';').any(|part| part.trim().starts_with(&format!("{}=", name))) {
+                                    headers.insert(
+                                        HeaderName::from_static("cookie"),
+                                        HeaderValue::from_str(&format!("{}; {}", existing, cookie))
+                                            .map_err(|e| anyhow!("invalid Cookie header: {}", e))?,
+                                    );
+                                }
+                            } else {
                                 headers.insert(
                                     HeaderName::from_static("cookie"),
-                                    HeaderValue::from_str(&combined)
+                                    HeaderValue::from_str(&cookie)
                                         .map_err(|e| anyhow!("invalid Cookie header: {}", e))?,
                                 );
                             }
-                        } else {
-                            headers.insert(
-                                HeaderName::from_static("cookie"),
-                                HeaderValue::from_str(&cookie)
-                                    .map_err(|e| anyhow!("invalid Cookie header: {}", e))?,
-                            );
+                        } else if location.eq_ignore_ascii_case("query") {
+                            return Err(anyhow!(
+                                "OpenAPI apiKey security '{}' uses query authentication, which the desktop transport does not support; use a header or cookie scheme",
+                                name
+                            ));
                         }
-                    } else if location.eq_ignore_ascii_case("query") {
-                        return Err(anyhow!(
-                            "OpenAPI apiKey security '{}' uses query authentication, which the desktop transport does not support; use a header or cookie scheme",
-                            name
-                        ));
                     }
-                }
-                OpenApiSecurity::Http { scheme, credentials } => {
-                    if !credentials.trim().is_empty() && !headers.contains_key("authorization") {
-                        insert_header(
-                            &mut headers,
-                            "Authorization",
-                            &format_auth_value(scheme, credentials),
-                        )?;
+                    OpenApiSecurity::Http { scheme, credentials } => {
+                        if !headers.contains_key("authorization") {
+                            insert_header(&mut headers, "Authorization", &format_auth_value(scheme, credentials))?;
+                        }
                     }
-                }
-                OpenApiSecurity::OAuth2 { token }
-                | OpenApiSecurity::OpenIdConnect { token, .. } => {
-                    if !token.trim().is_empty() && !headers.contains_key("authorization") {
-                        insert_header(&mut headers, "Authorization", &format_bearer(token))?;
+                    OpenApiSecurity::OAuth2 { token }
+                    | OpenApiSecurity::OpenIdConnect { token, .. } => {
+                        if !headers.contains_key("authorization") {
+                            insert_header(&mut headers, "Authorization", &format_bearer(token))?;
+                        }
                     }
                 }
             }
@@ -274,11 +306,17 @@ impl McpTransport for OpenapiTransport {
             self.config.spec_schema.as_ref().map(|_| "<inline>")
         );
         log::info!(
-            "[{}] OpenAPI config: version={}, header_names={:?}, security_configured={}",
+            "[{}] OpenAPI config: version={}, headers={}, security={}",
             self.server_name,
             self.config.version,
-            self.config.headers.keys().collect::<Vec<_>>(),
-            self.config.security.is_some()
+            format!("{} header(s) [values redacted]", self.config.headers.len()),
+            self.config.security.as_ref().map_or("none".to_string(), |s| match s {
+                OpenApiSecurity::ApiKey { .. } => "apiKey",
+                OpenApiSecurity::Http { .. } => "http",
+                OpenApiSecurity::OAuth2 { .. } => "oauth2",
+                OpenApiSecurity::OpenIdConnect { .. } => "openIdConnect",
+            }
+            .to_string())
         );
 
         // 1. Fetch the spec
@@ -292,13 +330,13 @@ impl McpTransport for OpenapiTransport {
             ))?;
         log::info!("[{}] OpenAPI base_url: {}", self.server_name, base_url);
 
-        // 3. Create the rmcp-openapi server. The project and rmcp-openapi both
-        // use reqwest 0.13, so the generated tools can share a real HeaderMap.
+        // 3. Create the rmcp-openapi server with configured outbound headers.
         let default_headers = self.build_default_headers()?;
         log::info!(
-            "[{}] OpenAPI default headers configured: {}",
+            "[{}] outbound default headers: {}, security configured: {}",
             self.server_name,
-            default_headers.as_ref().map(|h| h.len()).unwrap_or(0)
+            default_headers.as_ref().map(|h| h.len()).unwrap_or(0),
+            self.config.security.is_some()
         );
 
         let mut server = OpenApiServer::new(
@@ -311,9 +349,15 @@ impl McpTransport for OpenapiTransport {
             false, // insecure
         );
 
-        // 5. Load the spec and generate tools
-        server.load_openapi_spec()
-            .map_err(|e| anyhow!("Failed to load OpenAPI spec for '{}': {}", self.server_name, e))?;
+        // 5. Load the spec and generate tools — spec snapshot/restore is
+        // CPU-bound ($ref lattice can explode); keep it off the async worker.
+        let load = tokio::task::spawn_blocking(move || {
+            server.load_openapi_spec().map(|_| server)
+        })
+        .await
+        .map_err(|e| anyhow!("OpenAPI spec load task panicked for '{}': {}", self.server_name, e))?
+        .map_err(|e| anyhow!("Failed to load OpenAPI spec for '{}': {}", self.server_name, e))?;
+        let server = load;
 
         let tool_count = server.tool_count();
         log::info!(
@@ -372,6 +416,11 @@ impl McpTransport for OpenapiTransport {
                     // so they carry no MCP annotations / outputSchema.
                     annotations: None,
                     output_schema: None,
+                    title: None,
+                    execution: None,
+                    icons: None,
+                    meta: None,
+                    description_overridden: false,
                 }
             })
             .collect();
@@ -387,14 +436,15 @@ impl McpTransport for OpenapiTransport {
         let tool = server.tool_collection.get_tool(name)
             .ok_or_else(|| anyhow!("Tool '{}' not found in OpenAPI server '{}'", name, self.server_name))?;
 
-        // Log to database so it shows in the app's log viewer
-        let argument_keys = arguments
-            .as_object()
-            .map(|obj| obj.keys().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
+        // Log only argument names and size; argument values may contain secrets.
+        let arg_keys: Vec<&str> = arguments.as_object().map(|m| m.keys().map(String::as_str).collect()).unwrap_or_default();
         let start_msg = format!(
-            "[{}] OpenAPI call_tool: name={}, base_url={:?}, argument_keys={:?}",
-            self.server_name, name, self.base_url, argument_keys
+            "[{}] OpenAPI call_tool: name={}, base_url={:?}, arg_keys={:?}, arg_bytes={}",
+            self.server_name,
+            name,
+            self.base_url,
+            arg_keys,
+            arguments.to_string().len()
         );
         log::info!("{}", start_msg);
         app_logger::log_to_db("info", &start_msg);
@@ -419,12 +469,14 @@ impl McpTransport for OpenapiTransport {
 
         let is_error = result.is_error.unwrap_or(false);
 
+        // Log response shape only; returned content may include credentials.
+        let sizes: Vec<usize> = content
+            .iter()
+            .map(|c| serde_json::to_string(c).map(|s| s.len()).unwrap_or(0))
+            .collect();
         let ok_msg = format!(
-            "[{}] OpenAPI call_tool OK: name={}, is_error={}, content_items={}",
-            self.server_name,
-            name,
-            is_error,
-            content.len()
+            "[{}] OpenAPI call_tool OK: name={}, is_error={}, content_items={}, bytes={:?}",
+            self.server_name, name, is_error, content.len(), sizes
         );
         if is_error {
             log::warn!("{}", ok_msg);
@@ -433,7 +485,7 @@ impl McpTransport for OpenapiTransport {
             log::info!("{}", ok_msg);
         }
 
-        Ok(ToolCallResult { content, is_error, structured_content: None })
+        Ok(ToolCallResult { content, is_error, structured_content: None, raw_meta: None })
     }
 }
 
@@ -591,5 +643,46 @@ mod tests {
             .build_default_headers()
             .expect_err("query authentication should be rejected");
         assert!(error.to_string().contains("query authentication"));
+    }
+
+    #[test]
+    fn cookie_api_key_is_merged_without_replacing_existing_cookies() {
+        let mut headers = HashMap::new();
+        headers.insert("Cookie".to_string(), "session=abc".to_string());
+        let transport = OpenapiTransport::new(
+            "test",
+            OpenApiConfig {
+                spec_url: None,
+                spec_schema: None,
+                version: "3.1.0".to_string(),
+                security: Some(OpenApiSecurity::ApiKey {
+                    name: "api_key".to_string(),
+                    location: "cookie".to_string(),
+                    value: "secret".to_string(),
+                }),
+                passthrough_headers: HashMap::new(),
+                headers,
+            },
+        );
+
+        let result = transport.build_default_headers().unwrap().unwrap();
+        assert_eq!(result.get("cookie").unwrap(), "session=abc; api_key=secret");
+    }
+
+    #[test]
+    fn malformed_security_does_not_emit_an_empty_authorization_header() {
+        let transport = OpenapiTransport::new(
+            "test",
+            OpenApiConfig {
+                spec_url: None,
+                spec_schema: None,
+                version: "3.1.0".to_string(),
+                security: Some(OpenApiSecurity::OAuth2 { token: String::new() }),
+                passthrough_headers: HashMap::new(),
+                headers: HashMap::new(),
+            },
+        );
+
+        assert!(transport.build_default_headers().unwrap().is_none());
     }
 }

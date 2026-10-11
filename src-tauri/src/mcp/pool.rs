@@ -1,10 +1,9 @@
 /// Global MCP connection pool — manages live connections to all enabled servers.
 use super::{
     client::McpClient,
-    http_transport::HttpTransport,
     openapi_transport::{OpenApiConfig as TransportOpenApiConfig, OpenApiSecurity as TransportOpenApiSecurity, OpenapiTransport},
+    rmcp_http_transport::RmcpHttpTransport,
     sse_transport::SseTransport,
-    stdio_transport::StdioTransport,
 };
 use crate::models::server::{ServerConfig, ServerStatus, ServerType, Tool, ToolCallResult};
 use crate::services::app_logger;
@@ -14,13 +13,18 @@ use serde_json::Value;
 use tokio::time::{timeout, Duration};
 use std::{
     collections::HashMap,
-    sync::{Arc, OnceLock},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, OnceLock},
 };
 use tokio::sync::{Mutex, RwLock};
 
 /// Holds a live client + last known status + cached tools
 struct PoolEntry {
-    client: Option<McpClient>,
+    /// Arc<Mutex<>> so tool calls can run OUTSIDE the pool read lock: a slow
+    /// upstream call (up to 600s) used to pin the read lock and freeze every
+    /// concurrent reader (UI status polling, list_all_tools) behind any queued
+    /// writer (30s reconnect loop / reload). The per-client Mutex preserves
+    /// the old call-vs-disconnect serialization for the same server.
+    client: Option<std::sync::Arc<tokio::sync::Mutex<McpClient>>>,
     status: ServerStatus,
     tools: Vec<Tool>,  // cached at connect time; refreshed on reconnect
     /// Cached `per_session_client` flag from the server config. When true,
@@ -42,6 +46,7 @@ static POOL: OnceLock<Pool> = OnceLock::new();
 type ConnectionGenerations = Arc<Mutex<HashMap<String, u64>>>;
 
 static CONNECTION_GENERATIONS: OnceLock<ConnectionGenerations> = OnceLock::new();
+static POOL_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
 fn pool() -> &'static Pool {
     POOL.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
@@ -58,13 +63,50 @@ async fn next_connection_generation(name: &str) -> u64 {
     *generation
 }
 
+async fn begin_connection(name: &str) -> std::result::Result<u64, ServerStatus> {
+    if POOL_SHUTTING_DOWN.load(Ordering::Acquire) {
+        return Err(cancelled_status(name));
+    }
+    // Serialize duplicate-start detection with ticket allocation so a duplicate
+    // cannot invalidate the connection that already owns the starting entry.
+    let mut generations = connection_generations().lock().await;
+    let map = pool().read().await;
+    if let Some(entry) = map.get(name).filter(|entry| entry.status.starting) {
+        return Err(entry.status.clone());
+    }
+    let generation = generations.entry(name.to_string()).or_insert(0);
+    *generation = generation.saturating_add(1);
+    Ok(*generation)
+}
+
 async fn invalidate_connection(name: &str) {
     let _ = next_connection_generation(name).await;
 }
 
 async fn is_current_connection(name: &str, generation: u64) -> bool {
+    if POOL_SHUTTING_DOWN.load(Ordering::Acquire) {
+        return false;
+    }
     let generations = connection_generations().lock().await;
     generations.get(name).copied().unwrap_or(0) == generation
+}
+
+async fn lock_current_connection(
+    name: &str,
+    generation: u64,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    let lock = pool_connect_lock(name).await;
+    let guard = lock.lock_owned().await;
+    if is_current_connection(name, generation).await {
+        Some(guard)
+    } else {
+        None
+    }
+}
+
+async fn lock_connection_for_disconnect(name: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = pool_connect_lock(name).await;
+    lock.lock_owned().await
 }
 
 async fn invalidate_all_connections() {
@@ -85,7 +127,9 @@ async fn insert_if_current(
     entry: PoolEntry,
 ) -> Result<(), PoolEntry> {
     let generations = connection_generations().lock().await;
-    if generations.get(name).copied().unwrap_or(0) != generation {
+    if POOL_SHUTTING_DOWN.load(Ordering::Acquire)
+        || generations.get(name).copied().unwrap_or(0) != generation
+    {
         return Err(entry);
     }
     let mut map = pool().write().await;
@@ -118,7 +162,10 @@ pub(crate) fn build_client(cfg: &ServerConfig) -> Result<McpClient> {
                 .to_string();
             let args = cfg.args.clone().unwrap_or_default();
             let env = cfg.env.clone().unwrap_or_default();
-            let transport = StdioTransport::new(&name, command, args, env);
+            // rmcp-backed transport (AGENTS.md §3.9.4): official SDK protocol
+            // layer, all desktop behaviours (runtime_env resolution, download
+            // progress, stderr tail, process-tree kill) preserved.
+            let transport = super::rmcp_stdio_transport::RmcpStdioTransport::new(&name, command, args, env);
             Ok(McpClient::new(name, Box::new(transport)))
         }
         ServerType::Sse => {
@@ -138,61 +185,53 @@ pub(crate) fn build_client(cfg: &ServerConfig) -> Result<McpClient> {
                 .ok_or_else(|| anyhow!("HTTP server '{}' missing url", name))?
                 .to_string();
             let headers = cfg.headers.clone().unwrap_or_default();
-            let transport = HttpTransport::new(&name, url, headers);
+            // rmcp-backed transport (AGENTS.md §3.9.6): official SDK protocol
+            // layer — Auto lifecycle (discover probe → legacy fallback),
+            // native MRTR, native tasks/get polling, custom headers.
+            let transport =
+                RmcpHttpTransport::new(&name, url, headers);
             Ok(McpClient::new(name, Box::new(transport)))
         }
         ServerType::Openapi => {
             let openapi_cfg = cfg.openapi.as_ref()
                 .ok_or_else(|| anyhow!("OpenAPI server '{}' missing openapi config", name))?;
 
-            let security = match openapi_cfg.security.as_ref() {
-                Some(s) => {
-                    let security_type = s.security_type.clone();
-                    Some(match security_type.as_str() {
-                        "apiKey" => {
-                            let ak = s.api_key.as_ref().ok_or_else(|| {
-                                anyhow!("OpenAPI server '{}' apiKey security missing api_key", name)
-                            })?;
-                            TransportOpenApiSecurity::ApiKey {
-                                name: ak.name.clone(),
-                                location: ak.location.clone(),
-                                value: ak.value.clone(),
-                            }
+            let security = openapi_cfg.security.as_ref().map(|s| {
+                let security_type = s.security_type.clone();
+                // Malformed configs (declared type but missing payload) must not
+                // panic the connect path or synthesize usable credentials.
+                match (security_type.as_str(), s) {
+                    ("apiKey", crate::models::server::OpenApiSecurity { api_key: Some(ak), .. }) => {
+                        TransportOpenApiSecurity::ApiKey {
+                            name: ak.name.clone(),
+                            location: ak.location.clone(),
+                            value: ak.value.clone(),
                         }
-                        "http" => {
-                            let h = s.http.as_ref().ok_or_else(|| {
-                                anyhow!("OpenAPI server '{}' http security missing http", name)
-                            })?;
-                            TransportOpenApiSecurity::Http {
-                                scheme: h.scheme.clone(),
-                                credentials: h.credentials.clone(),
-                            }
+                    }
+                    ("http", crate::models::server::OpenApiSecurity { http: Some(h), .. }) => {
+                        TransportOpenApiSecurity::Http {
+                            scheme: h.scheme.clone(),
+                            credentials: h.credentials.clone(),
                         }
-                        "oauth2" => {
-                            let o = s.oauth2.as_ref().ok_or_else(|| {
-                                anyhow!("OpenAPI server '{}' oauth2 security missing oauth2", name)
-                            })?;
-                            TransportOpenApiSecurity::OAuth2 {
-                                token: o.token.clone(),
-                            }
+                    }
+                    ("oauth2", crate::models::server::OpenApiSecurity { oauth2: Some(o), .. }) => {
+                        TransportOpenApiSecurity::OAuth2 {
+                            token: o.token.clone(),
                         }
-                        "openIdConnect" => {
-                            let oidc = s.open_id_connect.as_ref().ok_or_else(|| {
-                                anyhow!("OpenAPI server '{}' openIdConnect security missing open_id_connect", name)
-                            })?;
-                            TransportOpenApiSecurity::OpenIdConnect {
-                                url: oidc.url.clone(),
-                                token: oidc.token.clone(),
-                            }
+                    }
+                    ("openIdConnect", crate::models::server::OpenApiSecurity { open_id_connect: Some(oidc), .. }) => {
+                        TransportOpenApiSecurity::OpenIdConnect {
+                            url: oidc.url.clone(),
+                            token: oidc.token.clone(),
                         }
-                        _ => TransportOpenApiSecurity::Http {
-                            scheme: "bearer".to_string(),
-                            credentials: String::new(),
-                        },
-                    })
+                    }
+                    _ => TransportOpenApiSecurity::ApiKey {
+                        name: String::new(),
+                        location: "header".to_string(),
+                        value: String::new(),
+                    }
                 }
-                None => None,
-            };
+            });
 
             // Build passthrough headers from the config
             let mut passthrough_headers = HashMap::new();
@@ -226,21 +265,40 @@ pub(crate) fn build_client(cfg: &ServerConfig) -> Result<McpClient> {
 /// Connect a single server and insert into pool.
 /// Immediately inserts a "starting" placeholder so the frontend can show "connecting" status
 /// while the actual connect (process spawn, handshake) is in progress.
+/// Per-name connect lock, shared by connect_server AND disconnect_server so a
+/// disable racing an in-flight connect cannot be resurrected by the connect's
+/// final entry insert (the disconnect waits for the connect flow to finish).
+static CONNECT_LOCKS: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
+    std::sync::OnceLock::new();
+
+pub(crate) async fn pool_connect_lock(name: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    CONNECT_LOCKS
+        .get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .await
+        .entry(name.to_string())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
     let name = cfg.name.clone();
     let per_session_client = cfg.per_session_client.unwrap_or(false);
 
-    // 0. Check if already connecting (prevent re-entry from rapid disable/enable clicks)
-    {
-        let map = pool().read().await;
-        if let Some(entry) = map.get(&name) {
-            if entry.status.starting {
-                log::warn!("[{}] Already connecting, skipping duplicate connect_server call", name);
-                app_logger::log_to_db("warn", &format!("[{}] Already connecting, skipping duplicate connect", name));
-                return entry.status.clone();
-            }
+    // Assign the ticket before waiting for the per-name lock so a later
+    // disable/reload can invalidate this queued connect immediately.
+    let connection_generation = match begin_connection(&name).await {
+        Ok(generation) => generation,
+        Err(status) => {
+            log::warn!("[{}] Already connecting, skipping duplicate connect_server call", name);
+            app_logger::log_to_db("warn", &format!("[{}] Already connecting, skipping duplicate connect", name));
+            return status;
         }
-    }
+    };
+    let _connect_guard = match lock_current_connection(&name, connection_generation).await {
+        Some(guard) => guard,
+        None => return cancelled_status(&name),
+    };
 
     // 1. Clean up any existing entry (e.g., zombie process from a previous connection).
     // Also tears down any per-session isolated clients for this server via the
@@ -249,8 +307,7 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
     // `disconnect_server` also reaps any live on-demand client (so reloading an
     // awake on-demand server kills the old process before re-inserting the
     // sleeping placeholder below).
-    disconnect_server(&name).await.ok();
-    let connection_generation = next_connection_generation(&name).await;
+    disconnect_server_inner(&name).await.ok();
 
     // 1a. On-demand stdio servers skip startup connect: insert a "sleeping"
     // placeholder (client None, connected false, start_on_demand true) and
@@ -271,14 +328,16 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
             last_connected: None,
             server_version: None,
         };
-        let mut map = pool().write().await;
-        map.insert(name.clone(), PoolEntry {
+        let entry = PoolEntry {
             client: None,
             status: status.clone(),
             tools: vec![],
             per_session_client,
             start_on_demand: true,
-        });
+        };
+        if insert_if_current(&name, connection_generation, entry).await.is_err() {
+            return cancelled_status(&name);
+        }
         return status;
     }
 
@@ -358,47 +417,48 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
 
         match connect_result {
             Ok(Ok(())) => {
+                // rmcp peer requests have no default timeout; a server that
+                // completes initialize then stalls on tools/list would leave
+                // the placeholder "starting" forever (re-entry guard skips
+                // every subsequent connect). Bound the tool discovery.
+                let (tools, _tools_ttl) = match tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    entry_client.list_tools_with_ttl(),
+                )
+                .await
+                {
+                    // Err (JSON-RPC error from the server, e.g. method not
+                    // found) degrades to an empty tool list but must not be
+                    // silent — a "connected, 0 tools" server with no error
+                    // hint is a diagnosis dead-end.
+                    Ok(Ok((t, ttl))) => {
+                        crate::services::list_freshness::record(&name, "tools", ttl);
+                        (t, ttl)
+                    }
+                    Ok(Err(e)) => {
+                        let msg = format!("[{}] tools/list failed post-handshake (continuing with 0 tools): {}", name, e);
+                        log::warn!("{}", msg);
+                        app_logger::log_to_db("warn", &msg);
+                        crate::services::list_freshness::record(&name, "tools", None);
+                        (Vec::new(), None)
+                    }
+                    Err(_) => {
+                        let msg = format!(
+                            "[{}] tools/list timed out after 60s post-handshake — treating as failure",
+                            name
+                        );
+                        log::warn!("{}", msg);
+                        app_logger::log_to_db("warn", &msg);
+                        let _ = entry_client.disconnect().await;
+                        last_error = "tools/list timed out after handshake".to_string();
+                        continue;
+                    }
+                };
+                let tools_for_index = tools.clone();
                 if !is_current_connection(&name, connection_generation).await {
                     let _ = entry_client.disconnect().await;
                     return cancelled_status(&name);
                 }
-                let tools = match entry_client.list_tools().await {
-                    Ok(tools) => tools,
-                    Err(e) => {
-                        let error = format!("Tool discovery failed: {}", e);
-                        log::error!("[{}] {}", name, error);
-                        app_logger::log_to_db("error", &format!("[{}] {}", name, error));
-                        let _ = entry_client.disconnect().await;
-                        if progress::is_package_manager(&cfg.command) {
-                            progress::emit_install_progress(&ServerInstallProgress {
-                                server: name.clone(),
-                                phase: "error".to_string(),
-                                progress: None,
-                                message: Some(error.clone()),
-                            });
-                        }
-                        let status = ServerStatus {
-                            name: name.clone(),
-                            connected: false,
-                            starting: false,
-                            start_on_demand: false,
-                            tool_count: 0,
-                            error: Some(error),
-                            last_connected: None,
-                            server_version: None,
-                        };
-                        if insert_if_current(&name, connection_generation, PoolEntry {
-                            client: None,
-                            status: status.clone(),
-                            tools: vec![],
-                            per_session_client,
-                            start_on_demand: false,
-                        }).await.is_err() {
-                            return cancelled_status(&name);
-                        }
-                        return status;
-                    }
-                };
                 let tool_count = tools.len();
                 // Capture the server-reported version before moving the client
                 // into the pool, for a best-effort "update available" check.
@@ -415,15 +475,15 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
                     server_version: running_version.clone(),
                 };
                 let publish_result = insert_if_current(&name, connection_generation, PoolEntry {
-                    client: Some(entry_client),
+                    client: Some(std::sync::Arc::new(tokio::sync::Mutex::new(entry_client))),
                     status: status.clone(),
                     tools,
                     per_session_client,
                     start_on_demand: false,
                 }).await;
                 if let Err(mut stale_entry) = publish_result {
-                    if let Some(mut client) = stale_entry.client.take() {
-                        let _ = client.disconnect().await;
+                    if let Some(client) = stale_entry.client.take() {
+                        let _ = client.lock().await.disconnect().await;
                     }
                     return cancelled_status(&name);
                 }
@@ -451,16 +511,32 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
                         running_version,
                     );
                 }
+                // Smart Routing index (Phase 3): background, skip-check makes
+                // repeat connects cheap; errors are logged inside.
+                crate::smart_routing::index::on_server_connected(
+                    name.clone(),
+                    tools_for_index,
+                    cfg.description.clone(),
+                );
                 return status;
             }
             Ok(Err(e)) => {
                 last_error = e.to_string();
-                // A failed handshake may already have spawned a stdio child.
-                // Explicitly disconnect before retrying or returning so the
-                // child tree is reaped instead of relying on Drop behavior.
+                // Handshake failed — disconnect the half-built client like the
+                // timeout branch (and session_pool/on_demand) do: rmcp drops
+                // the transport on error which SIGKILLs only the direct child;
+                // without an explicit disconnect npx/uvx grandchildren orphan.
                 let _ = entry_client.disconnect().await;
-                // Retry on transient errors (child process exited unexpectedly)
-                if attempt < MAX_RETRIES && last_error.contains("child process exited") {
+                // Retry on transient errors. rmcp 3.4.1 reports a child that
+                // died mid-handshake as `connection closed: …` (service/client.rs
+                // ClientInitializeError) or `Send message error …`; the legacy
+                // string "child process exited" came from the old handwritten
+                // transport and never matches post-migration, which silently
+                // disabled the whole retry mechanism.
+                let transient = last_error.contains("child process exited")
+                    || last_error.contains("connection closed")
+                    || last_error.contains("Send message error");
+                if attempt < MAX_RETRIES && transient {
                     let retry_msg = format!(
                         "[{}] Connect failed (attempt {}/{}): {} — retrying in 1s...",
                         name, attempt, MAX_RETRIES, last_error
@@ -541,7 +617,11 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
         }
     }
 
-    // All retries exhausted (should not reach here for timeout, only for "child process exited")
+    // Defensive fallback: under the current control flow every path inside the
+    // loop either returns or `continue`s (gated on attempt < MAX_RETRIES), so
+    // this block is unreachable today. It stays as insurance only — if a future
+    // edit introduces a fall-through arm, this still produces a correct
+    // terminal status instead of an unhandled fall-out.
     let err_msg = format!("[{}] Connect failed after {} attempts: {}", name, MAX_RETRIES, last_error);
     log::error!("{}", err_msg);
     app_logger::log_to_db("error", &err_msg);
@@ -579,10 +659,31 @@ pub async fn connect_server(cfg: &ServerConfig) -> ServerStatus {
 /// The entry is removed from the map while holding the write lock, then the
 /// actual disconnect I/O happens after the lock is released so that read
 /// operations are not blocked during the network round-trip.
+/// Drop the per-name connect lock entry for a deleted/renamed server.
+/// Without this, CONNECT_LOCKS grows without bound over a long session
+/// (one entry per name ever seen). Only call from server delete/rename —
+/// NOT from disconnect: removing while a concurrent connect holds the Arc
+/// would let a new connect mint a fresh lock and run concurrently.
+pub async fn forget_connect_lock(name: &str) {
+    if let Some(m) = CONNECT_LOCKS.get() {
+        m.lock().await.remove(name);
+    }
+}
+
 pub async fn disconnect_server(name: &str) -> Result<()> {
-    // Invalidate an in-flight connect before removing its placeholder. A slow
-    // handshake must not publish a stale client after a disable/reload/delete.
+    // Invalidate before waiting for the per-name connect lock. A slow handshake
+    // may finish later, but its generation check will reject publication.
     invalidate_connection(name).await;
+    super::on_demand::shutdown_on_demand_lifecycle(name).await;
+    // Take the same per-name connect lock connect_server holds for its ENTIRE
+    let _disconnect_guard = lock_connection_for_disconnect(name).await;
+    disconnect_server_inner(name).await
+}
+
+/// Disconnect core for callers that already hold the per-name connect lock.
+/// `connect_server` uses this to avoid recursively acquiring the non-reentrant
+/// mutex while cleaning up before reconnecting.
+pub(crate) async fn disconnect_server_inner(name: &str) -> Result<()> {
     log::info!("[{}] Disconnecting...", name);
     app_logger::log_to_db("info", &format!("[{}] Disconnecting...", name));
     // Tear down any per-session isolated upstream clients for this server too
@@ -598,9 +699,11 @@ pub async fn disconnect_server(name: &str) -> Result<()> {
         let mut map = pool().write().await;
         map.remove(name)
     }; // write lock released before any I/O
+    crate::services::list_freshness::invalidate_server(name);
     if let Some(mut e) = entry {
-        if let Some(mut client) = e.client.take() {
-            client.disconnect().await?;
+        if let Some(client) = e.client.take() {
+            let mut c = client.lock().await;
+            c.disconnect().await?;
         }
     }
     log::info!("[{}] Disconnected", name);
@@ -619,6 +722,10 @@ pub async fn disconnect_server(name: &str) -> Result<()> {
 /// Best-effort: disconnect errors are logged, not propagated, so one stuck
 /// server doesn't block the rest of the shutdown.
 pub async fn disconnect_all() {
+    POOL_SHUTTING_DOWN.store(true, Ordering::Release);
+    super::on_demand::begin_shutdown();
+    invalidate_all_connections().await;
+
     log::info!("[pool] Disconnecting all servers (shutdown)...");
     app_logger::log_to_db("info", "[pool] Disconnecting all servers (shutdown)");
 
@@ -630,16 +737,15 @@ pub async fn disconnect_all() {
     // processes are killed via kill_process_tree rather than relying on
     // kill_on_drop at process exit.
     super::on_demand::cleanup_all_on_demand().await;
-    invalidate_all_connections().await;
-
     let entries: Vec<(String, PoolEntry)> = {
         let mut map = pool().write().await;
         map.drain().collect()
     }; // write lock released before any I/O
 
     for (name, mut e) in entries {
-        if let Some(mut client) = e.client.take() {
-            if let Err(err) = client.disconnect().await {
+        if let Some(client) = e.client.take() {
+            let mut c = client.lock().await;
+            if let Err(err) = c.disconnect().await {
                 log::warn!("[{}] Error during shutdown disconnect: {}", name, err);
                 app_logger::log_to_db("warn", &format!("[{}] Error during shutdown disconnect: {}", name, err));
             } else {
@@ -701,7 +807,11 @@ pub async fn list_tools_for(server_name: &str) -> Result<Vec<Tool>> {
     // the RAG builtin tools - return them so the Tauri call_tool path and the
     // "servers" panel can list/enable/disable them like any other server.
     if server_name == crate::rag::service::BUILTIN_SERVER_NAME {
-        return Ok(crate::rag::service::builtin_tools());
+        let mut tools = crate::rag::service::builtin_tools();
+        // Smart Routing meta tools ride on the builtin server too (UI listing
+        // + test invocation) — empty when Smart Routing is disabled.
+        tools.extend(crate::smart_routing::meta::builtin_meta_tools().await);
+        return Ok(tools);
     }
     let needs_prime = {
         let map = pool().read().await;
@@ -725,11 +835,62 @@ pub async fn get_entry_info(name: &str) -> Option<(ServerStatus, Vec<Tool>)> {
 }
 
 /// Call a tool — automatically routes to the correct server
+/// A2/A9: call_tool variant forwarding request-level `_meta` upstream
+/// (MRTR inputResponses retry, OTel trace keys). Falls back to the plain
+/// path for builtin/on-demand/isolated routing (they drop _meta).
+pub async fn call_tool_with_meta(
+    server_name: &str,
+    tool_name: &str,
+    arguments: Value,
+    request_meta: Option<Value>,
+) -> Result<ToolCallResult> {
+    // NOTE: `request_meta` is consumed further down by the shared-pool path
+    // (forwarded to transports via call_tool_with_meta); the builtin/on-demand
+    // early returns below take no meta — those paths simply don't carry one.
+    if server_name == crate::rag::service::BUILTIN_SERVER_NAME {
+        return call_tool(server_name, tool_name, arguments).await;
+    }
+    let on_demand = {
+        let map = pool().read().await;
+        map.get(server_name).map(|e| e.start_on_demand).unwrap_or(false)
+    };
+    if on_demand {
+        return super::on_demand::call_tool_on_demand(server_name, tool_name, arguments).await;
+    }
+    let client_arc = {
+        let map = pool().read().await;
+        let entry = map
+            .get(server_name)
+            .ok_or_else(|| anyhow!("Server '{}' not connected", server_name))?;
+        entry
+            .client
+            .clone()
+            .ok_or_else(|| anyhow!("Server '{}' is still starting", server_name))?
+    }; // pool read lock released before the upstream call
+    let client = client_arc.lock().await;
+    let result = client.call_tool_with_meta(tool_name, arguments, request_meta).await;
+    drop(client);
+    result
+}
+
 pub async fn call_tool(server_name: &str, tool_name: &str, arguments: Value) -> Result<ToolCallResult> {
     // Builtin "mcphub-desktop" server (RAG tools): virtual, not in the pool.
     // Route to the RAG dispatch so invoking rag_* via the Tauri call_tool
     // command / "servers" panel works instead of erroring "not connected".
     if server_name == crate::rag::service::BUILTIN_SERVER_NAME {
+        // Smart Routing meta tools (smart_route_search / smart_route_describe / smart_route_call):
+        // global scope, executed in-process. Checked BEFORE RAG dispatch —
+        // names never collide (rag_* vs meta names).
+        if crate::smart_routing::meta::is_meta_tool(tool_name) {
+            // Box::pin: meta call_tool re-enters pool::call_tool for the
+            // RESOLVED real tool (different name) — a legal mutual recursion
+            // the compiler can't size without boxing.
+            return Box::pin(crate::smart_routing::meta::call_meta_tool_builtin(
+                tool_name,
+                &arguments,
+            ))
+            .await;
+        }
         let app = crate::mcp::progress::get_app_handle()
             .ok_or_else(|| anyhow!("app handle unavailable"))?;
         return crate::rag::service::call_builtin_tool(&app, tool_name, &arguments).await;
@@ -745,14 +906,19 @@ pub async fn call_tool(server_name: &str, tool_name: &str, arguments: Value) -> 
         return super::on_demand::call_tool_on_demand(server_name, tool_name, arguments).await;
     }
 
-    let map = pool().read().await;
-    let entry = map
-        .get(server_name)
-        .ok_or_else(|| anyhow!("Server '{}' not connected", server_name))?;
-    let client = entry.client.as_ref()
-        .ok_or_else(|| anyhow!("Server '{}' is still starting", server_name))?;
+    let client_arc = {
+        let map = pool().read().await;
+        let entry = map
+            .get(server_name)
+            .ok_or_else(|| anyhow!("Server '{}' not connected", server_name))?;
+        entry
+            .client
+            .clone()
+            .ok_or_else(|| anyhow!("Server '{}' is still starting", server_name))?
+    }; // pool read lock released before the upstream call
 
     log::debug!("[{}] Calling tool '{}'...", server_name, tool_name);
+    let client = client_arc.lock().await;
     let result = client.call_tool(tool_name, arguments).await;
     match &result {
         Ok(r) => {
@@ -785,6 +951,14 @@ pub(crate) async fn mark_on_demand_awake(name: &str, tools: Vec<Tool>, server_ve
     let last_connected = Some(chrono::Utc::now().to_rfc3339());
     let mut map = pool().write().await;
     if let Some(entry) = map.get_mut(name) {
+        // Identity guard: only mutate entries that are on-demand shadows.
+        // If the shadow was replaced by a live entry (server disabled ->
+        // re-enabled as a normal always-connected server while the cold
+        // spawn was in flight), stamping connected=true here would fabricate
+        // a connected status backed by no client in the pool.
+        if !entry.start_on_demand {
+            return;
+        }
         entry.tools = tools;
         entry.status.connected = true;
         entry.status.starting = false;
@@ -802,6 +976,12 @@ pub(crate) async fn mark_on_demand_awake(name: &str, tools: Vec<Tool>, server_ve
 pub(crate) async fn mark_on_demand_sleeping(name: &str) {
     let mut map = pool().write().await;
     if let Some(entry) = map.get_mut(name) {
+        // Identity guard: a live (non-on-demand) entry must never be flipped
+        // to disconnected by an on-demand idle timer firing late — that would
+        // report a connected server as down.
+        if !entry.start_on_demand {
+            return;
+        }
         entry.status.connected = false;
         entry.status.starting = false;
         entry.status.start_on_demand = true;
@@ -816,9 +996,68 @@ pub(crate) async fn mark_on_demand_sleeping(name: &str) {
 pub(crate) async fn mark_on_demand_error(name: &str, error: String) {
     let mut map = pool().write().await;
     if let Some(entry) = map.get_mut(name) {
+        // Identity guard: same rationale as awake/sleeping — never stamp an
+        // error onto a live entry that has a real client backing it.
+        if !entry.start_on_demand {
+            return;
+        }
         entry.status.connected = false;
         entry.status.starting = false;
         entry.status.start_on_demand = true;
         entry.status.error = Some(error);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn disable_invalidates_connect_waiting_for_per_name_lock() {
+        let name = format!("pool-lock-race-test-{}", std::process::id());
+        let connect_lock = pool_connect_lock(&name).await;
+        let held_guard = connect_lock.lock().await;
+        let (ticket_sent, ticket_received) = tokio::sync::oneshot::channel();
+        let waiter_name = name.clone();
+        let waiter = tokio::spawn(async move {
+            let generation = begin_connection(&waiter_name).await.unwrap();
+            ticket_sent.send(generation).unwrap();
+            lock_current_connection(&waiter_name, generation).await
+        });
+
+        let generation = ticket_received.await.unwrap();
+        assert!(is_current_connection(&name, generation).await);
+        // The connect has its ticket but cannot enter cleanup while this guard
+        // is held, matching disable racing the connect-lock wait.
+        invalidate_connection(&name).await;
+        drop(held_guard);
+
+        assert!(waiter.await.unwrap().is_none());
+        assert!(!is_current_connection(&name, generation).await);
+    }
+
+    #[tokio::test]
+    async fn disconnect_waits_until_connect_releases_per_name_lock() {
+        let name = format!("pool-disconnect-lock-test-{}", std::process::id());
+        let connect_lock = pool_connect_lock(&name).await;
+        let connect_guard = connect_lock.lock().await;
+        let waiter_name = name.clone();
+        let mut disconnect_waiter = tokio::spawn(async move {
+            lock_connection_for_disconnect(&waiter_name).await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut disconnect_waiter)
+            .await
+            .is_err(),
+            "disconnect acquired the per-name lock while connect still held it"
+        );
+
+        drop(connect_guard);
+        let disconnect_guard = tokio::time::timeout(Duration::from_secs(1), &mut disconnect_waiter)
+            .await
+            .expect("disconnect should acquire the lock after connect releases it")
+            .expect("disconnect lock task should not panic");
+        drop(disconnect_guard);
     }
 }

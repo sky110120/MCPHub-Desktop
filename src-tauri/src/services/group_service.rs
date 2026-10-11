@@ -38,10 +38,69 @@ pub async fn search_paged(search_key: &str, page: u32, page_size: u32) -> Result
     let key = search_key.trim().to_lowercase();
     let offset = (page as i64) * (page_size as i64);
 
+    // FTS5 路径（中/英/拼音分词 + rank 排序）；空表/Err 降级原 LIKE（§4.4）
+    if !key.is_empty() {
+        match crate::services::fts_service::search_ref_ids_weighted(
+            crate::services::fts_service::FtsTable::Groups,
+            &key,
+            1000,
+        )
+        .await
+        {
+            Ok(weighted) if !weighted.is_empty() => {
+                // groups 数量小：全量读（原生 name 序）→ 稳定排序按命中词数降序 → Rust 侧分页
+                let rows = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                    "SELECT {SELECT_COLS} FROM groups ORDER BY name"
+                )))
+                .fetch_all(db::pool())
+                .await?;
+                let counts: std::collections::HashMap<String, i64> =
+                    weighted.into_iter().collect();
+                let mut items = rows
+                    .iter()
+                    .map(row_to_group)
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .filter(|g| counts.contains_key(&g.id))
+                    .collect::<Vec<_>>();
+                // 相关度第一优先（稳定排序：同命中数保持 name 序）
+                items.sort_by_key(|g| std::cmp::Reverse(counts.get(&g.id).copied().unwrap_or(0)));
+                let total = items.len() as u64;
+                let window = items
+                    .iter()
+                    .skip(offset.max(0) as usize)
+                    .take(page_size as usize)
+                    .cloned()
+                    .collect();
+                return Ok(GroupPage {
+                    items: window,
+                    total,
+                    page,
+                    page_size,
+                });
+            }
+            Ok(_)
+                if crate::services::fts_service::table_is_empty(
+                    crate::services::fts_service::FtsTable::Groups,
+                )
+                .await
+                .unwrap_or(false) =>
+            {
+                // 空表兜底：继续走下方原 LIKE
+            }
+            Ok(_) => {
+                // 零结果/空表均不返回：落到下方原 LIKE（子串语义补 FTS 词前缀盲区）
+            }
+            Err(e) => {
+                log::warn!("[fts] search groups failed, fallback to LIKE: {e}");
+            }
+        }
+    }
+
     let mut where_clause = String::new();
     let mut pattern = String::new();
     if !key.is_empty() {
-        pattern = format!("%{}%", key.replace('%', "\\%").replace('_', "\\_"));
+        pattern = format!("%{}%", key.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
         where_clause = "WHERE LOWER(name) LIKE ? ESCAPE '\\' OR LOWER(COALESCE(description, '')) LIKE ? ESCAPE '\\'".to_string();
     }
 
@@ -93,6 +152,9 @@ pub async fn find_by_name_or_id(name_or_id: &str) -> Result<Option<Group>> {
 pub async fn create(payload: &GroupPayload) -> Result<Group> {
     let id = Uuid::new_v4().to_string();
     let servers_json = serde_json::to_string(&payload.servers)?;
+    let fts_text = group_fts_text(&payload.name, payload.description.as_deref());
+
+    let mut tx = db::pool().begin().await?;
     sqlx::query(
         "INSERT INTO groups (id, name, description, servers) \
          VALUES (?, ?, ?, ?)",
@@ -101,29 +163,85 @@ pub async fn create(payload: &GroupPayload) -> Result<Group> {
     .bind(&payload.name)
     .bind(&payload.description)
     .bind(&servers_json)
-    .execute(db::pool())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("UNIQUE constraint failed") {
+            anyhow!("Group name '{}' is already in use", payload.name)
+        } else {
+            e.into()
+        }
+    })?;
+    crate::services::fts_service::sync_upsert_tx(
+        &mut tx,
+        crate::services::fts_service::FtsTable::Groups,
+        &id,
+        &fts_text,
+    )
     .await?;
+    tx.commit().await?;
+    // New group scope exists — notify tools-list subscribers (R119 parity).
+    crate::services::subscription_hub::notify_tools_list_changed().await;
 
-    Ok(Group {
-        id,
-        name: payload.name.clone(),
-        description: payload.description.clone(),
-        servers: payload.servers.clone(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-    })
+    // Re-read from DB instead of fabricating created_at: the column is
+    // populated by a DB default whose format/value differs from
+    // chrono::Utc::now().to_rfc3339(), so the create response must match
+    // what list_all/update return (update() already re-reads this way).
+    match find_by_name_or_id(&id).await {
+        Ok(Some(g)) => Ok(g),
+        _ => Err(anyhow!("group create: row vanished after commit")),
+    }
 }
 
 pub async fn update(id: &str, payload: &GroupPayload) -> Result<Group> {
     let servers_json = serde_json::to_string(&payload.servers)?;
-    sqlx::query(
+    let fts_text = group_fts_text(&payload.name, payload.description.as_deref());
+
+    let mut tx = db::pool().begin().await?;
+    // Capture the old name INSIDE the tx so the bearer-key cascade rewrites
+    // the exact stored name (review round 9: allowed_groups is keyed by group
+    // NAME; a rename without cascade silently revoked every key referencing
+    // the old name).
+    let old_name: Option<String> = sqlx::query("SELECT name FROM groups WHERE id=?")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .and_then(|r| r.try_get("name").ok());
+    let result = sqlx::query(
         "UPDATE groups SET name=?, description=?, servers=? WHERE id=?",
     )
     .bind(&payload.name)
     .bind(&payload.description)
     .bind(&servers_json)
     .bind(id)
-    .execute(db::pool())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("UNIQUE constraint failed") {
+            anyhow!("Group name '{}' is already in use", payload.name)
+        } else {
+            e.into()
+        }
+    })?;
+    if result.rows_affected() == 0 {
+        return Err(anyhow!("Group not found"));
+    }
+    if let Some(old) = old_name.filter(|o| o != &payload.name) {
+        cascade_bearer_groups_rename_tx(&mut tx, &old, &payload.name).await?;
+    }
+    // ref_id=id，改名不影响 ref_id
+    crate::services::fts_service::sync_upsert_tx(
+        &mut tx,
+        crate::services::fts_service::FtsTable::Groups,
+        id,
+        &fts_text,
+    )
     .await?;
+    tx.commit().await?;
+    // Group membership/name changes reshape the /mcp/{group} and
+    // $smart/{group} exposed tool set — tell subscribers the list changed
+    // (R119: same parity as server rename/delete notification).
+    crate::services::subscription_hub::notify_tools_list_changed().await;
 
     let row = sqlx::query(sqlx::AssertSqlSafe(&*format!(
         "SELECT {SELECT_COLS} FROM groups WHERE id=?"
@@ -137,9 +255,97 @@ pub async fn update(id: &str, payload: &GroupPayload) -> Result<Group> {
 }
 
 pub async fn delete(id: &str) -> Result<()> {
+    let mut tx = db::pool().begin().await?;
+    // Cascade bearer keys BEFORE the row disappears (review round 9: same
+    // name-keyed storage as allowed_servers — a delete without cascade left
+    // dangling group names in allowed_groups).
+    let name: Option<String> = sqlx::query("SELECT name FROM groups WHERE id=?")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .and_then(|r| r.try_get("name").ok());
+    if let Some(name) = name {
+        cascade_bearer_groups_remove_tx(&mut tx, &name).await?;
+    }
     sqlx::query("DELETE FROM groups WHERE id=?")
         .bind(id)
-        .execute(db::pool())
+        .execute(&mut *tx)
         .await?;
+    crate::services::fts_service::sync_delete_tx(
+        &mut tx,
+        crate::services::fts_service::FtsTable::Groups,
+        id,
+    )
+    .await?;
+    tx.commit().await?;
+    // Exposed tool set of the group scope disappeared — notify subscribers.
+    crate::services::subscription_hub::notify_tools_list_changed().await;
+    Ok(())
+}
+
+/// groups 的 FTS 可搜索文本（P3）：name + description
+fn group_fts_text(name: &str, description: Option<&str>) -> String {
+    match description {
+        Some(d) if !d.is_empty() => format!("{name} {d}"),
+        _ => name.to_string(),
+    }
+}
+
+/// Rewrite `old_name` → `new_name` in every bearer key's `allowed_groups`
+/// (group rename). Mirrors server_service's allowed_servers cascade. Must run
+/// inside the caller's transaction.
+async fn cascade_bearer_groups_rename_tx(
+    tx: &mut sqlx::SqliteConnection,
+    old_name: &str,
+    new_name: &str,
+) -> Result<()> {
+    let rows = sqlx::query("SELECT id, allowed_groups FROM bearer_keys")
+        .fetch_all(&mut *tx)
+        .await?;
+    for row in rows {
+        let id: String = row.try_get("id")?;
+        let groups_str: String = row.try_get("allowed_groups")?;
+        let mut groups: Vec<String> = serde_json::from_str(&groups_str).unwrap_or_default();
+        if !groups.iter().any(|g| g == old_name) {
+            continue;
+        }
+        for g in groups.iter_mut() {
+            if g == old_name {
+                *g = new_name.to_string();
+            }
+        }
+        sqlx::query("UPDATE bearer_keys SET allowed_groups=? WHERE id=?")
+            .bind(serde_json::to_string(&groups).unwrap_or_else(|_| "[]".into()))
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Remove `name` from every bearer key's `allowed_groups` (group delete).
+/// Must run inside the caller's transaction.
+async fn cascade_bearer_groups_remove_tx(
+    tx: &mut sqlx::SqliteConnection,
+    name: &str,
+) -> Result<()> {
+    let rows = sqlx::query("SELECT id, allowed_groups FROM bearer_keys")
+        .fetch_all(&mut *tx)
+        .await?;
+    for row in rows {
+        let id: String = row.try_get("id")?;
+        let groups_str: String = row.try_get("allowed_groups")?;
+        let mut groups: Vec<String> = serde_json::from_str(&groups_str).unwrap_or_default();
+        let before = groups.len();
+        groups.retain(|g| g != name);
+        if groups.len() == before {
+            continue;
+        }
+        sqlx::query("UPDATE bearer_keys SET allowed_groups=? WHERE id=?")
+            .bind(serde_json::to_string(&groups).unwrap_or_else(|_| "[]".into()))
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+    }
     Ok(())
 }

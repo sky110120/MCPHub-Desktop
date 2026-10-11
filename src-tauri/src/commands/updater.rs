@@ -60,6 +60,15 @@ static CURRENT_TASK: OnceLock<tokio::sync::Mutex<Option<tokio::task::JoinHandle<
 /// can tag the "cancelled" event without the frontend having to pass it back.
 static CURRENT_INSTALL_ID: OnceLock<std::sync::Mutex<u64>> = OnceLock::new();
 
+/// ResourceId of the most recent install's `Update` resource — the cancel
+/// path (which aborts a task that will never reach its own terminal-state
+/// cleanup) uses it to release the resource from the table.
+static CURRENT_RID: OnceLock<std::sync::Mutex<Option<ResourceId>>> = OnceLock::new();
+
+fn current_rid_slot() -> &'static std::sync::Mutex<Option<ResourceId>> {
+    CURRENT_RID.get_or_init(|| std::sync::Mutex::new(None))
+}
+
 fn task_slot() -> &'static tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>> {
     CURRENT_TASK.get_or_init(|| tokio::sync::Mutex::new(None))
 }
@@ -77,7 +86,9 @@ pub async fn install_update_cancelable(
     install_id: u64,
     rid: ResourceId,
     on_event: Channel<UpdateDownloadEvent>,
+    session: tauri::State<'_, crate::commands::auth::SessionState>,
 ) -> Result<(), String> {
+    crate::commands::config::require_admin(&session).await?;
     let update = webview
         .resources_table()
         .get::<Update>(rid)
@@ -85,10 +96,33 @@ pub async fn install_update_cancelable(
     let app = webview.app_handle().clone();
 
     let mut slot = task_slot().lock().await;
+    // Capture + mark the PREVIOUS attempt as cancelled before replacing the
+    // id: it is being aborted here and would otherwise never emit a terminal
+    // event (its dialog hangs on "installing").
     if let Some(previous) = slot.take() {
+        let already_finished = previous.is_finished();
         previous.abort();
+        if !already_finished {
+            // Only an in-flight attempt needs a synthetic "cancelled" terminal
+            // event; one that already emitted ok/error must not receive a
+            // contradictory late event (review round 10). The aborted task
+            // never reaches its own resource cleanup, so release here.
+            let old_id = *install_id_slot().lock().unwrap();
+            if let Some(old_rid) = current_rid_slot().lock().unwrap().take() {
+                let _ = app.resources_table().close(old_rid);
+            }
+            let _ = app.emit(
+                "updater://install-result",
+                InstallResult {
+                    install_id: old_id,
+                    status: "cancelled".into(),
+                    error: None,
+                },
+            );
+        }
     }
     *install_id_slot().lock().unwrap() = install_id;
+    *current_rid_slot().lock().unwrap() = Some(rid);
 
     let handle = tokio::spawn(async move {
         let mut first_chunk = true;
@@ -120,6 +154,11 @@ pub async fn install_update_cancelable(
             },
         };
         let _ = app.emit("updater://install-result", payload);
+        // Release the plugin resource now that this attempt reached a
+        // terminal state (ok / error) — parity with the plugin's own install
+        // command, which removes the Update from the resources table.
+        // Cancelled attempts release via the cancel path below.
+        let _ = app.resources_table().close(rid);
     });
 
     *slot = Some(handle);
@@ -130,9 +169,20 @@ pub async fn install_update_cancelable(
 /// install section is synchronous and cannot be interrupted). Returns whether
 /// a still-running task was actually aborted.
 #[tauri::command]
-pub async fn cancel_update_install(app: tauri::AppHandle) -> Result<bool, String> {
-    let install_id = *install_id_slot().lock().unwrap();
+pub async fn cancel_update_install(
+    session: tauri::State<'_, crate::commands::auth::SessionState>,
+    app: tauri::AppHandle,
+) -> Result<bool, String> {
+    // Cancel is a control-plane write on an admin-initiated action — gate it
+    // like install_update_cancelable so a guest session cannot abort an
+    // administrator's update.
+    crate::commands::config::require_admin(&session).await?;
     let mut slot = task_slot().lock().await;
+    // Read the install id AFTER acquiring the slot lock: otherwise a
+    // concurrent install_update_cancelable could have already replaced the id
+    // (its own abort of the previous attempt races ours) and this cancel would
+    // tag the wrong attempt, leaving the new one without a terminal event.
+    let install_id = *install_id_slot().lock().unwrap();
     if let Some(handle) = slot.take() {
         if handle.is_finished() {
             // Task already completed and emitted its own ok/error result —
@@ -140,6 +190,11 @@ pub async fn cancel_update_install(app: tauri::AppHandle) -> Result<bool, String
             return Ok(false);
         }
         handle.abort();
+        // The aborted task never reaches its terminal-state cleanup, so
+        // release the Update resource here.
+        if let Some(rid) = current_rid_slot().lock().unwrap().take() {
+            let _ = app.resources_table().close(rid);
+        }
         let _ = app.emit(
             "updater://install-result",
             InstallResult {

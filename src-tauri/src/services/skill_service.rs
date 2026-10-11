@@ -14,6 +14,23 @@ use serde_json::json;
 use sqlx::Row;
 use std::collections::HashMap;
 use std::fs;
+use std::sync::OnceLock;
+
+/// Serializes agent read-modify-write on `config_json.skills.agents` — the
+/// whole-array replace loses concurrent mutations otherwise (created agents
+/// vanish / deleted ones resurrect).
+fn agents_lock() -> &'static tokio::sync::Mutex<()> {
+    static L: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Serializes filesystem install mutations (export copy/unlink, uninstall,
+/// delete) on the same agent paths — concurrent remove_link vs
+/// copy_dir_recursive leaves a truncated install marked status='ok'.
+fn skill_fs_lock() -> &'static tokio::sync::Mutex<()> {
+    static L: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
@@ -31,8 +48,11 @@ fn slugify(name: &str) -> String {
     let mut s = String::with_capacity(name.len());
     let mut prev_dash = true; // suppress leading hyphens
     for c in name.chars() {
-        if c.is_ascii_alphanumeric() {
-            s.push(c.to_ascii_lowercase());
+        // Unicode alphanumeric: CJK names (e.g. "我的助手") stay usable as ids.
+        if c.is_alphanumeric() {
+            for lc in c.to_lowercase() {
+                s.push(lc);
+            }
             prev_dash = false;
         } else if !prev_dash {
             s.push('-');
@@ -114,6 +134,7 @@ pub async fn save_agents(agents: Vec<SkillAgent>) -> Result<()> {
 ///   - no existing agent with the same name (case-insensitive) or same path
 ///   - `skillsPath` resolves to an existing directory (after `~` expansion)
 pub async fn create_custom_agent(name: &str, skills_path: &str) -> Result<SkillAgent> {
+    let _guard = agents_lock().lock().await;
     let name = name.trim();
     let skills_path = skills_path.trim();
     if name.is_empty() {
@@ -122,10 +143,18 @@ pub async fn create_custom_agent(name: &str, skills_path: &str) -> Result<SkillA
     if skills_path.is_empty() {
         return Err(anyhow!("agent skills path is required"));
     }
-    let base = slugify(name);
-    if base.is_empty() {
-        return Err(anyhow!("agent name must contain alphanumeric chars"));
-    }
+    let base = {
+        let b = slugify(name);
+        if b.is_empty() {
+            // Name is all symbols — derive a stable id from the name hash.
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            name.hash(&mut h);
+            format!("agent-{:x}", h.finish())
+        } else {
+            b
+        }
+    };
     if is_builtin_id(&base) {
         return Err(anyhow!("'{}' is a built-in agent name", name));
     }
@@ -189,6 +218,7 @@ pub async fn create_custom_agent(name: &str, skills_path: &str) -> Result<SkillA
 
 /// Delete a custom agent by id. Refuses to delete built-in agents.
 pub async fn delete_custom_agent(id: &str) -> Result<()> {
+    let _guard = agents_lock().lock().await;
     if is_builtin_id(id) {
         return Err(anyhow!("built-in agents cannot be deleted"));
     }
@@ -239,7 +269,25 @@ pub fn library_dir(app: &AppHandle) -> Result<PathBuf> {
 /// Recursively copy `src` into `dst`. **If dst exists it is removed first**
 /// (never incremental overlay — so files deleted in src don't linger in dst).
 /// Symlinks inside src are followed so the library stays all-real-files.
+/// `visited` carries canonicalized directories already copied on the current
+/// path: a symlinked directory loop (a→b, b→a or `loop→.`) would otherwise
+/// recurse infinitely and overflow the stack (whole-process abort).
 pub fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    copy_dir_inner(src, dst, &mut std::collections::HashSet::new())
+}
+
+fn copy_dir_inner(
+    src: &Path,
+    dst: &Path,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    // Cycle guard: if this source dir was already copied on the current path,
+    // skip it (also bounds symlink targets pointing at huge trees like `/`).
+    let key = src.canonicalize().unwrap_or_else(|_| src.to_path_buf());
+    if !visited.insert(key) {
+        return Ok(());
+    }
+    let result = (|| -> std::io::Result<()> {
     match fs::symlink_metadata(dst) {
         Ok(m) => {
             if m.file_type().is_symlink() {
@@ -261,17 +309,41 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         if meta.file_type().is_symlink() {
             // Follow the link: copy target contents (keep library real).
             if fs::metadata(&from).map(|m| m.is_dir()).unwrap_or(false) {
-                copy_dir_recursive(&from, &to)?;
+                copy_dir_inner(&from, &to, visited)?;
             } else {
                 fs::copy(&from, &to)?;
             }
         } else if meta.is_dir() {
-            copy_dir_recursive(&from, &to)?;
+            copy_dir_inner(&from, &to, visited)?;
         } else {
             fs::copy(&from, &to)?;
         }
     }
     Ok(())
+    })();
+    // Remove this dir from the visited set on unwind of the recursion path so
+    // sibling copies of the same subtree (non-cyclic DAG) are still allowed.
+    if let Ok(key) = src.canonicalize() {
+        visited.remove(&key);
+    }
+    result
+}
+
+/// Defense-in-depth re-validation of `dir_name` read back from the DB before
+/// it is joined into any remove/copy path (`lib.join(dir_name)` /
+/// `agent_path.join(dir_name)` + `remove_link`). The only write entry
+/// (`import_skills`) already enforces this; without re-checks, a row written
+/// before the guard existed (or an externally modified DB) could escape the
+/// library dir via `../` and delete arbitrary directories.
+pub(crate) fn valid_dir_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        // Windows drive-relative form ("C:foo"): Path::join with a drive
+        // prefix replaces the base entirely, escaping the library dir.
+        && !name.contains(':')
+        && name != "."
+        && name != ".."
 }
 
 /// Remove a path that may be a symlink (to dir or file) or a real dir/file.
@@ -438,6 +510,11 @@ pub async fn scan_for_import(app: &AppHandle) -> Result<Vec<ScannedSkill>> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            // Hidden entries (dot-prefixed) are agent-internal, not user skills
+            // (e.g. Codex's `.system` built-in skills dir).
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
             let meta = match fs::symlink_metadata(&path) {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -558,6 +635,78 @@ pub async fn search_library_paged(
     let page_size = page_size.clamp(1, 200) as usize;
     let key = search_key.trim().to_lowercase();
 
+    // FTS5 路径（中/英/拼音分词；§4.4）：FS/exports 过滤在 Rust 侧；
+    // 命中词数（相关度）第一优先，同命中数保持 dir_name 原生序（稳定排序）；
+    // 空表/Err/零结果降级原 LIKE。
+    if !key.is_empty() {
+        match crate::services::fts_service::search_ref_ids_weighted(
+            crate::services::fts_service::FtsTable::Skills,
+            &key,
+            2000,
+        )
+        .await
+        {
+            Ok(weighted) if !weighted.is_empty() => {
+                // 全量读（原生 dir_name 序），Rust 侧 FS 过滤 + 命中数稳定排序
+                let counts: HashMap<String, i64> = weighted.into_iter().collect();
+                let rows = sqlx::query(
+                    "SELECT id, dir_name, name, description, source_agent, source_path, created_at \
+                     FROM skills WHERE status='ok' ORDER BY dir_name",
+                )
+                .fetch_all(db::pool())
+                .await?;
+                let mut all: Vec<Skill> = Vec::new();
+                for row in rows.iter() {
+                    let dn: String = row.try_get("dir_name").unwrap_or_default();
+                    if !counts.contains_key(&dn) {
+                        continue;
+                    }
+                    if !lib.join(&dn).exists() {
+                        continue; // FS 过滤（与原路径一致）
+                    }
+                    let id: String = row.try_get("id").unwrap_or_default();
+                    let exports = exports_by_skill.get(&id).cloned().unwrap_or_default();
+                    all.push(Skill {
+                        exports,
+                        id,
+                        dir_name: dn.clone(),
+                        name: row.try_get("name").ok().flatten(),
+                        description: row.try_get("description").ok().flatten(),
+                        source_agent: row.try_get("source_agent").ok().flatten(),
+                        source_path: row.try_get("source_path").ok().flatten(),
+                        created_at: row.try_get("created_at").ok().flatten(),
+                    });
+                }
+                all.sort_by_key(|sk| {
+                    std::cmp::Reverse(counts.get(&sk.dir_name).copied().unwrap_or(0))
+                });
+                let total = all.len() as u64;
+                let start = (page as usize) * page_size;
+                let items = all
+                    .into_iter()
+                    .skip(start)
+                    .take(page_size)
+                    .collect::<Vec<_>>();
+                return Ok(SkillPage { items, total, page, page_size: page_size as u32 });
+            }
+            Ok(_)
+                if crate::services::fts_service::table_is_empty(
+                    crate::services::fts_service::FtsTable::Skills,
+                )
+                .await
+                .unwrap_or(false) =>
+            {
+                // 空表兜底：走原 LIKE
+            }
+            Ok(_) => {
+                // 零结果/空表均不返回：落到下方原 LIKE（子串语义补 FTS 词前缀盲区）
+            }
+            Err(e) => {
+                log::warn!("[fts] search skills failed, fallback to LIKE: {e}");
+            }
+        }
+    }
+
     let rows = if key.is_empty() {
         sqlx::query(
             "SELECT id, dir_name, name, description, source_agent, source_path, created_at \
@@ -566,7 +715,10 @@ pub async fn search_library_paged(
         .fetch_all(db::pool())
         .await?
     } else {
-        let pattern = format!("%{}%", key.replace('%', "\\%").replace('_', "\\_"));
+        // Backslash FIRST (order matters): without doubling, `foo\bar` makes
+        // \b an escaped literal b (wrong matches) and a trailing \ escapes
+        // the % wildcard entirely. Same chain as prompt/resource services.
+        let pattern = format!("%{}%", key.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
         sqlx::query(
             "SELECT id, dir_name, name, description, source_agent, source_path, created_at \
              FROM skills WHERE status='ok' AND \
@@ -697,6 +849,12 @@ pub async fn get_skill(app: &AppHandle, id: &str) -> Result<Option<Skill>> {
 /// on failure the partial dir + row are removed. Crash mid-copy → status=pending
 /// → reconcile_pending cleans at next startup.
 pub async fn import_skills(app: &AppHandle, items: Vec<ImportItem>) -> Result<ImportSummary> {
+    // Same tree-mutation contract as export/uninstall/delete: concurrent
+    // import-vs-import of the same dir_name would both pass the exists()
+    // check and both copy_dir_recursive into the same dst (copy_dir_inner
+    // does delete-then-copy — the second copy destroys the first's partial
+    // tree); import-vs-export would export a truncated tree marked ok.
+    let _fs_guard = skill_fs_lock().lock().await;
     let lib = library_dir(app)?;
     fs::create_dir_all(&lib).ok();
     let agents = list_agents().await?;
@@ -708,9 +866,20 @@ pub async fn import_skills(app: &AppHandle, items: Vec<ImportItem>) -> Result<Im
 
     for item in items {
         let dir_name = item.dir_name.trim().to_string();
-        if dir_name.is_empty() {
+        // Path-traversal guard: dir_name must be a single path segment —
+        // `lib.join(dir_name)` is used for copy/remove below, so names with
+        // separators or dot segments could escape the library dir and
+        // delete/copy arbitrary user directories.
+        if dir_name.is_empty()
+            || dir_name.contains('/')
+            || dir_name.contains('\\')
+            // Windows drive-relative form — same escape as valid_dir_name.
+            || dir_name.contains(':')
+            || dir_name == "."
+            || dir_name == ".."
+        {
             failure_count += 1;
-            results.push(ImportResultItem { dir_name: String::new(), success: false, message: Some("empty dir name".into()) });
+            results.push(ImportResultItem { dir_name, success: false, message: Some("invalid dir name".into()) });
             continue;
         }
         // Filesystem check (not DB): if the library already has this dir, skip.
@@ -775,6 +944,17 @@ pub async fn import_skills(app: &AppHandle, items: Vec<ImportItem>) -> Result<Im
                     .bind(&id)
                     .execute(db::pool())
                     .await;
+                // FTS 同步（skills 特例：安装是 FS 耦合多步非事务流，FTS 同步
+                // best-effort——失败不回滚安装；漂移由启动 rebuild_all 对账自愈）
+                if let Err(e) = crate::services::fts_service::sync_upsert(
+                    crate::services::fts_service::FtsTable::Skills,
+                    &dir_name,
+                    &skill_fts_text(&dir_name, Some(&name), Some(&description)),
+                )
+                .await
+                {
+                    log::warn!("[fts] sync fts_skills upsert '{}': {e}", dir_name);
+                }
                 // Source-agent install record (copy) — ONLY for agent-grouped
                 // imports (manual imports have no default source agent).
                 if let Some(sa) = &source_agent_id {
@@ -797,6 +977,11 @@ pub async fn import_skills(app: &AppHandle, items: Vec<ImportItem>) -> Result<Im
                     .bind(&id)
                     .execute(db::pool())
                     .await;
+                let _ = crate::services::fts_service::sync_delete(
+                    crate::services::fts_service::FtsTable::Skills,
+                    &dir_name,
+                )
+                .await;
                 failure_count += 1;
                 results.push(ImportResultItem { dir_name, success: false, message: Some(format!("copy: {}", e)) });
             }
@@ -850,6 +1035,10 @@ pub async fn scan_folder_for_skills(app: &AppHandle, folder: &str) -> Result<Vec
     // Layer 2: direct children with SKILL.md.
     if let Ok(entries) = fs::read_dir(&root) {
         for entry in entries.flatten() {
+            // Hidden entries (dot-prefixed) are not user skills.
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
             let child = entry.path();
             if read_skill_md(&child).is_some() {
                 let dir_name = entry.file_name().to_string_lossy().to_string();
@@ -861,6 +1050,16 @@ pub async fn scan_folder_for_skills(app: &AppHandle, folder: &str) -> Result<Vec
 }
 
 // ── 2.3: reconcile (startup cleanup of crashed-pending) ─────────────────────
+
+/// skills 的 FTS 可搜索文本（P3）：dir_name + name + description
+fn skill_fts_text(dir_name: &str, name: Option<&str>, description: Option<&str>) -> String {
+    [Some(dir_name), name, description]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Remove `pending` skills/exports left by a crashed import/export:
 /// - pending skills: delete partial library dir + row.
@@ -879,9 +1078,19 @@ pub async fn reconcile_pending(app: &AppHandle) -> Result<()> {
         let id: String = r.try_get("id").unwrap_or_default();
         let dir_name: String = r.try_get("dir_name").unwrap_or_default();
         if !dir_name.is_empty() {
-            let _ = remove_link(&lib.join(&dir_name));
+            if valid_dir_name(&dir_name) {
+                let _ = remove_link(&lib.join(&dir_name));
+            } else {
+                log::warn!("[skills] reconcile: skipping unsafe dir_name {:?} from DB", dir_name);
+            }
         }
         let _ = sqlx::query("DELETE FROM skills WHERE id=?").bind(&id).execute(db::pool()).await;
+        // FTS 联动（pending 行通常无 FTS 行，删除为 no-op；防漂移兜底）
+        let _ = crate::services::fts_service::sync_delete(
+            crate::services::fts_service::FtsTable::Skills,
+            &dir_name,
+        )
+        .await;
     }
 
     let agents = list_agents().await?;
@@ -907,7 +1116,14 @@ pub async fn reconcile_pending(app: &AppHandle) -> Result<()> {
         let skill_id: String = r.try_get("skill_id").unwrap_or_default();
         let agent_id: String = r.try_get("agent_id").unwrap_or_default();
         if let (Some(Some(ap)), Some(dn)) = (agent_path.get(&agent_id), dir_by_skill.get(&skill_id)) {
-            let _ = remove_link(&ap.join(dn));
+            // Same guard as every other join+remove site: a tampered/legacy
+            // dir_name containing `../` must not escape the library dir and
+            // delete arbitrary directories via remove_dir_all.
+            if valid_dir_name(dn) {
+                let _ = remove_link(&ap.join(dn));
+            } else {
+                log::warn!("reconcile: skipping pending export removal for unsafe dir_name {:?}", dn);
+            }
         }
         let _ = sqlx::query("DELETE FROM skill_exports WHERE id=?").bind(&id).execute(db::pool()).await;
     }
@@ -937,6 +1153,12 @@ pub async fn reconcile_pending(app: &AppHandle) -> Result<()> {
                 .bind(&id).execute(&mut *tx).await?;
             let _ = sqlx::query("DELETE FROM skills WHERE id=?")
                 .bind(&id).execute(&mut *tx).await?;
+            let _ = crate::services::fts_service::sync_delete_tx(
+                &mut tx,
+                crate::services::fts_service::FtsTable::Skills,
+                &dir_name,
+            )
+            .await;
             tx.commit().await?;
             gone_count += 1;
         }
@@ -1039,6 +1261,7 @@ pub async fn export_to_agents(
     agent_ids: Vec<String>,
     method: String,
 ) -> Result<Vec<ExportResultItem>> {
+    let _guard = skill_fs_lock().lock().await;
     let lib = library_dir(app)?;
     let agents = list_agents().await?;
     let agent_by_id: HashMap<String, &SkillAgent> = agents.iter().map(|a| (a.id.clone(), a)).collect();
@@ -1063,6 +1286,10 @@ pub async fn export_to_agents(
 
     for sid in &skill_ids {
         let Some(dir_name) = dir_by_skill.get(sid) else { continue };
+        if !valid_dir_name(dir_name) {
+            results.push(ExportResultItem { skill_id: sid.clone(), agent_id: String::new(), success: false, message: Some("invalid dir name".into()) });
+            continue;
+        }
         let target_lib = lib.join(dir_name); // library copy (symlink target / copy source)
         for aid in &agent_ids {
             let Some(agent) = agent_by_id.get(aid) else { continue };
@@ -1363,6 +1590,7 @@ pub(crate) fn create_symlinks_elevated(items: &[(PathBuf, PathBuf)]) -> Vec<Mani
 /// remove the skill from the source agent too. Removing a link needs no
 /// privilege (user-writable agent dir).
 pub async fn uninstall_skill(skill_id: &str, agent_id: &str) -> Result<bool> {
+    let _guard = skill_fs_lock().lock().await;
     let skill_row = sqlx::query("SELECT dir_name FROM skills WHERE id=?")
         .bind(skill_id)
         .fetch_optional(db::pool())
@@ -1373,7 +1601,11 @@ pub async fn uninstall_skill(skill_id: &str, agent_id: &str) -> Result<bool> {
     let agents = list_agents().await?;
     if let Some(agent) = agents.iter().find(|a| a.id == agent_id) {
         if let Some(ap) = resolve_agent_path(&agent.skills_path) {
-            let _ = remove_link(&ap.join(&dir_name));
+            if valid_dir_name(&dir_name) {
+                let _ = remove_link(&ap.join(&dir_name));
+            } else {
+                log::warn!("[skills] uninstall: skipping unsafe dir_name {:?} from DB", dir_name);
+            }
         }
     }
 
@@ -1394,6 +1626,7 @@ pub async fn uninstall_skill(skill_id: &str, agent_id: &str) -> Result<bool> {
 /// is always removed. Errors if the skill isn't found or the delete matched 0
 /// rows (so the frontend can't mistake a no-op for success).
 pub async fn delete_skill(app: &AppHandle, id: &str, cleanup_agent_ids: Vec<String>) -> Result<()> {
+    let _guard = skill_fs_lock().lock().await;
     let row = sqlx::query("SELECT dir_name FROM skills WHERE id=?")
         .bind(id)
         .fetch_optional(db::pool())
@@ -1420,14 +1653,22 @@ pub async fn delete_skill(app: &AppHandle, id: &str, cleanup_agent_ids: Vec<Stri
         let clean = method == "symlink" || cleanup_agent_ids.iter().any(|a| a == &agent_id);
         if clean {
             if let Some(Some(ap)) = agent_path.get(&agent_id) {
-                let _ = remove_link(&ap.join(&dir_name));
+                if valid_dir_name(&dir_name) {
+                    let _ = remove_link(&ap.join(&dir_name));
+                } else {
+                    log::warn!("[skills] delete: skipping unsafe dir_name {:?} from DB", dir_name);
+                }
             }
         }
     }
 
     // Remove the library copy (real dir → remove_dir_all via remove_link).
     let lib = library_dir(app)?;
-    let _ = remove_link(&lib.join(&dir_name));
+    if valid_dir_name(&dir_name) {
+        let _ = remove_link(&lib.join(&dir_name));
+    } else {
+        return Err(anyhow::anyhow!("unsafe dir_name in DB: {dir_name:?}"));
+    }
 
     // Delete the skill row AND its skill_exports rows in one transaction
     // (no foreign-key cascade — done explicitly in code for flexibility).
@@ -1442,6 +1683,19 @@ pub async fn delete_skill(app: &AppHandle, id: &str, cleanup_agent_ids: Vec<Stri
         .execute(&mut *tx)
         .await?
         .rows_affected();
+    // FTS 同步（§4.3 铁律：同事务删 fts_skills；ref_id=dir_name）。
+    // Failure must not be silently dropped: the row is already deleted, so a
+    // failed FTS delete leaves a stale search hit until the startup rebuild
+    // self-heals — at minimum log it (review round 8, 2026-10-04).
+    if let Err(e) = crate::services::fts_service::sync_delete_tx(
+        &mut tx,
+        crate::services::fts_service::FtsTable::Skills,
+        &dir_name,
+    )
+    .await
+    {
+        log::warn!("[skills] FTS delete failed for '{dir_name}' (search row stale until rebuild): {e}");
+    }
     tx.commit().await?;
     if affected == 0 {
         return Err(anyhow::anyhow!("skill not deleted (0 rows affected): {}", id));
@@ -1480,6 +1734,11 @@ pub async fn open_skill_library(app: &AppHandle, id: &str) -> Result<()> {
         return Err(anyhow::anyhow!("skill not found: {}", id));
     };
     let dir_name: String = r.try_get("dir_name")?;
+    // Defense-in-depth parity with uninstall/delete/reconcile: dir_name comes
+    // from the DB — a tampered row must not open arbitrary directories.
+    if !valid_dir_name(&dir_name) {
+        return Err(anyhow::anyhow!("invalid skill directory name"));
+    }
     let p = library_dir(app)?.join(&dir_name);
     if !p.exists() {
         return Err(anyhow::anyhow!("library copy not found: {}", p.display()));
@@ -1496,7 +1755,11 @@ fn spawn_file_manager(p: &Path) -> std::io::Result<()> {
 #[cfg(target_os = "windows")]
 fn spawn_file_manager(p: &Path) -> std::io::Result<()> {
     // explorer returns immediately; don't wait (odd exit codes otherwise).
-    std::process::Command::new("explorer").arg(p).spawn()?;
+    let mut c = std::process::Command::new("explorer");
+    c.arg(p);
+    use std::os::windows::process::CommandExt;
+    c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    c.spawn()?;
     Ok(())
 }
 #[cfg(all(unix, not(target_os = "macos")))]

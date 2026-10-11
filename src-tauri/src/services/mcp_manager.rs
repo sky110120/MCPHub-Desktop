@@ -28,7 +28,7 @@ pub async fn start_all(app: &AppHandle) -> Result<()> {
                 let msg = format!("Server '{}' connected ({} tools)", name, status.tool_count);
                 log::info!("{}", msg);
                 app_logger::log_to_db("info", &msg);
-            } else if cfg.start_on_demand.unwrap_or(false) {
+            } else if cfg.start_on_demand.unwrap_or(false) && status.error.is_none() {
                 let msg = format!("Server '{}' sleeping (on-demand)", name);
                 log::info!("{}", msg);
                 app_logger::log_to_db("info", &msg);
@@ -81,6 +81,26 @@ pub async fn start_all(app: &AppHandle) -> Result<()> {
                     tokio::spawn(async move {
                         let status = pool::connect_server(&cfg).await;
                         if status.connected {
+                            // Post-connect "still enabled?" recheck — the same
+                            // fail-closed invariant as the toggle paths. The
+                            // rebuild tick read the config BEFORE connecting;
+                            // a disable/delete landing in that window leaves
+                            // this spawn reconnecting a disabled server with
+                            // nothing else ever disconnecting it.
+                            let still_enabled = {
+                                match server_service::get_by_name(&name).await {
+                                    Ok(c) => c.map(|s| s.enabled).unwrap_or(false),
+                                    Err(_) => false,
+                                }
+                            };
+                            if !still_enabled {
+                                log::info!(
+                                    "[session_rebuild] '{}' disabled/deleted during rebuild — disconnecting",
+                                    name
+                                );
+                                let _ = pool::disconnect_server(&name).await;
+                                return;
+                            }
                             log::info!("[session_rebuild] Server '{}' reconnected", name);
                         } else {
                             log::warn!("[session_rebuild] Server '{}' still failed: {}", name,
@@ -109,6 +129,17 @@ pub async fn reload_server(server_name: &str) -> Result<()> {
         if cfg.enabled {
             tokio::spawn(async move {
                 pool::connect_server(&cfg).await;
+                // Post-connect enabled recheck (toggle/rebuild family): a
+                // disable landing during the connect window must not leave a
+                // live process serving a disabled server (fail-closed on
+                // read error, same as toggle's settle recheck).
+                match server_service::get_by_name(&cfg.name).await {
+                    Ok(Some(c)) if c.enabled => {}
+                    _ => {
+                        log::warn!("[{}] disabled/removed during reload connect — disconnecting", cfg.name);
+                        let _ = pool::disconnect_server(&cfg.name).await;
+                    }
+                }
             });
         }
     }
@@ -129,9 +160,29 @@ pub async fn toggle_server(server_name: &str) -> Result<bool> {
             log::warn!("[{}] Pre-enable disconnect failed (may be already disconnected): {}", server_name, e);
         }
         // Connect in the background so the toggle returns immediately.
+        // Re-check `enabled` after connecting: a rapid enable→disable while
+        // the connect was in flight would otherwise leave the server
+        // permanently connected and serving over HTTP despite being disabled
+        // (session_rebuild only reconnects enabled servers, and the HTTP
+        // scope filter does not consult the DB `enabled` flag).
         let cfg_clone = cfg.clone();
+        let name_for_recheck = server_name.to_string();
         tokio::spawn(async move {
             pool::connect_server(&cfg_clone).await;
+            let still_enabled = {
+                match crate::services::server_service::get_by_name(&name_for_recheck).await {
+                    // Row gone (deleted mid-connect) or DB error → NOT enabled:
+                    // fail-open here orphans a live process with no DB row —
+                    // nothing reaps it until restart. Mirrors the disable-path
+                    // recheck below.
+                    Ok(c) => c.map(|s| s.enabled).unwrap_or(false),
+                    Err(_) => false,
+                }
+            };
+            if !still_enabled {
+                log::info!("[{}] disabled during connect — disconnecting after connect finished", name_for_recheck);
+                let _ = pool::disconnect_server(&name_for_recheck).await;
+            }
         });
     } else {
         // Invalidate and tear down even a connection that is still starting.
@@ -142,6 +193,14 @@ pub async fn toggle_server(server_name: &str) -> Result<bool> {
             log::error!("[{}] Failed to disconnect: {}", server_name, e);
             app_logger::log_to_db("error", &format!("[{}] Failed to disconnect: {}", server_name, e));
         }
+        // Disabled servers contribute no Smart Routing rows — drop them
+        // (best-effort; logged inside).
+        let n = server_name.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = crate::smart_routing::index::remove_server_embeddings(&n).await {
+                log::warn!("[smart] remove embeddings for disabled '{}': {}", n, e);
+            }
+        });
     }
     Ok(cfg.enabled)
 }

@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useAuth } from '../contexts/AuthContext';
 import { X } from 'lucide-react';
 import { Server, EnvVar, ServerFormData } from '@/types';
 import { buildServerPayload } from '../utils/serverFormPayload';
@@ -10,6 +11,14 @@ interface ServerFormProps {
   initialData?: Server | null;
   modalTitle: string;
   formError?: string | null;
+  /**
+   * Which flow this form drives. `initialData` pre-fills the form for the edit
+   * flow *and* for create flows that start from an existing configuration
+   * (duplicate), so it cannot decide this on its own: it defaults to 'edit'
+   * when `initialData` is set, and callers that create a server pass 'create'
+   * explicitly.
+   */
+  mode?: 'create' | 'edit';
 }
 
 const ServerForm = ({
@@ -18,8 +27,10 @@ const ServerForm = ({
   initialData = null,
   modalTitle,
   formError = null,
+  mode,
 }: ServerFormProps) => {
   const { t } = useTranslation();
+  const { auth } = useAuth();
 
   // Determine the initial server type from the initialData
   const getInitialServerType = (): 'stdio' | 'sse' | 'streamable-http' | 'openapi' => {
@@ -48,6 +59,9 @@ const ServerForm = ({
     const oauth = data?.config?.oauth;
     return {
       clientId: oauth?.clientId || '',
+      ...(oauth?.allowInsecureTokenEndpoint !== undefined && {
+        allowInsecureTokenEndpoint: oauth.allowInsecureTokenEndpoint,
+      }),
       clientSecret: oauth?.clientSecret || '',
       scopes: oauth?.scopes ? oauth.scopes.join(' ') : '',
       accessToken: oauth?.accessToken || '',
@@ -55,6 +69,14 @@ const ServerForm = ({
       authorizationEndpoint: oauth?.authorizationEndpoint || '',
       tokenEndpoint: oauth?.tokenEndpoint || '',
       resource: oauth?.resource || '',
+      // Faithful pass-through (#1193): carry the non-editable OAuth sub-fields —
+      // the `dynamicRegistration` sub-object (RFC7591), `revocationEndpoint`
+      // (RFC 7009) and `redirectUri` — through the edit/duplicate round-trip so
+      // a save does not silently drop them. They have no in-form editors and
+      // are re-emitted verbatim by buildServerPayload.
+      ...(oauth?.dynamicRegistration && { dynamicRegistration: oauth.dynamicRegistration }),
+      ...(oauth?.revocationEndpoint && { revocationEndpoint: oauth.revocationEndpoint }),
+      ...(oauth?.redirectUri && { redirectUri: oauth.redirectUri }),
     };
   };
 
@@ -71,20 +93,22 @@ const ServerForm = ({
     arguments:
       initialData && initialData.config && initialData.config.args
         ? Array.isArray(initialData.config.args)
-          ? initialData.config.args.join(' ')
+          ? initialData.config.args.map(quoteArg).join(' ')
           : String(initialData.config.args)
         : '',
     args: (initialData && initialData.config && initialData.config.args) || [],
     type: getInitialServerType(), // Initialize the type field
     env: getInitialServerEnvVars(initialData),
     headers: [],
-    passthroughHeaders:
-      initialData?.config?.passthroughHeaders?.join(', ') || '',
+    passthroughHeaders: Array.isArray(initialData?.config?.passthroughHeaders)
+      ? initialData.config.passthroughHeaders.join(', ')
+      : '',
     visibility: (initialData?.config?.visibility ?? 'public') as
       | 'private'
       | 'group'
       | 'public',
     options: {
+      maxBufferSize: initialData?.config?.options?.maxBufferSize,
       timeout:
         (initialData &&
           initialData.config &&
@@ -176,7 +200,7 @@ const ServerForm = ({
   const [isKeepAliveSectionExpanded, setIsKeepAliveSectionExpanded] = useState<boolean>(false);
   const [isAdvancedExpanded, setIsAdvancedExpanded] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
-  const isEdit = !!initialData;
+  const isEdit = mode ? mode === 'edit' : !!initialData;
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const { name, value } = e.target;
@@ -185,7 +209,7 @@ const ServerForm = ({
 
   // Transform space-separated arguments string into array
   const handleArgsChange = (value: string) => {
-    const args = value.split(' ').filter((arg) => arg.trim() !== '');
+    const args = splitArgs(value);
     setFormData({ ...formData, arguments: value, args });
   };
 
@@ -195,8 +219,9 @@ const ServerForm = ({
   };
 
   const handleEnvVarChange = (index: number, field: 'key' | 'value', value: string) => {
-    const newEnvVars = [...envVars];
-    newEnvVars[index][field] = value;
+    // Copy the row too: mutating the shared object would break snapshot
+    // comparisons on envVars items (state-immutability discipline).
+    const newEnvVars = envVars.map((v, i) => (i === index ? { ...v, [field]: value } : v));
     setEnvVars(newEnvVars);
   };
 
@@ -211,8 +236,7 @@ const ServerForm = ({
   };
 
   const handleHeaderVarChange = (index: number, field: 'key' | 'value', value: string) => {
-    const newHeaderVars = [...headerVars];
-    newHeaderVars[index][field] = value;
+    const newHeaderVars = headerVars.map((v, i) => (i === index ? { ...v, [field]: value } : v));
     setHeaderVars(newHeaderVars);
   };
 
@@ -228,7 +252,7 @@ const ServerForm = ({
 
   const handleOAuthChange = <K extends keyof NonNullable<ServerFormData['oauth']>>(
     field: K,
-    value: string,
+    value: NonNullable<ServerFormData['oauth']>[K],
   ) => {
     setFormData((prev) => ({
       ...prev,
@@ -241,7 +265,7 @@ const ServerForm = ({
 
   // Handle options changes
   const handleOptionsChange = (
-    field: 'timeout' | 'resetTimeoutOnProgress' | 'maxTotalTimeout',
+    field: 'timeout' | 'resetTimeoutOnProgress' | 'maxTotalTimeout' | 'maxBufferSize',
     value: number | boolean | undefined,
   ) => {
     setFormData((prev) => ({
@@ -1126,6 +1150,25 @@ const ServerForm = ({
                       <p className="text-xs text-gray-500 mb-3">
                         {t('server.oauth.sectionDescription')}
                       </p>
+                      {(serverType === 'sse' || serverType === 'streamable-http') &&
+                        (auth.user?.isAdmin || formData.oauth?.allowInsecureTokenEndpoint) && (
+                          <div className="mb-3">
+                            <label className="flex items-center gap-2 text-sm">
+                              <input
+                                type="checkbox"
+                                checked={formData.oauth?.allowInsecureTokenEndpoint === true}
+                                disabled={!auth.user?.isAdmin}
+                                onChange={(e) =>
+                                  handleOAuthChange('allowInsecureTokenEndpoint', e.target.checked)
+                                }
+                              />
+                              {t('server.oauth.allowInsecureTokenEndpoint')}
+                            </label>
+                            <p className="text-xs text-amber-700 dark:text-amber-400 mt-1">
+                              {t('server.oauth.allowInsecureTokenEndpointHelp')}
+                            </p>
+                          </div>
+                        )}
                       <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
                         <div>
                           <label className="block text-xs text-gray-600 mb-1">
@@ -1187,7 +1230,10 @@ const ServerForm = ({
                             id="timeout"
                             value={formData.options?.timeout || 60000}
                             onChange={(e) =>
-                              handleOptionsChange('timeout', parseInt(e.target.value) || 60000)
+                              handleOptionsChange(
+                                'timeout',
+                                Math.max(1000, parseInt(e.target.value) || 60000),
+                              )
                             }
                             className="w-full py-2 px-3 form-input"
                             placeholder="30000"
@@ -1222,6 +1268,35 @@ const ServerForm = ({
                             {t('server.maxTotalTimeoutDescription')}
                           </p>
                         </div>
+
+                        {serverType === 'stdio' && (
+                          <div>
+                            <label
+                              className="block text-gray-600 text-sm font-medium mb-1"
+                              htmlFor="maxBufferSize"
+                            >
+                              {t('server.maxBufferSize')}
+                            </label>
+                            <input
+                              type="number"
+                              id="maxBufferSize"
+                              value={formData.options?.maxBufferSize ?? ''}
+                              onChange={(e) =>
+                                handleOptionsChange(
+                                  'maxBufferSize',
+                                  e.target.value === '' ? undefined : Number(e.target.value),
+                                )
+                              }
+                              className="w-full py-2 px-3 form-input"
+                              placeholder="10485760"
+                              min="1"
+                              step="1"
+                            />
+                            <p className="text-xs text-gray-500 mt-1">
+                              {t('server.maxBufferSizeDescription')}
+                            </p>
+                          </div>
+                        )}
                       </div>
 
                       <div className="mt-3">
@@ -1393,10 +1468,28 @@ const ServerForm = ({
                         min={10000}
                         step={1000}
                         value={formData.idleTimeoutMs ?? 300000}
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          // Free typing: store the raw number (even a
+                          // partial "6"); clamping here would snap the
+                          // first keystroke to 300000 and make manual
+                          // entry impossible. Clamp on blur instead.
+                          const n = Number(e.target.value);
                           setFormData((prev) => ({
                             ...prev,
-                            idleTimeoutMs: Number(e.target.value),
+                            idleTimeoutMs: e.target.value === '' || !Number.isFinite(n) ? undefined : n,
+                          }));
+                        }}
+                        onBlur={() =>
+                          setFormData((prev) => ({
+                            ...prev,
+                            // Clearing yields undefined — restore the
+                            // default (0/NaN would defeat idle shutdown).
+                            idleTimeoutMs:
+                              prev.idleTimeoutMs === undefined ||
+                              !Number.isFinite(prev.idleTimeoutMs as number) ||
+                              (prev.idleTimeoutMs as number) < 10000
+                                ? 300000
+                                : prev.idleTimeoutMs,
                           }))
                         }
                         className="hub-input w-40 text-sm"
@@ -1433,6 +1526,56 @@ const ServerForm = ({
       </form>
     </div>
   );
+};
+
+
+// Quote-aware argv round-trip: args may legitimately contain spaces (e.g.
+// `--header Content-Type: application/json`). Naive join(' ')/split(' ')
+// silently rewrites stored configs on every edit.
+const quoteArg = (arg: string): string =>
+  /[\s"]/.test(arg)
+    ? `"${arg.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+    : arg;
+
+const splitArgs = (value: string): string[] => {
+  const out: string[] = [];
+  let cur = '';
+  let inQuotes = false;
+  let escaped = false;
+  for (const ch of value) {
+    if (escaped) {
+      cur += ch;
+      escaped = false;
+    } else if (ch === '\\') {
+      // Escape prefix ONLY inside quotes (quoteArg now escapes both \ and "):
+      // outside quotes a backslash is literal (Windows paths must survive).
+      if (inQuotes) {
+        escaped = true;
+      } else {
+        cur += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = !inQuotes;
+      if (!inQuotes && cur) {
+        out.push(cur);
+        cur = '';
+      } else if (inQuotes && cur) {
+        // keep building quoted token
+      }
+      if (inQuotes && !cur) {
+        // opening quote of a token
+      }
+    } else if (ch === ' ' && !inQuotes) {
+      if (cur) {
+        out.push(cur);
+        cur = '';
+      }
+    } else {
+      cur += ch;
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
 };
 
 export default ServerForm;

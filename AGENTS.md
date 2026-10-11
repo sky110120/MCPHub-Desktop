@@ -9,6 +9,35 @@
 
 ---
 
+## 2026-10-11 桌面上游合并约束
+
+- 合并基线：本地 `8e1937a`，桌面上游 `47461e5506ae04a8590e8c0a31e54748540e2660`。本次留在 `main`，提交、推送和发布需另行确认。
+- 本地已发布迁移 v1-v25 的含义不得改变。追加 v26 FTS、v27 agent 回填、v28 keep-alive/透传头、v29 builtin 重名保留并改名及唯一索引、v30 tool pinned。上游同号 SQL 仅作参考，不用于判断本地数据库结构；不得照搬上游 v29 的 bearer 表删除。
+- 保留 macOS ARM 防护：mimalloc 不启用 `override`，SQLx 语句缓存为 0，数据库最大连接数为 1，外链仍用 `open_external_url`，不注册 shell plugin。
+- 保留当前仓库 updater 地址、公钥和仅 macOS ARM 的 draft 构建流程。合并本身不发布新版本，四处应用版本暂时保持 `1.0.32005`。
+- Smart Routing 旧字段 `openaiApiBaseUrl/openaiApiKey/openaiApiEmbeddingModel` 映射到 `llmProviderBaseUrl/llmProviderApiKey/embeddingModel`；新字段存在时优先，即使用户已清空。RAG 自动更新仍默认关闭。
+- 自动测试只能使用临时或内存数据库，不得默认回填用户真实的 `mcphub.db`。编译通过不代表完成真实 MCP 客户端、OCR 或模型推理验收。
+- rmcp 的 Streamable HTTP 与旧 endpoint-event SSE 同时保留；旧 SSE POST 入队后返回 202，初始化串行同步协议版本，普通回复异步增量转发。SSE/JSON 回复均有 64 MiB 上限，分块 CRLF/LF 和 UTF-8 边界有回归测试。
+- HTTP 停止先取消 stream，确认 listener 退出后有界清理共享 SDK session、last-seen 和隔离 client，不断开共享上游池。分组 bearer 权限保留桌面既有的“授权分组展开服务器集合”语义，不改成 Node 参考项目的 URL scope 权限。
+- `mcphub-origin` 仅作参考；因未能取得上游要求的子模块提交，本次保留固定指针 `a8ace625c7fc17b8fb2855ca15a8ba17f5b72779`，未改其源码。
+- 合并后修复：rmcp 健康检查读取真实 peer 状态，普通业务错误保留健康客户端；HTTP 只追踪真实 SDK 会话，容量 4096，在途请求及响应流持有活动租约，完成时更新空闲时间，与回收使用一致的锁顺序。旧 SSE 的内部 SDK 调用也经过追踪。
+- RAG 文档修改由拥有 META_LOCK 的任务执行：排队或事务开始前取消不写入，开始后取消仅停止等待，当前文档必须完成提交或错误补偿。适用于上传、新建、文件/原文件更新、MCP 更新、标签编辑和删除；source-sync 添加转移现有锁，不得重复获取。删除后的 Git 工件清理在核心任务之外，取消可能留下可清理的孤立克隆。
+- 旧 `.meta` 在索引期间保持可见，避免列表/SQL 清理误判删除；元数据快照恢复失败保留备份并记日志。内容更新的向量补偿仍为 best-effort 重嵌入，不能宣称完整事务持久性或进程崩溃后的自动恢复。
+- 删除先快照原分块并暂存自有内容，向量或元数据删除失败返回错误并尝试恢复；成功后才清理备份及 SQL 镜像。删除路径去重，UUID 内容存在时不删除另一份同显示名 legacy 文件，symlink 原文件不删除。标签与删除补偿复用每个分块原始 tags、embedding 和 ID，不调用模型。
+- Git 刷新保留已持久化克隆的 HEAD 分支；同 URL 不同分支不能复用同一克隆。同步合并网络解析与记录的原文件路径身份，地址别名、混合分支、HEAD 不匹配均不得误删或从错误分支更新。原文件更新按记录路径离线核验，历史歧义不会自动修复。取消在 URL 探测前注册，取消操作本身不做网络探测。
+- shell 探测统一限制进程和双管道期限，非阻塞轮询，每个输出流最多 8 MiB；使用标准 process_group 隔离并清理后台子进程，不增加 pre_exec。Smart Routing 返回真实逐服务器成功/失败/跳过、当前索引及工具数量，前端部分失败使用 warning。
+- 历史快照：ARM64 库测试曾为 192 passed、0 failed、4 ignored；最新最终结果（2026-10-12，Asia/Shanghai）为 `cargo test --lib -j4 --locked --offline -- --test-threads=1`：196 passed、0 failed、4 ignored（200 total）。gpt-6-luna 修复 `auth.rs`/`config.rs` 共用 `skip_auth_enabled_from_config`：合法对象缺 `routing` 或 `skipAuth` 按桌面约定 true，显式值保持；损坏结构或非 bool、读取/解析错误均为 false。两个缺省值测试先 RED，再 GREEN，修复后全库测试通过。
+- 2026-10-12 隔离 HOME 原生实测设置：修复 HTTP 端口保存问题并新增 4 项测试后，GUI 保存端口 24391、创建 `native-time-fixture` stdio 服务。Python 解释器为 `/Users/khlu/.pyenv/versions/3.14.6/bin/python3`；GUI 会将低于 10000ms 的 idle timeout 重置为 300000ms，因此最终设为 10000ms 并只读核验。
+- 以下协议验收全部在 **Bearer 认证关闭** 时通过：initialize/SSE、initialized、tools/list/time、DELETE、删除后 session 404；HTTP off 后端口停止接受连接，重新开启可再次调用。正常菜单 Quit 后以相同隔离 HOME 重启，完整调用流程、12 秒长调用后由同一 stdio 进程紧接处理后续调用及删除会话拒绝均通过。fixture 实际 idle 退出后再次运行完整流程通过，marker 从 6 增至 7，确认重新唤醒。报告：`/private/tmp/mcphub-native-after-restart-report.json`、`/private/tmp/mcphub-native-idle-wake-report.json`、`/private/tmp/mcphub-native-final-stopped-report.json`。
+- 协议结果来自 Python 验证器访问原生 App 真实 listener，不是 Codex 已配置 MCP 工具直连，也不是第三方 time 服务。验证器 mock 通过；HTTP header 大小写和非 2xx 纯文本错误处理的修复仅属于临时验证器，不是 App 源码 bug。本轮未新增仓库生产代码。实际 DB 为 `/private/tmp/mcphub-native-check-20261011/home/Library/Application Support/app.mcphub.verification20261011/mcphub.db`，未操作真实 MCPHub DB/config。
+- App 退出后 AX 工具曾在普通 HOME 意外重启专用测试 app id 实例；已停止该实例、删除仅属于该测试 app id 的目录并复核隔离 DB 路径，之后不再使用退出后的 AX 自动重启。HTTP 最终关闭且端口停止验证通过；测试进程已结束并消费 exec session 退出状态。Bearer key 尚未创建，有效、无效及缺失 token 的原生认证测试待用户确认通过 UI 创建持久访问 key 后进行。
+- `cargo build --bin mcphub -j4 --locked --offline` 已通过（28.69s），有 debug compact-unwind 警告。前端 Vite build、TypeScript noEmit、8 项兼容测试、命令契约检查及 FTS 回填测试 1 passed 均为先前已验证快照，本轮未重跑。未下载 GGUF，不能宣称实测 RAG 模型；OCR、正式安装包也未实测。
+- 测试使用内存数据库、临时文件、本地 Python MCP fixture 和本地 Git 仓库，未使用用户真实配置。仍有上游测试 unused import/helper、Vite 配置/大 chunk 警告。HTTP 容量测试用占满许可模拟，RAG 取消测试部分使用索引替身。
+- updater 私钥 `src-tauri/updater/mcphub.key` 是历史已跟踪文件，本轮未新增或修改；`release.yml` 会读取该文件且密码为空。推送或草稿发布前需用户决策；不得擅自轮换 updater 身份或输出 key。
+- 本次合并提交须同时纳入最终修复及 `rmcp_health_tests.rs`、`service_git_tests.rs`，不能只提交旧 index。用户已明确授权在当前 `main` 完成本地合并提交；最新只读 `git diff --check HEAD` 通过。本次提交操作不包含 push、tag 或 dispatch。
+
+---
+
 ## 1. 项目概览[](https://)[](https://)
 
 ### 1.1 原项目（mcphub-origin — Node.js/Express + React/Vite）

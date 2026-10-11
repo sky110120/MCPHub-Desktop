@@ -1,3 +1,7 @@
+use tauri::State;
+
+use crate::commands::auth::SessionState;
+
 use crate::{
     mcp::{pool, progress},
     models::server::{ServerConfig, ServerInfo, ServerPage, ServerStatus, ServerType},
@@ -24,9 +28,13 @@ pub async fn list_servers() -> Result<Vec<ServerInfo>, String> {
             vec![],
         ));
         // Apply tool enabled/description configs
-        let tools = server_tool_config_service::apply_tool_filters(&cfg.name, tools)
-            .await
-            .unwrap_or_default();
+        let tools = match server_tool_config_service::apply_tool_filters(&cfg.name, tools).await {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("[servers] apply_tool_filters({}) failed: {}", cfg.name, e);
+                Vec::new()
+            }
+        };
         result.push(ServerInfo { config: cfg, status, tools, prompts: Vec::new(), resources: Vec::new() });
     }
     // Append the "mcphub-desktop" builtin server (virtual, no DB row), which
@@ -69,6 +77,40 @@ pub async fn search_servers(
     let mut matched_names: std::collections::HashSet<String> =
         candidates.iter().map(|c| c.name.clone()).collect();
 
+    // 相关度计数（2026-09-06 用户要求：命中查询词元数第一优先，同数保持原生序）。
+    // ① name/description：FTS weighted 口径（与 search_configs 主路径同源）；
+    //    FTS 降级（空表/Err/零结果走 LIKE）时 counts 为空，用 Rust token 计数补齐，
+    //    防止工具名命中反超名称命中（LIKE 候选必含完整 key=全部 token，计数最大）。
+    // ② 工具名兜底候选：token 级子串计数并入同一 counts（原来仅整 key 子串匹配，
+    //    多词查询时几乎永不命中；token 级提高召回且可参与相关度排序）。
+    let mut counts: std::collections::HashMap<String, i64> =
+        crate::services::fts_service::search_ref_ids_weighted(
+            crate::services::fts_service::FtsTable::Servers,
+            &key,
+            1000,
+        )
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let tokens: Vec<String> = key.split_whitespace().map(|s| s.to_string()).collect();
+    if counts.is_empty() && !candidates.is_empty() {
+        // FTS 降级路径：Rust 侧逐 token 计数（LIKE 候选均含完整 key → 计数相同
+        // → 稳定排序保持 name 序不变；工具名候选计数较小 → 排在名称命中之后）
+        for cfg in &candidates {
+            let hay = format!(
+                "{} {}",
+                cfg.name,
+                cfg.description.as_deref().unwrap_or("")
+            )
+            .to_lowercase();
+            counts.insert(
+                cfg.name.clone(),
+                tokens.iter().filter(|t| hay.contains(t.as_str())).count() as i64,
+            );
+        }
+    }
+
     // Tool-name fallback: tools live only in the runtime pool, so when a query
     // is active, additionally scan the full list's tool names and merge servers
     // not already matched (preserves the previous client-side haystack).
@@ -78,16 +120,26 @@ pub async fn search_servers(
             if matched_names.contains(&cfg.name) {
                 continue;
             }
-            let tool_match = pool::get_entry_info(&cfg.name)
+            let tool_hit = pool::get_entry_info(&cfg.name)
                 .await
-                .map(|(_, tools)| tools.iter().any(|t| t.name.to_lowercase().contains(&key)))
-                .unwrap_or(false);
-            if tool_match {
+                .map(|(_, tools)| {
+                    let hay = tools
+                        .iter()
+                        .map(|t| t.name.to_lowercase())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    tokens.iter().filter(|t| hay.contains(t.as_str())).count()
+                })
+                .unwrap_or(0);
+            if tool_hit > 0 {
                 matched_names.insert(cfg.name.clone());
+                counts.insert(cfg.name.clone(), tool_hit as i64);
                 candidates.push(cfg);
             }
         }
-        candidates.sort_by_key(|c| c.name.to_lowercase());
+        // 统一相关度排序：命中 token 数降序，稳定排序保持候选进入序
+        //（FTS 候选 = weighted+name 序；LIKE 候选 = name 序；工具兜底 = list_all 序）
+        candidates.sort_by_key(|c| std::cmp::Reverse(counts.get(&c.name).copied().unwrap_or(0)));
     }
 
     // Enrich candidates with runtime status + filtered tools (same as list_servers).
@@ -106,9 +158,13 @@ pub async fn search_servers(
             },
             vec![],
         ));
-        let tools = server_tool_config_service::apply_tool_filters(&cfg.name, tools)
-            .await
-            .unwrap_or_default();
+        let tools = match server_tool_config_service::apply_tool_filters(&cfg.name, tools).await {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("[servers] apply_tool_filters({}) failed: {}", cfg.name, e);
+                Vec::new()
+            }
+        };
         infos.push(ServerInfo { config: cfg, status, tools, prompts: Vec::new(), resources: Vec::new() });
     }
 
@@ -190,9 +246,13 @@ pub async fn get_server(name: String) -> Result<Option<ServerInfo>, String> {
             vec![],
         ));
         // Apply tool enabled/description configs
-        let tools = server_tool_config_service::apply_tool_filters(&name, tools)
-            .await
-            .unwrap_or_default();
+        let tools = match server_tool_config_service::apply_tool_filters(&name, tools).await {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("[servers] apply_tool_filters({}) failed: {}", name, e);
+                Vec::new()
+            }
+        };
         Ok(Some(ServerInfo { config: cfg, status, tools, prompts: Vec::new(), resources: Vec::new() }))
     } else {
         Ok(None)
@@ -200,7 +260,13 @@ pub async fn get_server(name: String) -> Result<Option<ServerInfo>, String> {
 }
 
 #[tauri::command]
-pub async fn add_server(config: ServerConfig) -> Result<ServerInfo, String> {
+pub async fn add_server(
+    session: State<'_, SessionState>,
+    config: ServerConfig,
+) -> Result<ServerInfo, String> {
+    // Arbitrary command/args/env injection executes at app privileges on
+    // next connect — admin-gated in multi-user mode (skipAuth short-circuits).
+    crate::commands::config::require_admin(&session).await?;
     let saved = server_service::create(&config).await.map_err(|e| e.to_string())?;
     if saved.enabled {
         // Connect in background so the API returns immediately
@@ -223,7 +289,12 @@ pub async fn add_server(config: ServerConfig) -> Result<ServerInfo, String> {
 }
 
 #[tauri::command]
-pub async fn update_server(name: String, config: ServerConfig) -> Result<ServerInfo, String> {
+pub async fn update_server(
+    session: State<'_, SessionState>,
+    name: String,
+    config: ServerConfig,
+) -> Result<ServerInfo, String> {
+    crate::commands::config::require_admin(&session).await?;
     // Mirror of upstream #1055 ("avoid unnecessary runtime reloads when editing
     // a server"): if no connection-relevant field changed, persist + refresh the
     // in-memory access metadata only, WITHOUT tearing down and reconnecting the
@@ -252,6 +323,49 @@ pub async fn update_server(name: String, config: ServerConfig) -> Result<ServerI
     let saved = server_service::update(&name, &config)
         .await
         .map_err(|e| e.to_string())?;
+
+    // Smart Routing index (Phase 3): a rename orphans the old name's rows, and
+    // any update can change the server-level searchable text (description).
+    // Both are background best-effort; the skip check makes no-op updates free.
+    if is_renaming {
+        let old = name.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = crate::smart_routing::index::remove_server_embeddings(&old).await {
+                log::warn!("[smart] remove embeddings for renamed server '{}': {}", old, e);
+            }
+        });
+    }
+    {
+        let saved_for_index = saved.clone();
+        // `needs_reconnect` (computed above) means the live runtime is about to
+        // be torn down below — get_entry_info could still see the STALE entry
+        // if this spawn raced ahead of the teardown, saving outdated tools.
+        // When reconnecting, conservatively drop embeddings here and let the
+        // reconnect's update/rebuild path re-save with fresh tools.
+        let reconnecting = needs_reconnect;
+        tauri::async_runtime::spawn(async move {
+            let n = saved_for_index.name.clone();
+            let desc = saved_for_index.description.clone();
+            if !saved_for_index.enabled || reconnecting {
+                let _ = crate::smart_routing::index::remove_server_embeddings(&n).await;
+                return;
+            }
+            if let Some((_, tools)) = crate::mcp::pool::get_entry_info(&n).await {
+                if tools.is_empty() {
+                    let _ = crate::smart_routing::index::remove_server_embeddings(&n).await;
+                } else {
+                    let _ = crate::smart_routing::index::save_server_embeddings(&n, desc.as_deref(), &tools).await;
+                }
+            } else {
+                // Entry genuinely absent (server never connected / already
+                // torn down). Conservatively drop old embeddings — the next
+                // successful connect's update/rebuild path re-saves with
+                // fresh tools; keeping stale rows would leak outdated
+                // searchable text indefinitely.
+                let _ = crate::smart_routing::index::remove_server_embeddings(&n).await;
+            }
+        });
+    }
 
     if needs_reconnect && saved.enabled {
         // Connection-relevant field changed (command/url/args/env/headers/
@@ -342,7 +456,16 @@ fn to_connection_relevant(cfg: &ServerConfig) -> serde_json::Value {
     // Serialize the whole config, then drop the non-connection keys. Cheaper and
     // less error-prone than hand-listing every field (stays in sync with model
     // changes), at the cost of serializing a few extra fields that we then strip.
-    let mut v = serde_json::to_value(cfg).unwrap_or(serde_json::Value::Null);
+    let mut v = match serde_json::to_value(cfg) {
+        Ok(v) => v,
+        Err(e) => {
+            // Serialization failure is impossible for ServerConfig in practice,
+            // but failing closed (force reconnect) is safer than failing open
+            // (Null == Null would silently swallow the change).
+            log::warn!("[update_server] failed to serialize config for comparison: {}", e);
+            return serde_json::Value::String("__serialization_failed__".to_string());
+        }
+    };
     let obj = match v.as_object_mut() {
         Some(o) => o,
         None => return v,
@@ -361,8 +484,30 @@ fn to_connection_relevant(cfg: &ServerConfig) -> serde_json::Value {
     // Treat the default request timeout (60000, the dashboard form default) as
     // equivalent to "not set": an explicit 60000 stored via API/file import and
     // an absent timeout resolve to the same effective connect timeout.
+    // Normalize boolean flags: the DB stores NOT NULL DEFAULT 0, so map_row
+    // always emits `Some(false)` → serde `"perSessionClient": false`, while
+    // the frontend payload omits the key entirely when false → `None` →
+    // serde `null` → stripped by strip_empty. Without this normalization the
+    // `false != absent` mismatch made has_connection_relevant_change return
+    // true for EVERY server created via the UI (description-only edits
+    // forced reconnects, defeating #1055). Same shape as the timeout rule:
+    // `false` and "not set" are semantically identical (changing to `true`
+    // still compares unequal and triggers a reconnect).
+    for flag in ["perSessionClient", "startOnDemand"] {
+        if obj.get(flag).and_then(|f| f.as_bool()) == Some(false) {
+            obj.remove(flag);
+        }
+    }
     if let Some(options) = obj.get_mut("options").and_then(|o| o.as_object_mut()) {
-        if options.get("timeout").and_then(|t| t.as_u64()) == Some(60_000) {
+        // Accept both numeric 60000 and string "60000" (JSON file import / API
+        // writes may store it as a string) — either form is equivalent to
+        // "not set" for comparison purposes.
+        let timeout_eq_default = match options.get("timeout") {
+            Some(serde_json::Value::Number(n)) => n.as_u64() == Some(60_000),
+            Some(serde_json::Value::String(s)) => s.trim().parse::<u64>() == Ok(60_000),
+            _ => false,
+        };
+        if timeout_eq_default {
             options.remove("timeout");
             if options.is_empty() {
                 obj.remove("options");
@@ -406,20 +551,42 @@ fn is_empty_or_null(v: &serde_json::Value) -> bool {
 }
 
 #[tauri::command]
-pub async fn delete_server(name: String) -> Result<(), String> {
+pub async fn delete_server(
+    session: State<'_, SessionState>,
+    name: String,
+) -> Result<(), String> {
+    crate::commands::config::require_admin(&session).await?;
     pool::disconnect_server(&name).await.ok();
-    server_service::delete(&name).await.map_err(|e| e.to_string())
+    server_service::delete(&name).await.map_err(|e| e.to_string())?;
+    // Closing TOCTOU guard: between the pre-delete disconnect and the delete
+    // commit, the 30s session-rebuild loop could see the still-enabled row
+    // and spawn a fresh connect — disconnect again after the delete commits
+    // so no live connection outlives a deleted server row.
+    pool::disconnect_server(&name).await.ok();
+    // Smart Routing index cleanup (best-effort; logged inside).
+    if let Err(e) = crate::smart_routing::index::remove_server_embeddings(&name).await {
+        log::warn!("[smart] remove embeddings for deleted '{}': {}", name, e);
+    }
+    Ok(())
 }
 
 #[tauri::command]
-pub async fn toggle_server(name: String) -> Result<bool, String> {
+pub async fn toggle_server(
+    session: State<'_, SessionState>,
+    name: String,
+) -> Result<bool, String> {
+    crate::commands::config::require_admin(&session).await?;
     mcp_manager::toggle_server(&name)
         .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub async fn reload_server(name: String) -> Result<ServerStatus, String> {
+pub async fn reload_server(
+    session: State<'_, SessionState>,
+    name: String,
+) -> Result<ServerStatus, String> {
+    crate::commands::config::require_admin(&session).await?;
     mcp_manager::reload_server(&name)
         .await
         .map_err(|e| e.to_string())?;
@@ -440,8 +607,126 @@ pub async fn reload_server(name: String) -> Result<ServerStatus, String> {
     Ok(status)
 }
 
+/// Resolve the npx package spec(s) from a server's args (origin #1182):
+/// `-p/--package[=]` values are explicit specs; the first bare token is the
+/// package; everything after `-c/--call` is a shell command, not a spec.
+fn resolve_npx_package_specs(args: &[String]) -> Vec<String> {
+    let mut specs: Vec<String> = Vec::new();
+    let mut explicit = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "-p" || arg == "--package" {
+            if let Some(v) = args.get(i + 1) {
+                specs.push(v.clone());
+                explicit = true;
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(v) = arg.strip_prefix("--package=") {
+            specs.push(v.to_string());
+            explicit = true;
+            i += 1;
+            continue;
+        }
+        if arg == "-c" || arg == "--call" {
+            break;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        if !explicit {
+            specs.push(arg.clone());
+        }
+        break;
+    }
+    specs
+}
+
+/// Strip the version from a package spec, keeping a scoped name intact:
+/// `cowsay@1.5.0` -> `cowsay`, `@scope/pkg@1.2.3` -> `@scope/pkg`.
+fn npx_package_name_from_spec(spec: &str) -> &str {
+    match spec.rfind('@') {
+        // `separator > 0` so a leading `@scope` marker is kept.
+        Some(idx) if idx > 0 => &spec[..idx],
+        _ => spec,
+    }
+}
+
+/// Whether an `_npx` cache entry (identified by the metadata npm leaves in its
+/// package.json) installed one of the given specs.
+fn npx_entry_matches_spec(manifest: &serde_json::Value, specs: &[String]) -> bool {
+    if let Some(packages) = manifest.get("_npx").and_then(|n| n.get("packages")).and_then(|p| p.as_array()) {
+        return packages
+            .iter()
+            .filter_map(|p| p.as_str())
+            .any(|p| specs.iter().any(|s| s == p));
+    }
+    if let Some(deps) = manifest.get("dependencies").and_then(|d| d.as_object()) {
+        let names: std::collections::HashSet<&str> =
+            specs.iter().map(|s| npx_package_name_from_spec(s)).collect();
+        return deps.keys().any(|k| names.contains(k.as_str()));
+    }
+    false
+}
+
+/// Remove only the `_npx` cache entries belonging to the given package specs.
+/// Returns Ok(true) when entries were cleared, Ok(false) when no spec could be
+/// resolved (cache deliberately left untouched). Unreadable entries are skipped:
+/// this runs to refresh one server, an unreadable neighbour is not ours to delete.
+///
+/// The cache scanned is the SERVER-SPECIFIC npm cache that `env_overrides`
+/// actually points npx at (`npm_config_cache = <app_local>/npm-cache-{name}`) —
+/// the shared `runtimes/_npx` dir is never written by managed npx spawns, so
+/// scanning it made reinstalls a no-op (package kept running the old version).
+async fn clear_npx_cache_for_specs(name: &str, args: &[String]) -> Result<bool, std::io::Error> {
+    let specs = resolve_npx_package_specs(args);
+    if specs.is_empty() {
+        return Ok(false);
+    }
+    // env_overrides writes `npm-cache-{server}` inside the same app-local
+    // dir app_local_dir resolves (runtime_env); reuse its base + `_npx`.
+    let Some(cache_dir) = runtime_env::npm_server_cache_dir(name).map(|d| d.join("_npx")) else {
+        return Ok(false);
+    };
+    let entries = match std::fs::read_dir(&cache_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let mut removed = false;
+    for entry in entries.flatten() {
+        let entry_dir = entry.path();
+        let manifest: serde_json::Value = match std::fs::read_to_string(entry_dir.join("package.json"))
+        {
+            Ok(s) => match serde_json::from_str(&s) {
+                Ok(v) => v,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        if !npx_entry_matches_spec(&manifest, &specs) {
+            continue;
+        }
+        // spawn_blocking: remove_dir_all can block for seconds on large
+        // package caches; must not stall the async executor.
+        if let Err(e) = tauri::async_runtime::spawn_blocking(move || std::fs::remove_dir_all(&entry_dir)).await.unwrap_or(Err(std::io::Error::other("join failed"))) {
+            return Err(e);
+        }
+        removed = true;
+    }
+    Ok(removed)
+}
+
 #[tauri::command]
-pub async fn reinstall_server(name: String) -> Result<serde_json::Value, String> {
+pub async fn reinstall_server(
+    session: State<'_, SessionState>,
+    name: String,
+) -> Result<serde_json::Value, String> {
+    crate::commands::config::require_admin(&session).await?;
     // Disconnect first
     pool::disconnect_server(&name).await.ok();
 
@@ -456,19 +741,36 @@ pub async fn reinstall_server(name: String) -> Result<serde_json::Value, String>
 
     // Clear npx cache if the server uses npx
     if command == "npx" {
-        if let Some(cache_dir) = runtime_env::npm_cache_dir() {
-            if cache_dir.exists() {
-                let _ = std::fs::remove_dir_all(&cache_dir);
-                cleared.push("npx".to_string());
+        // Scope the clear to this server's package (origin #1182): deleting the
+        // whole `_npx` directory would discard every other npx server's install
+        // as well. Entries are identified from the metadata npm leaves in each
+        // entry's package.json; unreadable/unmatched entries are left alone.
+        match clear_npx_cache_for_specs(&name, cfg.args.as_deref().unwrap_or(&[])).await {
+            Ok(true) => cleared.push("npx".to_string()),
+            Ok(false) => {
+                log::warn!(
+                    "[reinstall] Could not identify the npx package from args of '{}'; cache left untouched",
+                    name
+                );
             }
+            Err(e) => log::warn!("[reinstall] Failed to clear scoped npx cache for '{}': {}", name, e),
         }
     }
 
     // Clear uvx cache if the server uses uvx
     if command == "uvx" {
-        if let Some(cache_dir) = runtime_env::uvx_cache_dir() {
-            if cache_dir.exists() {
-                let _ = std::fs::remove_dir_all(&cache_dir);
+        // uvx caches are per-server: `env_overrides` sets UV_CACHE_DIR to
+        // `uv-cache-{server}` for each uvx server, so clearing THIS server's
+        // cache dir forces a fresh download without touching other uvx
+        // servers' caches (per-package scoping, same spirit as origin #1182
+        // for npx). The previous code deleted the shared `runtimes/uv-cache`
+        // dir — which neither holds this server's real cache nor is shared
+        // per-server — so reinstalls silently kept serving stale packages.
+        if let Some(cache) = runtime_env::uvx_server_cache_dir(&name) {
+            if cache.exists() {
+                let dir = cache.clone();
+                let _ = tauri::async_runtime::spawn_blocking(move || std::fs::remove_dir_all(&dir))
+                    .await;
                 cleared.push("uvx".to_string());
             }
         }
@@ -522,7 +824,12 @@ async fn run_update_check(cfg: &ServerConfig) {
 /// result (and badge) flow back via `server://update-available` exactly as on
 /// connect. Returns the number of servers scheduled for a check.
 #[tauri::command]
-pub async fn check_stdio_updates() -> Result<serde_json::Value, String> {
+pub async fn check_stdio_updates(
+    session: tauri::State<'_, crate::commands::auth::SessionState>,
+) -> Result<serde_json::Value, String> {
+    // Spawns outbound registry checks for every npx/uvx server — bounded to
+    // admin (review round 8, 2026-10-04).
+    crate::commands::config::require_admin(&session).await?;
     let configs = server_service::list_all().await.map_err(|e| e.to_string())?;
     let mut count = 0usize;
     for cfg in configs {
@@ -539,7 +846,11 @@ pub async fn check_stdio_updates() -> Result<serde_json::Value, String> {
 /// Check a single server for package updates (npx/uvx stdio only). Mirrors the
 /// connect-time check; the result returns via `server://update-available`.
 #[tauri::command]
-pub async fn check_server_update(name: String) -> Result<serde_json::Value, String> {
+pub async fn check_server_update(
+    session: tauri::State<'_, crate::commands::auth::SessionState>,
+    name: String,
+) -> Result<serde_json::Value, String> {
+    crate::commands::config::require_admin(&session).await?;
     let cfg = server_service::get_by_name(&name)
         .await
         .map_err(|e| e.to_string())?
@@ -555,33 +866,84 @@ pub async fn check_server_update(name: String) -> Result<serde_json::Value, Stri
 }
 
 #[tauri::command]
-pub async fn clear_cache() -> Result<serde_json::Value, String> {
+pub async fn clear_cache(session: State<'_, SessionState>) -> Result<serde_json::Value, String> {
+    crate::commands::config::require_admin(&session).await?;
     let mut results = serde_json::Map::new();
 
-    // Clear npm/npx cache
-    if let Some(npm_cache) = runtime_env::npm_cache_dir() {
-        if npm_cache.exists() {
-            match std::fs::remove_dir_all(&npm_cache) {
-                Ok(_) => { results.insert("npx".to_string(), serde_json::json!({"status": "cleared"})); }
-                Err(e) => { results.insert("npx".to_string(), serde_json::json!({"status": "error", "message": e.to_string()})); }
+    // Clear npm/npx cache: the per-server cache dirs env_overrides actually
+    // points npx at (`npm-cache-{server}`, whose `_npx` holds the installs).
+    // clear_cache is a global clear — wipe EVERY `npm-cache-*` sibling.
+    {
+        let mc_root = runtime_env::npm_server_cache_dir("x").map(|p| {
+            let mut pb = p;
+            pb.pop(); // strip the "npm-cache-x" name → the mcphub-desktop dir
+            pb
+        });
+        match mc_root {
+            Some(root) if root.exists() => {
+                let mut removed_any = false;
+                let mut had_error: Option<String> = None;
+                if let Ok(entries) = std::fs::read_dir(&root) {
+                    for entry in entries.flatten() {
+                        let fname = entry.file_name();
+                        let fname = fname.to_string_lossy();
+                        if !fname.starts_with("npm-cache-") {
+                            continue;
+                        }
+                        let dir = entry.path();
+                        match tauri::async_runtime::spawn_blocking(move || std::fs::remove_dir_all(&dir)).await
+                        {
+                            Ok(Ok(_)) => removed_any = true,
+                            Ok(Err(e)) => had_error = Some(e.to_string()),
+                            Err(e) => had_error = Some(e.to_string()),
+                        }
+                    }
+                }
+                match had_error {
+                    Some(e) => { results.insert("npx".to_string(), serde_json::json!({"status": "error", "message": e})); }
+                    None if removed_any => { results.insert("npx".to_string(), serde_json::json!({"status": "cleared"})); }
+                    None => { results.insert("npx".to_string(), serde_json::json!({"status": "skipped"})); }
+                }
             }
-        } else {
-            results.insert("npx".to_string(), serde_json::json!({"status": "skipped"}));
+            _ => { results.insert("npx".to_string(), serde_json::json!({"status": "skipped"})); }
         }
-    } else {
-        results.insert("npx".to_string(), serde_json::json!({"status": "skipped"}));
     }
 
-    // Clear uv/uvx cache
-    if let Some(uvx_cache) = runtime_env::uvx_cache_dir() {
-        if uvx_cache.exists() {
-            match std::fs::remove_dir_all(&uvx_cache) {
-                Ok(_) => { results.insert("uvx".to_string(), serde_json::json!({"status": "cleared"})); }
-                Err(e) => { results.insert("uvx".to_string(), serde_json::json!({"status": "error", "message": e.to_string()})); }
+    // Clear uv/uvx caches. uvx servers use per-server dirs (`uv-cache-{name}`
+    // / `uv-tools-{name}` under the app cache dir, matching the UV_CACHE_DIR /
+    // UV_TOOL_DIR env overrides), NOT the legacy shared runtimes/uv-cache.
+    if let Some(base) = runtime_env::uvx_server_cache_dir("probe").and_then(|p| p.parent().map(|p| p.to_path_buf())) {
+        let mut cleared_any = false;
+        let mut had_error: Option<String> = None;
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !(name.starts_with("uv-cache-") || name.starts_with("uv-tools-")) {
+                    continue;
+                }
+                let dir = entry.path();
+                if !dir.is_dir() {
+                    continue;
+                }
+                cleared_any = true;
+                match tauri::async_runtime::spawn_blocking(move || std::fs::remove_dir_all(&dir)).await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => had_error = Some(e.to_string()),
+                    Err(e) => had_error = Some(e.to_string()),
+                }
             }
-        } else {
-            results.insert("uvx".to_string(), serde_json::json!({"status": "skipped"}));
         }
+        let status = match &had_error {
+            Some(_) => "error",
+            None if cleared_any => "cleared",
+            None => "skipped",
+        };
+        let mut v = serde_json::json!({"status": status});
+        if let Some(e) = had_error {
+            v["message"] = serde_json::json!(e);
+        }
+        results.insert("uvx".to_string(), v);
     } else {
         results.insert("uvx".to_string(), serde_json::json!({"status": "skipped"}));
     }
@@ -590,4 +952,73 @@ pub async fn clear_cache() -> Result<serde_json::Value, String> {
         "success": true,
         "results": results
     }))
+}
+
+#[cfg(test)]
+mod connection_relevance_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn cfg_from(extra: serde_json::Value) -> ServerConfig {
+        let mut v = json!({
+            "name": "s1",
+            "serverType": "stdio",
+            "command": "npx",
+            "args": ["-y", "demo"],
+        });
+        if let (Some(base), Some(obj)) = (v.as_object_mut(), extra.as_object()) {
+            for (k, val) in obj {
+                base.insert(k.clone(), val.clone());
+            }
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn boolean_false_and_absent_are_equivalent() {
+        // DB-backed configs always carry explicit `false` (NOT NULL DEFAULT 0)
+        // while UI payloads omit the key — both must compare equal so a
+        // description-only edit does not force a reconnect.
+        let prev = cfg_from(json!({"perSessionClient": false, "startOnDemand": false}));
+        let next = cfg_from(json!({}));
+        assert!(!has_connection_relevant_change(&prev, &next));
+        assert!(!has_connection_relevant_change(&next, &prev));
+
+        // Flipping to true is still connection-relevant.
+        let next_on = cfg_from(json!({"perSessionClient": true}));
+        assert!(has_connection_relevant_change(&prev, &next_on));
+    }
+
+    #[test]
+    fn default_timeout_is_equivalent_to_absent() {
+        // Note: ServerOptions.timeout is a typed u64, so string-form "60000"
+        // can never deserialize into ServerConfig; the string branch in
+        // to_connection_relevant is purely defensive (JSON Value level).
+        let numeric = cfg_from(json!({"options": {"timeout": 60000}}));
+        let none = cfg_from(json!({}));
+        assert!(!has_connection_relevant_change(&numeric, &none));
+
+        let changed = cfg_from(json!({"options": {"timeout": 30000}}));
+        assert!(has_connection_relevant_change(&numeric, &changed));
+    }
+
+    #[test]
+    fn description_only_edit_does_not_reconnect() {
+        let prev = cfg_from(json!({"description": "old"}));
+        let next = cfg_from(json!({"description": "new"}));
+        assert!(!has_connection_relevant_change(&prev, &next));
+
+        let cmd_changed = cfg_from(json!({"description": "old", "command": "uvx"}));
+        assert!(has_connection_relevant_change(&prev, &cmd_changed));
+    }
+
+    #[test]
+    fn keep_alive_and_passthrough_header_edits_reconnect() {
+        let prev = cfg_from(json!({}));
+        let keep_alive_changed = cfg_from(json!({"enableKeepAlive": true}));
+        assert!(has_connection_relevant_change(&prev, &keep_alive_changed));
+
+        let headers_changed = cfg_from(json!({"passthroughHeaders": ["X-Trace"]}));
+        assert!(has_connection_relevant_change(&prev, &headers_changed));
+    }
 }

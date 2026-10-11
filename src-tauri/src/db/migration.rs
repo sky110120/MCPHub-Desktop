@@ -9,7 +9,91 @@ use anyhow::{anyhow, Result};
 use sqlx::{Row, SqlitePool};
 
 /// Current target schema version — bump this when adding new migrations.
-pub const TARGET_VERSION: i64 = 25;
+pub const TARGET_VERSION: i64 = 30;
+
+/// Whether this database needs a schema upgrade.
+pub async fn has_pending(pool: &SqlitePool) -> Result<bool> {
+    Ok(get_current_version(pool).await? < TARGET_VERSION)
+}
+
+/// Save a consistent pre-migration snapshot without sacrificing the previous
+/// backup if VACUUM or the final rename fails.
+pub async fn backup_before_migration(
+    pool: &SqlitePool,
+    db_path: &std::path::Path,
+    db_existed_before_connect: bool,
+) -> Result<()> {
+    if !db_existed_before_connect {
+        return Ok(());
+    }
+    if !has_pending(pool).await? {
+        return Ok(());
+    }
+
+    let backup_path = db_path.with_extension("db.bak");
+    let temp_path = db_path.with_extension("db.bak.tmp");
+    let previous_path = db_path.with_extension("db.bak.previous");
+
+    // Recover an interrupted Windows replacement before producing a newer
+    // snapshot. The old backup is kept under this name until replacement ends.
+    if !backup_path.exists() && previous_path.exists() {
+        std::fs::rename(&previous_path, &backup_path)?;
+    }
+    if temp_path.exists() {
+        std::fs::remove_file(&temp_path)?;
+    }
+
+    let started = std::time::Instant::now();
+    sqlx::query("VACUUM INTO ?1")
+        .bind(temp_path.to_string_lossy().as_ref())
+        .execute(pool)
+        .await?;
+
+    replace_backup_file(&temp_path, &backup_path, &previous_path)?;
+    log::info!(
+        "[db] pre-migration backup: {} ({}ms)",
+        backup_path.display(),
+        started.elapsed().as_millis()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn replace_backup_file(temp_path: &std::path::Path, backup_path: &std::path::Path, _previous_path: &std::path::Path) -> Result<()> {
+    std::fs::rename(temp_path, backup_path)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn replace_backup_file(
+    temp_path: &std::path::Path,
+    backup_path: &std::path::Path,
+    previous_path: &std::path::Path,
+) -> Result<()> {
+    if previous_path.exists() {
+        std::fs::remove_file(previous_path)?;
+    }
+    let had_backup = backup_path.exists();
+    if had_backup {
+        std::fs::rename(backup_path, previous_path)?;
+    }
+
+    if let Err(error) = std::fs::rename(temp_path, backup_path) {
+        if had_backup {
+            if let Err(restore_error) = std::fs::rename(previous_path, backup_path) {
+                return Err(anyhow!(
+                    "replace backup failed ({error}); restoring previous backup failed ({restore_error})"
+                ));
+            }
+        }
+        return Err(error.into());
+    }
+
+    if had_backup {
+        std::fs::remove_file(previous_path)?;
+    }
+    Ok(())
+}
 
 /// Initialize the schema_version table (create if not exists, read current version).
 /// Handles migration from old `sqlx::migrate!` system (which used `_sqlx_migrations` table).
@@ -55,7 +139,10 @@ async fn get_current_version(pool: &SqlitePool) -> Result<i64> {
         // Map old migration count to new schema version
         // Old migrations: 0001_initial, 0002_schema_fix, 0003_config_json, 0004_default_admin, 0005_default_skip_auth
         // New system: v1=initial, v2=schema_fix, v3=config_json, v4=default_admin, v5=skip_auth
-        let new_version = std::cmp::min(old_count, TARGET_VERSION);
+        // Preserve the legacy mapping ceiling from when this migration path
+        // targeted v25. New local migrations must still run even if an old
+        // sqlx history contains more than 25 entries.
+        let new_version = std::cmp::min(old_count, 25);
         if new_version > 0 {
             set_version(pool, new_version).await?;
             log::info!(
@@ -139,6 +226,11 @@ async fn apply_migration(pool: &SqlitePool, version: i64) -> Result<()> {
         23 => migrate_v23(pool).await,
         24 => migrate_v24(pool).await,
         25 => migrate_v25(pool).await,
+        26 => migrate_v26(pool).await,
+        27 => migrate_v27(pool).await,
+        28 => migrate_v28(pool).await,
+        29 => migrate_v29(pool).await,
+        30 => migrate_v30(pool).await,
         _ => Err(anyhow!("Unknown migration version: {}", version)),
     }
 }
@@ -1422,6 +1514,174 @@ async fn migrate_v25(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+/// v25 -> v26: Create the FTS5 tables used by the search services.
+async fn migrate_v26(pool: &SqlitePool) -> Result<()> {
+    let statements = [
+        "CREATE VIRTUAL TABLE IF NOT EXISTS fts_servers USING fts5(ref_id UNINDEXED, zh, py, ini)",
+        "CREATE VIRTUAL TABLE IF NOT EXISTS fts_groups USING fts5(ref_id UNINDEXED, zh, py, ini)",
+        "CREATE VIRTUAL TABLE IF NOT EXISTS fts_rag_docs USING fts5(ref_id UNINDEXED, zh, py, ini)",
+        "CREATE VIRTUAL TABLE IF NOT EXISTS fts_skills USING fts5(ref_id UNINDEXED, zh, py, ini)",
+        "CREATE VIRTUAL TABLE IF NOT EXISTS fts_prompts USING fts5(ref_id UNINDEXED, zh, py, ini)",
+        "CREATE VIRTUAL TABLE IF NOT EXISTS fts_resources USING fts5(ref_id UNINDEXED, zh, py, ini)",
+        "CREATE VIRTUAL TABLE IF NOT EXISTS fts_app_log USING fts5(ref_id UNINDEXED, zh, py, ini)",
+    ];
+    for statement in statements {
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(pool)
+            .await
+            .map_err(|error| anyhow!("create FTS5 table failed: {error}"))?;
+    }
+    Ok(())
+}
+
+/// v26 -> v27: Backfill newly bundled agent choices without replacing the
+/// user's existing agent entries or their order.
+async fn migrate_v27(pool: &SqlitePool) -> Result<()> {
+    let row = sqlx::query("SELECT config_json FROM system_config WHERE id = 1")
+        .fetch_optional(pool)
+        .await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let raw_config: Option<String> = row.try_get("config_json")?;
+    let mut config = match raw_config {
+        Some(raw) => {
+            let value: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|error| {
+                    anyhow!("migration v27: invalid system_config.config_json: {error}")
+                })?;
+            if !value.is_object() {
+                return Err(anyhow!(
+                    "migration v27: system_config.config_json must be a JSON object"
+                ));
+            }
+            value
+        }
+        None => serde_json::json!({}),
+    };
+    if config.get("skills").is_some_and(|value| !value.is_object()) {
+        return Err(anyhow!("migration v27: system_config.config_json.skills must be an object"));
+    }
+    if config.get("skills").is_none() {
+        config["skills"] = serde_json::json!({});
+    }
+
+    let defaults = crate::services::skill_service::default_agents();
+    if config["skills"]
+        .get("agents")
+        .is_some_and(|value| !value.is_array())
+    {
+        return Err(anyhow!(
+            "migration v27: system_config.config_json.skills.agents must be an array"
+        ));
+    }
+    let mut agents = config["skills"]
+        .get("agents")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let present: std::collections::HashSet<String> = agents
+        .iter()
+        .filter_map(|agent| agent.get("id")?.as_str().map(str::to_owned))
+        .collect();
+    for default in &defaults {
+        if !present.contains(default.id.as_str()) {
+            agents.push(serde_json::to_value(default)?);
+        }
+    }
+    config["skills"]["agents"] = serde_json::Value::Array(agents);
+
+    let json = serde_json::to_string(&config)?;
+    sqlx::query(
+        "UPDATE system_config SET config_json = ?, updated_at = datetime('now', 'localtime') WHERE id = 1",
+    )
+    .bind(json)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// v27 -> v28: Persist keep-alive and passthrough-header server settings.
+async fn migrate_v28(pool: &SqlitePool) -> Result<()> {
+    add_column_if_missing(pool, "servers", "enable_keep_alive", "INTEGER").await?;
+    add_column_if_missing(pool, "servers", "keep_alive_interval", "INTEGER").await?;
+    add_column_if_missing(pool, "servers", "passthrough_headers", "TEXT").await?;
+    Ok(())
+}
+
+/// v28 -> v29: Retain every duplicate builtin record while making names
+/// unique. Renamed rows keep their ids and all other user data unchanged.
+async fn migrate_v29(pool: &SqlitePool) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    for (table, index) in [
+        ("builtin_prompts", "idx_builtin_prompts_name"),
+        ("builtin_resources", "idx_builtin_resources_name"),
+    ] {
+        let select_sql = format!("SELECT rowid, id, name FROM {table} ORDER BY name COLLATE BINARY, rowid");
+        let rows = sqlx::query(sqlx::AssertSqlSafe(&*select_sql))
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut seen = std::collections::HashSet::new();
+        for row in rows {
+            let rowid: i64 = row.try_get("rowid")?;
+            let id: String = row.try_get("id")?;
+            let name: String = row.try_get("name")?;
+            if seen.insert(name.clone()) {
+                continue;
+            }
+
+            let mut suffix = 0_u32;
+            let unique_name = loop {
+                let candidate = if suffix == 0 {
+                    format!("{name} [legacy duplicate {id}]")
+                } else {
+                    format!("{name} [legacy duplicate {id}-{suffix}]")
+                };
+                let check_sql = format!("SELECT COUNT(*) FROM {table} WHERE name = ?");
+                let collision: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(&*check_sql))
+                    .bind(&candidate)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                if collision == 0 {
+                    break candidate;
+                }
+                suffix += 1;
+            };
+
+            let update_sql = format!("UPDATE {table} SET name = ? WHERE rowid = ?");
+            sqlx::query(sqlx::AssertSqlSafe(&*update_sql))
+                .bind(unique_name)
+                .bind(rowid)
+                .execute(&mut *tx)
+                .await?;
+            log::warn!("[db] migration v29 renamed duplicate {table} name for row {id}");
+        }
+
+        let drop_index_sql = format!("DROP INDEX IF EXISTS {index}");
+        sqlx::query(sqlx::AssertSqlSafe(&*drop_index_sql))
+            .execute(&mut *tx)
+            .await?;
+        let index_sql = format!("CREATE UNIQUE INDEX {index} ON {table}(name)");
+        sqlx::query(sqlx::AssertSqlSafe(&*index_sql))
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// v29 -> v30: Add the per-server-tool pin setting used by Smart Routing.
+async fn migrate_v30(pool: &SqlitePool) -> Result<()> {
+    add_column_if_missing(
+        pool,
+        "server_tool_config",
+        "pinned",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    Ok(())
+}
+
 /// 幂等建索引，且目标列不存在时跳过（不报错）。
 ///
 /// 与无条件 `CREATE INDEX` 的区别：历史上有过多个 schema 路径（旧 sqlx 迁移
@@ -1464,13 +1724,374 @@ async fn create_index_if_column_exists(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::{path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+
+    async fn memory_pool() -> Result<SqlitePool> {
+        let options = SqliteConnectOptions::new()
+            .filename(":memory:")
+            .statement_cache_capacity(0);
+        Ok(SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?)
+    }
+
+    async fn migrate_through(pool: &SqlitePool, target: i64) -> Result<()> {
+        get_current_version(pool).await?;
+        for version in 1..=target {
+            apply_migration(pool, version).await?;
+            set_version(pool, version).await?;
+        }
+        Ok(())
+    }
+
+    async fn seed_v25_records(pool: &SqlitePool) -> Result<()> {
+        sqlx::query("INSERT INTO servers (id, name) VALUES ('server-1', 'fixture-server')")
+            .execute(pool)
+            .await?;
+        sqlx::query("INSERT INTO rag_tags (tag, file_count, created_at) VALUES ('fixture-tag', 1, '123')")
+            .execute(pool)
+            .await?;
+        sqlx::query("INSERT INTO rag_doc_tags (doc_id, tag) VALUES ('doc-1', 'fixture-tag')")
+            .execute(pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO bearer_keys (id, name, token, enabled, access_type, allowed_groups, allowed_servers)
+             VALUES ('key-1', 'fixture-key', 'fixture-secret-token', 1, 'all', '[]', '[]')",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "UPDATE system_config SET config_json = ? WHERE id = 1",
+        )
+        .bind(r#"{"smartRouting":{"enabled":true},"skills":{"agents":[{"id":"custom-agent","name":"Custom"}]}}"#)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO builtin_prompts (id, name, title, template) VALUES
+             ('prompt-1', 'duplicate-prompt', 'Prompt one', 'template one'),
+             ('prompt-2', 'duplicate-prompt', 'Prompt two', 'template two')",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO builtin_resources (id, uri, name, content) VALUES
+             ('resource-1', 'fixture://one', 'duplicate-resource', 'content one'),
+             ('resource-2', 'fixture://two', 'duplicate-resource', 'content two')",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO server_tool_config (id, server_name, item_type, item_name)
+             VALUES ('tool-config-1', 'fixture-server', 'tool', 'fixture-tool')",
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    struct TestDbFiles(PathBuf);
+
+    impl TestDbFiles {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos();
+            Self(std::env::temp_dir().join(format!(
+                "mcphub-migration-{}-{nonce}.db",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl Drop for TestDbFiles {
+        fn drop(&mut self) {
+            for path in [
+                self.0.clone(),
+                self.0.with_extension("db-wal"),
+                self.0.with_extension("db-shm"),
+                self.0.with_extension("db.bak"),
+                self.0.with_extension("db.bak.tmp"),
+                self.0.with_extension("db.bak.previous"),
+            ] {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_database_applies_all_local_migrations_and_is_idempotent() {
+        let pool = memory_pool()
+            .await
+            .expect("connect in-memory sqlite");
+
+        run_pending(&pool).await.expect("migrate fresh database");
+        let version: i64 = sqlx::query_scalar("SELECT version FROM schema_version WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("read schema version");
+        assert_eq!(version, 30);
+
+        for table in [
+            "fts_servers", "fts_groups", "fts_rag_docs", "fts_skills", "fts_prompts",
+            "fts_resources", "fts_app_log",
+        ] {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .expect("check FTS table");
+            assert_eq!(count, 1, "missing FTS table {table}");
+        }
+
+        run_pending(&pool).await.expect("rerun migrations idempotently");
+        let version_after: i64 = sqlx::query_scalar("SELECT version FROM schema_version WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("read schema version after rerun");
+        assert_eq!(version_after, version);
+    }
+
+    #[tokio::test]
+    async fn legacy_sqlx_count_cannot_skip_local_migrations_after_v25() -> Result<()> {
+        let pool = memory_pool().await?;
+        migrate_through(&pool, 25).await?;
+        sqlx::query("DROP TABLE schema_version").execute(&pool).await?;
+        sqlx::query("CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY)")
+            .execute(&pool)
+            .await?;
+        for version in 1..=30_i64 {
+            sqlx::query("INSERT INTO _sqlx_migrations (version) VALUES (?)")
+                .bind(version)
+                .execute(&pool)
+                .await?;
+        }
+
+        assert_eq!(get_current_version(&pool).await?, 25);
+        run_pending(&pool).await?;
+        assert_eq!(get_current_version(&pool).await?, 30);
+        let fts_table_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'fts_rag_docs'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(fts_table_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v25_upgrade_preserves_records_and_renames_duplicate_builtin_rows() -> Result<()> {
+        let pool = memory_pool()
+            .await
+            .expect("connect in-memory sqlite");
+        migrate_through(&pool, 25).await.expect("build local v25 schema");
+        seed_v25_records(&pool).await.expect("seed v25 user records");
+
+        run_pending(&pool).await.expect("upgrade populated v25 database");
+        run_pending(&pool).await.expect("rerun upgrade idempotently");
+
+        let server_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM servers WHERE id = 'server-1'")
+            .fetch_one(&pool).await?;
+        assert_eq!(server_count, 1);
+        let tag_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rag_tags WHERE tag = 'fixture-tag'")
+            .fetch_one(&pool).await?;
+        assert_eq!(tag_count, 1);
+        let token: String = sqlx::query_scalar("SELECT token FROM bearer_keys WHERE id = 'key-1'")
+            .fetch_one(&pool).await?;
+        assert_eq!(token, "fixture-secret-token");
+
+        let config: String = sqlx::query_scalar("SELECT config_json FROM system_config WHERE id = 1")
+            .fetch_one(&pool).await?;
+        let config: serde_json::Value = serde_json::from_str(&config)?;
+        assert_eq!(config["smartRouting"]["enabled"], true);
+        assert_eq!(config["skills"]["agents"][0]["id"], "custom-agent");
+
+        for (table, expected_ids) in [
+            ("builtin_prompts", vec!["prompt-1", "prompt-2"]),
+            ("builtin_resources", vec!["resource-1", "resource-2"]),
+        ] {
+            let sql = format!("SELECT id, name FROM {table} ORDER BY id");
+            let rows = sqlx::query(sqlx::AssertSqlSafe(&*sql)).fetch_all(&pool).await?;
+            assert_eq!(rows.len(), 2, "migration must retain all {table} rows");
+            let ids: Vec<String> = rows.iter().map(|row| row.try_get("id")).collect::<std::result::Result<_, _>>()?;
+            assert_eq!(
+                ids,
+                expected_ids
+                    .iter()
+                    .map(|id| (*id).to_owned())
+                    .collect::<Vec<_>>()
+            );
+            let names: Vec<String> = rows.iter().map(|row| row.try_get("name")).collect::<std::result::Result<_, _>>()?;
+            assert_ne!(names[0], names[1], "duplicate names must be made explicit");
+            assert!(names[1].contains(expected_ids[1]), "renamed row should identify its original record");
+            match table {
+                "builtin_prompts" => {
+                    let templates: Vec<String> = sqlx::query_scalar(
+                        "SELECT template FROM builtin_prompts ORDER BY id",
+                    ).fetch_all(&pool).await?;
+                    assert_eq!(templates, ["template one", "template two"]);
+                    assert!(sqlx::query(
+                        "INSERT INTO builtin_prompts (id, name, template) VALUES ('prompt-3', ?, '')",
+                    ).bind(&names[0]).execute(&pool).await.is_err());
+                }
+                "builtin_resources" => {
+                    let contents: Vec<String> = sqlx::query_scalar(
+                        "SELECT content FROM builtin_resources ORDER BY id",
+                    ).fetch_all(&pool).await?;
+                    assert_eq!(contents, ["content one", "content two"]);
+                    assert!(sqlx::query(
+                        "INSERT INTO builtin_resources (id, uri, name, content) VALUES ('resource-3', 'fixture://three', ?, '')",
+                    ).bind(&names[0]).execute(&pool).await.is_err());
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let pinned: i64 = sqlx::query_scalar(
+            "SELECT pinned FROM server_tool_config WHERE id = 'tool-config-1'",
+        ).fetch_one(&pool).await?;
+        assert_eq!(pinned, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pre_migration_backup_is_consistent_and_not_overwritten_after_upgrade() -> Result<()> {
+        let files = TestDbFiles::new();
+        let options = SqliteConnectOptions::new()
+            .filename(&files.0)
+            .create_if_missing(true)
+            .statement_cache_capacity(0);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        migrate_through(&pool, 25).await?;
+        seed_v25_records(&pool).await?;
+
+        backup_before_migration(&pool, &files.0, true).await?;
+        let backup_path = files.0.with_extension("db.bak");
+        assert!(backup_path.is_file(), "pre-migration snapshot should exist");
+        let backup_options = SqliteConnectOptions::new()
+            .filename(&backup_path)
+            .read_only(true)
+            .statement_cache_capacity(0);
+        let backup = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(backup_options)
+            .await?;
+        let backup_version: i64 = sqlx::query_scalar("SELECT version FROM schema_version WHERE id = 1")
+            .fetch_one(&backup)
+            .await?;
+        let backup_server_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM servers WHERE id = 'server-1'")
+            .fetch_one(&backup)
+            .await?;
+        assert_eq!(backup_version, 25);
+        assert_eq!(backup_server_count, 1);
+
+        run_pending(&pool).await?;
+        backup_before_migration(&pool, &files.0, true).await?;
+        let backup_version_after: i64 = sqlx::query_scalar("SELECT version FROM schema_version WHERE id = 1")
+            .fetch_one(&backup)
+            .await?;
+        assert_eq!(backup_version_after, 25, "up-to-date startup must not replace the snapshot");
+        backup.close().await;
+        pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_run_does_not_create_an_empty_backup() -> Result<()> {
+        let files = TestDbFiles::new();
+        let options = SqliteConnectOptions::new()
+            .filename(&files.0)
+            .create_if_missing(true)
+            .statement_cache_capacity(0);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+
+        backup_before_migration(&pool, &files.0, false).await?;
+        assert!(!files.0.with_extension("db.bak").exists());
+        pool.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v27_rejects_malformed_config_without_overwriting_it() -> Result<()> {
+        let pool = memory_pool().await?;
+        sqlx::query("CREATE TABLE system_config (id INTEGER PRIMARY KEY, config_json TEXT, updated_at TEXT)")
+            .execute(&pool)
+            .await?;
+
+        for raw in [
+            "{not-json",
+            "[]",
+            r#"{"skills":null}"#,
+            r#"{"skills":[]}"#,
+            r#"{"skills":{"agents":null}}"#,
+            r#"{"skills":{"agents":{}}}"#,
+        ] {
+            sqlx::query("INSERT OR REPLACE INTO system_config (id, config_json) VALUES (1, ?)")
+                .bind(raw)
+                .execute(&pool)
+                .await?;
+
+            assert!(migrate_v27(&pool).await.is_err(), "must reject {raw}");
+            let actual: String = sqlx::query_scalar(
+                "SELECT config_json FROM system_config WHERE id = 1",
+            )
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(actual, raw, "failed migration must preserve original JSON");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v27_fills_missing_null_config_without_discarding_other_fields() -> Result<()> {
+        let pool = memory_pool().await?;
+        sqlx::query("CREATE TABLE system_config (id INTEGER PRIMARY KEY, config_json TEXT, updated_at TEXT)")
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO system_config (id, config_json) VALUES (1, NULL)")
+            .execute(&pool)
+            .await?;
+
+        migrate_v27(&pool).await?;
+        let raw: String = sqlx::query_scalar(
+            "SELECT config_json FROM system_config WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let config: serde_json::Value = serde_json::from_str(&raw)?;
+        assert!(config["skills"]["agents"].is_array());
+
+        sqlx::query("UPDATE system_config SET config_json = ? WHERE id = 1")
+            .bind(r#"{"custom":{"keep":true},"skills":{}}"#)
+            .execute(&pool)
+            .await?;
+        migrate_v27(&pool).await?;
+        let raw: String = sqlx::query_scalar(
+            "SELECT config_json FROM system_config WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await?;
+        let config: serde_json::Value = serde_json::from_str(&raw)?;
+        assert_eq!(config["custom"]["keep"], true);
+        assert!(config["skills"]["agents"].is_array());
+        Ok(())
+    }
 
     /// v23 迁移在全新库上应建出三张 RAG 表 + 全部查询索引，且版本号推进到
     /// TARGET_VERSION；重跑（run_pending 二次调用）应为幂等 no-op。
     #[tokio::test]
     async fn v23_creates_rag_tables_and_indexes() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .connect("sqlite::memory:")
+        let pool = memory_pool()
             .await
             .expect("connect in-memory sqlite");
 
@@ -1585,8 +2206,7 @@ mod tests {
     /// fatal。列守卫后应只 warn 跳过。
     #[tokio::test]
     async fn v25_skips_indexes_on_missing_columns() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .connect("sqlite::memory:")
+        let pool = memory_pool()
             .await
             .expect("connect in-memory sqlite");
         run_pending(&pool).await.expect("run migrations to v25");
@@ -1683,8 +2303,7 @@ mod tests {
     /// 它们执行的 SQL 语义本身。）
     #[tokio::test]
     async fn tag_count_semantics_decrement_to_zero_deletes() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .connect("sqlite::memory:")
+        let pool = memory_pool()
             .await
             .expect("connect in-memory sqlite");
         run_pending(&pool).await.expect("run migrations");
@@ -1749,8 +2368,7 @@ mod tests {
 
     #[tokio::test]
     async fn v20_preserves_existing_current_bearer_keys() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .connect("sqlite::memory:")
+        let pool = memory_pool()
             .await
             .expect("connect in-memory sqlite");
 
@@ -1791,8 +2409,7 @@ mod tests {
 
     #[tokio::test]
     async fn v20_rolls_back_partial_schema_repair_on_invalid_rows() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .connect("sqlite::memory:")
+        let pool = memory_pool()
             .await
             .expect("connect in-memory sqlite");
 

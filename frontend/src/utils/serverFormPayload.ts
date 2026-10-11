@@ -53,6 +53,13 @@ const buildOptions = (options?: ServerFormData['options']) => {
     nextOptions.maxTotalTimeout = options.maxTotalTimeout;
   }
 
+  if (options?.maxBufferSize !== undefined) {
+    if (!Number.isSafeInteger(options.maxBufferSize) || options.maxBufferSize <= 0) {
+      throw new Error('options.maxBufferSize must be a positive safe integer in bytes');
+    }
+    nextOptions.maxBufferSize = options.maxBufferSize;
+  }
+
   return nextOptions;
 };
 
@@ -64,6 +71,9 @@ const buildOAuthConfig = (
   }
 
   const nextOAuth: Partial<NonNullable<ServerConfig['oauth']>> = {};
+  if (oauth.allowInsecureTokenEndpoint !== undefined) {
+    nextOAuth.allowInsecureTokenEndpoint = oauth.allowInsecureTokenEndpoint;
+  }
   const clientId = oauth.clientId?.trim();
   const clientSecret = oauth.clientSecret?.trim();
   const scopes = oauth.scopes?.trim();
@@ -90,6 +100,20 @@ const buildOAuthConfig = (
   if (authorizationEndpoint) nextOAuth.authorizationEndpoint = authorizationEndpoint;
   if (tokenEndpoint) nextOAuth.tokenEndpoint = tokenEndpoint;
   if (resource) nextOAuth.resource = resource;
+
+  // Faithful pass-through of the non-editable OAuth sub-fields: the
+  // `dynamicRegistration` sub-object (RFC7591) plus `revocationEndpoint`
+  // (RFC 7009) and `redirectUri`. They are never rendered in the form, only
+  // round-tripped, so a faithful re-emission survives persistence (#1193).
+  if (oauth.dynamicRegistration) {
+    nextOAuth.dynamicRegistration = oauth.dynamicRegistration;
+  }
+  if (oauth.revocationEndpoint) {
+    nextOAuth.revocationEndpoint = oauth.revocationEndpoint;
+  }
+  if (oauth.redirectUri) {
+    nextOAuth.redirectUri = oauth.redirectUri;
+  }
 
   return nextOAuth;
 };
@@ -180,8 +204,11 @@ export const buildServerPayload = ({
     config.env = env;
   }
 
-  // Per-session client isolation applies to any server type.
-  config.perSessionClient = formData.perSessionClient === true ? true : undefined;
+  // Per-session client isolation applies to any server type — except openapi,
+  // where the form renders no checkbox (a stored true would be unremovable
+  // from the UI, so it is dropped on save).
+  config.perSessionClient =
+    serverType !== 'openapi' && formData.perSessionClient === true ? true : undefined;
   // On-demand spawning (stdio only): only set when enabled, scoped to stdio servers
   if (serverType === 'stdio') {
     config.startOnDemand = formData.startOnDemand === true ? true : undefined;

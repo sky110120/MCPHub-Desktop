@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { emit } from '@tauri-apps/api/event';
@@ -14,13 +14,16 @@ import { PERMISSIONS } from '@/constants/permissions';
 import { isTauri } from '@/utils/tauriClient';
 import { buildMcpClientConfig, mcpConfigUsesTokenPlaceholder } from '@/utils/mcpConfig';
 import { invoke } from '@tauri-apps/api/core';
-import { Copy, Check, Download, Edit, Trash2, Code as CodeIcon, Zap, Database, Wrench, Sparkles, RefreshCw, Route as RouteIcon, Key, Lock, Cloud, SlidersHorizontal, ShieldCheck, Package, KeyRound, FileDown, X, FileText } from 'lucide-react';
+import { Copy, Check, Download, Edit, Trash2, Code as CodeIcon, Zap, Database, Wrench, Sparkles, RefreshCw, Route as RouteIcon, Key, Lock, Cloud, SlidersHorizontal, ShieldCheck, Package, KeyRound, FileDown, X, FileText, Loader2 } from 'lucide-react';
 import { EndpointCopy, copyText } from '@/components/ui/EndpointCopy';
 import type { BearerKey, User } from '@/types';
 import { useServerContext } from '@/contexts/ServerContext';
 import { useGroupData } from '@/hooks/useGroupData';
 import { useAuth } from '@/contexts/AuthContext';
 import ConfirmDialog from '@/components/ui/ConfirmDialog';
+import SmartRoutingIndexPanel from '@/components/SmartRoutingIndexPanel';
+import ModelVectorSettings from '@/components/ModelVectorSettings';
+import { reindexSmartRouting } from '@/services/smartRoutingService';
 import { apiGet, apiPost, apiPut } from '@/utils/fetchInterceptor';
 import {
   filterBearerKeysByScopeFilter,
@@ -33,11 +36,7 @@ interface BearerKeyRowProps {
   loading: boolean;
   availableServers: { value: string; label: string }[];
   availableGroups: { value: string; label: string }[];
-  searchGroups: (
-    searchKey: string,
-    page: number,
-    pageSize: number,
-  ) => Promise<{ items: { value: string; label: string }[]; total: number }>;
+  groupSearchFn: (searchKey: string, page: number, pageSize: number) => Promise<{ items: { value: string; label: string }[]; total: number }>;
   isAdmin: boolean;
   onSave: (
     id: string,
@@ -57,7 +56,7 @@ const BearerKeyRow: React.FC<BearerKeyRowProps> = ({
   loading,
   availableServers,
   availableGroups,
-  searchGroups: searchGroupsFn,
+  groupSearchFn,
   isAdmin,
   onSave,
   onDelete,
@@ -117,6 +116,10 @@ const BearerKeyRow: React.FC<BearerKeyRowProps> = ({
         allowedServers: selectedServers.join(', '),
       });
       setIsEditing(false);
+    } catch {
+      // handleSaveExistingBearerKey throws on failure to KEEP the editor open;
+      // the error toast is already shown by the hook — swallow the rejection
+      // here so the click handler doesn't raise an unhandled rejection.
     } finally {
       setSaving(false);
     }
@@ -248,7 +251,7 @@ const BearerKeyRow: React.FC<BearerKeyRowProps> = ({
                     options={isGroupsMode ? availableGroups : availableServers}
                     selected={isGroupsMode ? selectedGroups : selectedServers}
                     onChange={isGroupsMode ? setSelectedGroups : setSelectedServers}
-                    searchFn={isGroupsMode ? searchGroupsFn : undefined}
+                    searchFn={isGroupsMode ? groupSearchFn : undefined}
                     placeholder={
                       isGroupsMode
                         ? t('settings.selectGroups') || 'Select groups...'
@@ -270,7 +273,7 @@ const BearerKeyRow: React.FC<BearerKeyRowProps> = ({
                       options={availableGroups}
                       selected={selectedGroups}
                       onChange={setSelectedGroups}
-                      searchFn={searchGroupsFn}
+                      searchFn={groupSearchFn}
                       placeholder={t('settings.selectGroups') || 'Select groups...'}
                       disabled={loading}
                     />
@@ -395,6 +398,53 @@ function getDefaultTokenLimitForUI(model: string): number {
   return 512;
 }
 
+type EmbeddingProviderPresetId = 'openai' | 'openrouter' | 'siliconflow' | 'gemini' | 'custom';
+
+const EMBEDDING_PROVIDER_PRESETS: Record<
+  EmbeddingProviderPresetId,
+  { baseUrl?: string; model?: string }
+> = {
+  openai: {
+    baseUrl: 'https://api.openai.com/v1',
+    model: 'text-embedding-3-small',
+  },
+  openrouter: {
+    baseUrl: 'https://openrouter.ai/api/v1',
+    model: 'baai/bge-m3',
+  },
+  siliconflow: {
+    baseUrl: 'https://api.siliconflow.cn/v1',
+    model: 'BAAI/bge-m3',
+  },
+  gemini: {
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    model: 'gemini-embedding-001',
+  },
+  custom: {},
+};
+
+function getEmbeddingProviderPresetId(
+  baseUrl: string,
+  model: string,
+): EmbeddingProviderPresetId {
+  const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, '').toLowerCase();
+  const normalizedModel = model.trim().toLowerCase();
+
+  for (const [id, preset] of Object.entries(EMBEDDING_PROVIDER_PRESETS) as Array<
+    [EmbeddingProviderPresetId, (typeof EMBEDDING_PROVIDER_PRESETS)[EmbeddingProviderPresetId]]
+  >) {
+    if (
+      id !== 'custom' &&
+      normalizedBaseUrl === preset.baseUrl?.replace(/\/+$/, '').toLowerCase() &&
+      normalizedModel === preset.model?.toLowerCase()
+    ) {
+      return id;
+    }
+  }
+
+  return 'custom';
+}
+
 /**
  * Parses embeddingMaxTokens from form input string.
  * Returns the parsed value if it differs from current value, otherwise undefined (no update needed).
@@ -413,6 +463,61 @@ function parseEmbeddingMaxTokensForUpdate(
   return result !== current ? result : undefined;
 }
 
+function parseEmbeddingDimensionsForUpdate(
+  rawValue: string,
+  currentValue: number | null | undefined,
+): number | null | undefined {
+  const trimmed = rawValue.trim();
+  if (!trimmed) {
+    return currentValue == null ? undefined : null;
+  }
+
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    return undefined;
+  }
+
+  return parsed !== currentValue ? parsed : undefined;
+}
+
+/**
+ * Parses an optional search setting (similarity threshold, full-schema top N).
+ * Empty clears it back to the default (null), a value `parse` accepts is sent
+ * as a number, and anything else or an unchanged value sends nothing.
+ */
+function parseOptionalSearchSettingForUpdate(
+  rawValue: string,
+  currentValue: number | null | undefined,
+  parse: (value: number) => boolean,
+): number | null | undefined {
+  const trimmed = rawValue.trim();
+  if (!trimmed) {
+    return currentValue == null ? undefined : null;
+  }
+
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || !parse(parsed)) {
+    return undefined;
+  }
+
+  return parsed !== currentValue ? parsed : undefined;
+}
+
+const isSimilarityThreshold = (value: number) => value >= 0 && value <= 1;
+const isFullSchemaTopN = (value: number) => Number.isInteger(value) && value >= 0;
+// Mirrors TOOL_DEFINITION_FIELDS / DEFAULT_TOOL_DEFINITION_FIELDS in
+// origin src/constants/smartRoutingDefaults.ts (origin #1286; the desktop
+// smart_routing backend consumes the same key).
+const TOOL_DEFINITION_FIELDS = [
+  'title',
+  'annotations',
+  'outputSchema',
+  'execution',
+  'icons',
+  '_meta',
+] as const;
+const DEFAULT_TOOL_DEFINITION_FIELDS: readonly string[] = ['title', 'annotations'];
+
 function parseBasePacingDelayForUpdate(
   rawValue: string,
   currentValue: number | null | undefined,
@@ -425,6 +530,56 @@ function parseBasePacingDelayForUpdate(
 }
 
 const DEFAULT_OIDC_SCOPES = ['openid', 'profile', 'email'];
+
+/** Slider + editable number input (mirrors RAG SearchSettingsDialog sliders).
+ *  Used by the Smart Routing retrieval settings on desktop. */
+const SrSlider: React.FC<{
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  disabled?: boolean;
+  onChange: (v: number) => void;
+}> = ({ label, value, min, max, step, disabled = false, onChange }) => {
+  const disabledStyle = disabled ? { opacity: 0.5, cursor: 'not-allowed' } : {};
+  const decimals = step < 1 ? 2 : 0;
+  return (
+    <div style={disabledStyle}>
+      <div className="flex items-center justify-between mb-1 gap-2">
+        <label className="text-[13px] font-medium" style={{ color: 'var(--hub-ink)' }}>
+          {label}
+        </label>
+        <input
+          type="number"
+          min={min}
+          max={max}
+          step={step}
+          value={value.toFixed(decimals)}
+          onChange={(e) => {
+            const v = parseFloat(e.target.value);
+            if (Number.isNaN(v)) return;
+            onChange(Math.max(min, Math.min(max, v)));
+          }}
+          disabled={disabled}
+          className="hub-mono text-[12px] text-right"
+          style={{ width: 72, background: 'var(--hub-bg-2)', color: 'var(--hub-ink)' }}
+        />
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        disabled={disabled}
+        className="w-full"
+        style={{ accentColor: 'var(--hub-accent)' }}
+      />
+    </div>
+  );
+};
 
 const SettingsPage: React.FC = () => {
   const { t } = useTranslation();
@@ -449,10 +604,13 @@ const SettingsPage: React.FC = () => {
     dbUrl: string;
     basePacingDelayMs: string;
     embeddingProvider: 'openai' | 'azure_openai';
+    embeddingProviderPreset: EmbeddingProviderPresetId;
     embeddingEncodingFormat: 'auto' | 'base64' | 'float';
-    openaiApiBaseUrl: string;
-    openaiApiKey: string;
-    openaiApiEmbeddingModel: string;
+    embeddingDimensions: string;
+    embeddingDimensionsApiPassthrough: boolean;
+    llmProviderBaseUrl: string;
+    llmProviderApiKey: string;
+    embeddingModel: string;
     azureOpenaiEndpoint: string;
     azureOpenaiApiKey: string;
     azureOpenaiApiVersion: string;
@@ -460,20 +618,44 @@ const SettingsPage: React.FC = () => {
     azureOpenaiEmbeddingModel: string;
     // Empty string = use model default; numeric string = explicit override
     embeddingMaxTokens: string;
+    embeddingQueryPrefix: string;
+    embeddingDocumentPrefix: string;
+    // Empty string = default (query heuristic / every hit in full)
+    similarityThreshold: string;
+    fullSchemaTopN: string;
+    // Origin #1286: undefined = server default (title, annotations)
+    toolDefinitionFields?: string[];
+    // Desktop local mode: hybrid retrieval settings (temp strings parsed on save)
+    vectorWeight: string;
+    keywordWeight: string;
+    maxResults: string;
+    scoreThreshold: string;
   }>({
     dbUrl: '',
     basePacingDelayMs: '',
     embeddingProvider: 'openai',
+    embeddingProviderPreset: 'openai',
     embeddingEncodingFormat: 'auto',
-    openaiApiBaseUrl: '',
-    openaiApiKey: '',
-    openaiApiEmbeddingModel: '',
+    embeddingDimensions: '',
+    embeddingDimensionsApiPassthrough: false,
+    llmProviderBaseUrl: '',
+    llmProviderApiKey: '',
+    embeddingModel: '',
     azureOpenaiEndpoint: '',
     azureOpenaiApiKey: '',
     azureOpenaiApiVersion: '2024-02-15-preview',
     azureOpenaiEmbeddingDeployment: '',
     azureOpenaiEmbeddingModel: '',
     embeddingMaxTokens: '',
+    embeddingQueryPrefix: '',
+    embeddingDocumentPrefix: '',
+    similarityThreshold: '',
+    fullSchemaTopN: '',
+    toolDefinitionFields: undefined,
+    vectorWeight: '0.5',
+    keywordWeight: '0.5',
+    maxResults: '20',
+    scoreThreshold: '0.5',
   });
 
   const [tempToolResultCompressionConfig, setTempToolResultCompressionConfig] = useState<{
@@ -504,12 +686,14 @@ const SettingsPage: React.FC = () => {
     authorizationCodeLifetime: string;
     allowedScopes: string;
     dynamicRegistrationAllowedGrantTypes: string;
+    dynamicRegistrationClientTtl: string;
   }>({
     accessTokenLifetime: '3600',
     refreshTokenLifetime: '1209600',
     authorizationCodeLifetime: '300',
     allowedScopes: 'read, write',
     dynamicRegistrationAllowedGrantTypes: 'authorization_code, refresh_token',
+    dynamicRegistrationClientTtl: '2592000',
   });
 
   const [tempBetterAuthConfig, setTempBetterAuthConfig] = useState<{
@@ -573,6 +757,25 @@ const SettingsPage: React.FC = () => {
     refreshBearerKeys,
   } = useSettingsData();
 
+  // Smart routing resolves env vars first, so a value typed here can be shadowed
+  // without any visible change: the form shows the key you just pasted while the
+  // runtime keeps calling the provider with a stale OPENAI_API_KEY from .env, and
+  // the only symptom is a 401 far away in the logs (issue #642). The API reports
+  // which fields are in that state, so say it next to the input.
+  const renderEnvOverrideWarning = (field: string) => {
+    const envVar = smartRoutingConfig.envOverriddenFields?.find(
+      (entry) => entry.field === field,
+    )?.envVar;
+    if (!envVar) {
+      return null;
+    }
+    return (
+      <p className="mt-2 text-xs text-amber-700 dark:text-amber-400">
+        {t('settings.smartRoutingEnvOverrideWarning', { envVar })}
+      </p>
+    );
+  };
+
   // Desktop access base URL: in Tauri mode the service port is `routingConfig.httpPort`
   // (install.baseUrl is hidden in the desktop client - see the install section - the
   // port is configured in route config). Derive the URL from httpPort so every
@@ -594,9 +797,16 @@ const SettingsPage: React.FC = () => {
     }
   }, [savedInstallConfig]);
 
+  // Drafts typed into tempSmartRoutingConfig must survive immediate-write
+  // toggles in the same section (progressiveDisclosure etc.): updating the
+  // saved object re-fires this effect, and an unconditional rebuild would
+  // silently discard unsaved edits. Skip the rebuild while dirty; the Save
+  // handler clears the flag (saved == temp then, so the next rebuild is a
+  // no-op anyway).
+  const smartRoutingDirtyRef = useRef(false);
   // Update local tempSmartRoutingConfig when smartRoutingConfig changes
   useEffect(() => {
-    if (smartRoutingConfig) {
+    if (smartRoutingConfig && !smartRoutingDirtyRef.current) {
       setTempSmartRoutingConfig({
         dbUrl: smartRoutingConfig.dbUrl || '',
         basePacingDelayMs:
@@ -605,15 +815,25 @@ const SettingsPage: React.FC = () => {
             : '',
         embeddingProvider:
           smartRoutingConfig.embeddingProvider === 'azure_openai' ? 'azure_openai' : 'openai',
+        embeddingProviderPreset: getEmbeddingProviderPresetId(
+          smartRoutingConfig.llmProviderBaseUrl || '',
+          smartRoutingConfig.embeddingModel || '',
+        ),
         embeddingEncodingFormat:
           smartRoutingConfig.embeddingEncodingFormat === 'base64'
             ? 'base64'
             : smartRoutingConfig.embeddingEncodingFormat === 'float'
               ? 'float'
               : 'auto',
-        openaiApiBaseUrl: smartRoutingConfig.openaiApiBaseUrl || '',
-        openaiApiKey: smartRoutingConfig.openaiApiKey || '',
-        openaiApiEmbeddingModel: smartRoutingConfig.openaiApiEmbeddingModel || '',
+        embeddingDimensions:
+          smartRoutingConfig.embeddingDimensions != null
+            ? String(smartRoutingConfig.embeddingDimensions)
+            : '',
+        embeddingDimensionsApiPassthrough:
+          smartRoutingConfig.embeddingDimensionsApiPassthrough,
+        llmProviderBaseUrl: smartRoutingConfig.llmProviderBaseUrl || '',
+        llmProviderApiKey: smartRoutingConfig.llmProviderApiKey || '',
+        embeddingModel: smartRoutingConfig.embeddingModel || '',
         azureOpenaiEndpoint: smartRoutingConfig.azureOpenaiEndpoint || '',
         azureOpenaiApiKey: smartRoutingConfig.azureOpenaiApiKey || '',
         azureOpenaiApiVersion: smartRoutingConfig.azureOpenaiApiVersion || '2024-02-15-preview',
@@ -623,6 +843,29 @@ const SettingsPage: React.FC = () => {
           smartRoutingConfig.embeddingMaxTokens != null
             ? String(smartRoutingConfig.embeddingMaxTokens)
             : '',
+        embeddingQueryPrefix: smartRoutingConfig.embeddingQueryPrefix || '',
+        embeddingDocumentPrefix: smartRoutingConfig.embeddingDocumentPrefix || '',
+        similarityThreshold:
+          smartRoutingConfig.similarityThreshold != null
+            ? String(smartRoutingConfig.similarityThreshold)
+            : '',
+        fullSchemaTopN:
+          smartRoutingConfig.fullSchemaTopN != null
+            ? String(smartRoutingConfig.fullSchemaTopN)
+            : '',
+        toolDefinitionFields: smartRoutingConfig.toolDefinitionFields,
+        vectorWeight:
+          smartRoutingConfig.vectorWeight != null ? String(smartRoutingConfig.vectorWeight) : '0.5',
+        keywordWeight:
+          smartRoutingConfig.keywordWeight != null
+            ? String(smartRoutingConfig.keywordWeight)
+            : '0.5',
+        maxResults:
+          smartRoutingConfig.maxResults != null ? String(smartRoutingConfig.maxResults) : '20',
+        scoreThreshold:
+          smartRoutingConfig.scoreThreshold != null
+            ? String(smartRoutingConfig.scoreThreshold)
+            : '0.5',
       });
     }
   }, [smartRoutingConfig]);
@@ -672,6 +915,10 @@ const SettingsPage: React.FC = () => {
           ?.allowedGrantTypes?.length
           ? oauthServerConfig.dynamicRegistration.allowedGrantTypes.join(', ')
           : '',
+        dynamicRegistrationClientTtl:
+          oauthServerConfig.dynamicRegistration?.clientTtl !== undefined
+            ? String(oauthServerConfig.dynamicRegistration.clientTtl)
+            : '',
       });
     }
   }, [oauthServerConfig]);
@@ -766,6 +1013,16 @@ const SettingsPage: React.FC = () => {
     }));
   };
 
+  // Draft state for the HTTP port input: commit on blur instead of per
+  // keystroke (per-keystroke commits flipped global loading + toasts and
+  // bounced an intentionally-empty input back to the default).
+  const [httpPortDraft, setHttpPortDraft] = useState(
+    String(routingConfig?.httpPort ?? 23333),
+  );
+  useEffect(() => {
+    setHttpPortDraft(String(routingConfig?.httpPort ?? 23333));
+  }, [routingConfig?.httpPort]);
+
   const handleRoutingConfigChange = async (
     key:
       | 'enableGlobalRoute'
@@ -776,12 +1033,18 @@ const SettingsPage: React.FC = () => {
       | 'jsonBodyLimit'
       | 'skipAuth'
       | 'exposeHttp'
-      | 'httpPort',
+      | 'httpPort'
+      | 'mcpStrictValidation',
     value: boolean | string | number,
   ) => {
     // exposeHttp and httpPort are top-level config, not inside routing
     if (key === 'exposeHttp' || key === 'httpPort') {
       await updateSystemConfig({ [key]: value });
+      return;
+    }
+    // mcpStrictValidation lives in config.mcp.strictValidation (nested)
+    if (key === 'mcpStrictValidation') {
+      await updateSystemConfig({ mcpStrictValidation: value, mcp: { strictValidation: value } });
       return;
     }
     await updateRoutingConfig(key, value);
@@ -857,8 +1120,10 @@ const SettingsPage: React.FC = () => {
       const summary = parts.length > 0 ? parts.join(', ') : t('settings.clearCacheSuccess');
       showToast(summary, 'success');
 
-      // Notify RuntimeVersionManager to refresh version lists
-      emit('cache://cleared');
+      // Notify RuntimeVersionManager to refresh version lists.
+      // The Tauri event API throws on web, which would land in the catch
+      // below and show a spurious "clear failed" toast after a success.
+      if (isTauri()) emit('cache://cleared');
     } catch (err) {
       console.error('Failed to clear cache:', err);
       showToast(t('settings.clearCacheError') || 'Failed to clear cache', 'error');
@@ -867,26 +1132,65 @@ const SettingsPage: React.FC = () => {
     }
   };
 
+  // 桌面检索设置：相似度/关键词权重联动（与 RAG 一致——调一边，另一边补 1-v）。
+  const handleSrWeightChange = (key: 'vectorWeight' | 'keywordWeight', v: number) => {
+    const other = key === 'vectorWeight' ? 'keywordWeight' : 'vectorWeight';
+    const otherValue = Math.max(0, Math.min(1, 1 - v));
+    // Mark the panel dirty: without this a same-card immediate write (e.g.
+    // progressiveDisclosure toggle) rebuilds temp state from the saved config
+    // and silently discards the un-saved slider drag (review round 8).
+    smartRoutingDirtyRef.current = true;
+    setTempSmartRoutingConfig({
+      ...tempSmartRoutingConfig,
+      [key]: String(v),
+      [other]: String(otherValue),
+    });
+  };
+
   const handleSmartRoutingConfigChange = (
     key:
       | 'dbUrl'
       | 'basePacingDelayMs'
       | 'embeddingProvider'
       | 'embeddingEncodingFormat'
-      | 'openaiApiBaseUrl'
-      | 'openaiApiKey'
-      | 'openaiApiEmbeddingModel'
+      | 'embeddingDimensions'
+      | 'llmProviderBaseUrl'
+      | 'llmProviderApiKey'
+      | 'embeddingModel'
       | 'azureOpenaiEndpoint'
       | 'azureOpenaiApiKey'
       | 'azureOpenaiApiVersion'
       | 'azureOpenaiEmbeddingDeployment'
       | 'azureOpenaiEmbeddingModel'
-      | 'embeddingMaxTokens',
-    value: string,
+      | 'embeddingMaxTokens'
+      | 'embeddingQueryPrefix'
+      | 'embeddingDocumentPrefix'
+      | 'similarityThreshold'
+      | 'fullSchemaTopN'
+      | 'toolDefinitionFields'
+      | 'vectorWeight'
+      | 'keywordWeight'
+      | 'maxResults'
+      | 'scoreThreshold',
+    value: string | string[],
   ) => {
+    smartRoutingDirtyRef.current = true;
     setTempSmartRoutingConfig({
       ...tempSmartRoutingConfig,
       [key]: value,
+      ...(key === 'llmProviderBaseUrl' || key === 'embeddingModel'
+        ? { embeddingProviderPreset: 'custom' as EmbeddingProviderPresetId }
+        : {}),
+    });
+  };
+
+  const handleEmbeddingProviderPresetChange = (presetId: EmbeddingProviderPresetId) => {
+    const preset = EMBEDDING_PROVIDER_PRESETS[presetId];
+    setTempSmartRoutingConfig({
+      ...tempSmartRoutingConfig,
+      embeddingProviderPreset: presetId,
+      ...(preset.baseUrl ? { llmProviderBaseUrl: preset.baseUrl } : {}),
+      ...(preset.model ? { embeddingModel: preset.model } : {}),
     });
   };
 
@@ -909,7 +1213,11 @@ const SettingsPage: React.FC = () => {
     | 'refreshTokenLifetime'
     | 'authorizationCodeLifetime';
 
-  const handleOAuthServerNumberChange = (key: OAuthServerNumberField, value: string) => {
+  // Temp-config fields handled by the generic number input; nested
+  // dynamicRegistration fields get their own dedicated save handler.
+  type OAuthServerTempNumberField = OAuthServerNumberField | 'dynamicRegistrationClientTtl';
+
+  const handleOAuthServerNumberChange = (key: OAuthServerTempNumberField, value: string) => {
     setTempOAuthServerConfig((prev) => ({
       ...prev,
       [key]: value,
@@ -940,6 +1248,25 @@ const SettingsPage: React.FC = () => {
     }
 
     await updateOAuthServerConfig(key, parsedValue);
+  };
+
+  const saveDynamicRegistrationClientTtl = async () => {
+    const rawValue = tempOAuthServerConfig.dynamicRegistrationClientTtl;
+    if (rawValue.trim() === '') {
+      showToast(t('settings.invalidNumberInput') || 'Please enter a valid number', 'error');
+      return;
+    }
+
+    const parsedValue = Number(rawValue);
+    if (Number.isNaN(parsedValue) || parsedValue < 0) {
+      showToast(t('settings.invalidNumberInput') || 'Please enter a valid number', 'error');
+      return;
+    }
+
+    await updateOAuthServerConfig('dynamicRegistration', {
+      ...oauthServerConfig.dynamicRegistration,
+      clientTtl: Math.floor(parsedValue),
+    });
   };
 
   const saveOAuthServerAllowedScopes = async () => {
@@ -1063,7 +1390,51 @@ const SettingsPage: React.FC = () => {
     await updateNameSeparator(tempNameSeparator);
   };
 
+  // Labels of the search settings the API would reject. Saving stops on any of
+  // them instead of silently leaving the stored value in place.
+  const getInvalidSearchSettingLabels = (): string[] => {
+    const invalid: string[] = [];
+    const threshold = tempSmartRoutingConfig.similarityThreshold.trim();
+    if (threshold && !isSimilarityThreshold(Number(threshold))) {
+      invalid.push(t('settings.similarityThreshold'));
+    }
+    const topN = tempSmartRoutingConfig.fullSchemaTopN.trim();
+    if (topN && !isFullSchemaTopN(Number(topN))) {
+      invalid.push(t('settings.fullSchemaTopN'));
+    }
+    return invalid;
+  };
+
+  const reportInvalidSearchSettings = (): boolean => {
+    const invalid = getInvalidSearchSettingLabels();
+    if (invalid.length > 0) {
+      showToast(t('settings.invalidSearchSettings', { fields: invalid.join(', ') }), 'error');
+    }
+    return invalid.length > 0;
+  };
+
+  const [srReindexing, setSrReindexing] = useState(false);
+  const handleSmartRoutingReindex = async () => {
+    if (srReindexing) return;
+    setSrReindexing(true);
+    try {
+      await reindexSmartRouting();
+      showToast(t('settings.smartReindexDone') || 'Smart routing index rebuilt', 'success');
+    } catch (e) {
+      showToast(
+        `${t('settings.smartReindexFailed') || 'Failed to rebuild smart routing index'}: ${e instanceof Error ? e.message : String(e)}`,
+        'error',
+      );
+    } finally {
+      setSrReindexing(false);
+    }
+  };
   const handleSmartRoutingEnabledChange = async (value: boolean) => {
+    // Desktop local mode: no external provider fields required — enable directly
+    if (value && isTauri()) {
+      await updateSmartRoutingConfig('enabled', value);
+      return;
+    }
     // If enabling Smart Routing, validate required fields and save any unsaved changes
     if (value) {
       const currentDbUrl = tempSmartRoutingConfig.dbUrl || smartRoutingConfig.dbUrl;
@@ -1090,28 +1461,28 @@ const SettingsPage: React.FC = () => {
           );
         }
       } else {
-        // Get current OpenAI config values with explicit type checking and trim
-        const currentOpenaiApiKey = (typeof tempSmartRoutingConfig.openaiApiKey === 'string'
-          ? tempSmartRoutingConfig.openaiApiKey
-          : smartRoutingConfig.openaiApiKey || ''
+        // Get current LLM provider config values with explicit type checking and trim
+        const currentLlmProviderApiKey = (typeof tempSmartRoutingConfig.llmProviderApiKey === 'string'
+          ? tempSmartRoutingConfig.llmProviderApiKey
+          : smartRoutingConfig.llmProviderApiKey || ''
         ).trim();
-        const currentOpenaiApiBaseUrl = (typeof tempSmartRoutingConfig.openaiApiBaseUrl === 'string'
-          ? tempSmartRoutingConfig.openaiApiBaseUrl
-          : smartRoutingConfig.openaiApiBaseUrl || ''
+        const currentLlmProviderBaseUrl = (typeof tempSmartRoutingConfig.llmProviderBaseUrl === 'string'
+          ? tempSmartRoutingConfig.llmProviderBaseUrl
+          : smartRoutingConfig.llmProviderBaseUrl || ''
         ).trim();
-        const currentOpenaiApiEmbeddingModel = (typeof tempSmartRoutingConfig.openaiApiEmbeddingModel === 'string'
-          ? tempSmartRoutingConfig.openaiApiEmbeddingModel
-          : smartRoutingConfig.openaiApiEmbeddingModel || ''
+        const currentEmbeddingModel = (typeof tempSmartRoutingConfig.embeddingModel === 'string'
+          ? tempSmartRoutingConfig.embeddingModel
+          : smartRoutingConfig.embeddingModel || ''
         ).trim();
 
-        if (!currentOpenaiApiKey) {
-          missingFields.push(t('settings.openaiApiKey') || 'OpenAI API Key');
+        if (!currentLlmProviderApiKey) {
+          missingFields.push(t('settings.llmProviderApiKey') || 'OpenAI API Key');
         }
-        if (!currentOpenaiApiBaseUrl) {
-          missingFields.push(t('settings.openaiApiBaseUrl') || 'OpenAI API Base URL');
+        if (!currentLlmProviderBaseUrl) {
+          missingFields.push(t('settings.llmProviderBaseUrl') || 'OpenAI API Base URL');
         }
-        if (!currentOpenaiApiEmbeddingModel) {
-          missingFields.push(t('settings.openaiApiEmbeddingModel') || 'OpenAI Embedding Model');
+        if (!currentEmbeddingModel) {
+          missingFields.push(t('settings.embeddingModel') || 'OpenAI Embedding Model');
         }
       }
 
@@ -1125,6 +1496,9 @@ const SettingsPage: React.FC = () => {
       }
 
       // Prepare updates object with unsaved changes and enabled status
+      if (reportInvalidSearchSettings()) {
+        return;
+      }
       const updates: any = { enabled: value };
 
       // Check for unsaved changes and include them in the batch update
@@ -1147,17 +1521,17 @@ const SettingsPage: React.FC = () => {
       ) {
         updates.embeddingEncodingFormat = tempSmartRoutingConfig.embeddingEncodingFormat;
       }
-      if (tempSmartRoutingConfig.openaiApiBaseUrl !== smartRoutingConfig.openaiApiBaseUrl) {
-        updates.openaiApiBaseUrl = tempSmartRoutingConfig.openaiApiBaseUrl;
+      if (tempSmartRoutingConfig.llmProviderBaseUrl !== smartRoutingConfig.llmProviderBaseUrl) {
+        updates.llmProviderBaseUrl = tempSmartRoutingConfig.llmProviderBaseUrl;
       }
-      if (tempSmartRoutingConfig.openaiApiKey !== smartRoutingConfig.openaiApiKey) {
-        updates.openaiApiKey = tempSmartRoutingConfig.openaiApiKey;
+      if (tempSmartRoutingConfig.llmProviderApiKey !== smartRoutingConfig.llmProviderApiKey) {
+        updates.llmProviderApiKey = tempSmartRoutingConfig.llmProviderApiKey;
       }
       if (
-        tempSmartRoutingConfig.openaiApiEmbeddingModel !==
-        smartRoutingConfig.openaiApiEmbeddingModel
+        tempSmartRoutingConfig.embeddingModel !==
+        smartRoutingConfig.embeddingModel
       ) {
-        updates.openaiApiEmbeddingModel = tempSmartRoutingConfig.openaiApiEmbeddingModel;
+        updates.embeddingModel = tempSmartRoutingConfig.embeddingModel;
       }
 
       if (tempSmartRoutingConfig.azureOpenaiEndpoint !== smartRoutingConfig.azureOpenaiEndpoint) {
@@ -1185,6 +1559,19 @@ const SettingsPage: React.FC = () => {
         updates.azureOpenaiEmbeddingModel = tempSmartRoutingConfig.azureOpenaiEmbeddingModel;
       }
 
+      if (
+        tempSmartRoutingConfig.embeddingQueryPrefix !==
+        (smartRoutingConfig.embeddingQueryPrefix || '')
+      ) {
+        updates.embeddingQueryPrefix = tempSmartRoutingConfig.embeddingQueryPrefix;
+      }
+      if (
+        tempSmartRoutingConfig.embeddingDocumentPrefix !==
+        (smartRoutingConfig.embeddingDocumentPrefix || '')
+      ) {
+        updates.embeddingDocumentPrefix = tempSmartRoutingConfig.embeddingDocumentPrefix;
+      }
+
       // embeddingMaxTokens: empty string → null (clear override), numeric string → number
       const parsedTokens = parseEmbeddingMaxTokensForUpdate(
         tempSmartRoutingConfig.embeddingMaxTokens,
@@ -1192,6 +1579,62 @@ const SettingsPage: React.FC = () => {
       );
       if (parsedTokens !== undefined) {
         updates.embeddingMaxTokens = parsedTokens;
+      }
+      const parsedDimensions = parseEmbeddingDimensionsForUpdate(
+        tempSmartRoutingConfig.embeddingDimensions,
+        smartRoutingConfig.embeddingDimensions,
+      );
+      if (parsedDimensions !== undefined) {
+        updates.embeddingDimensions = parsedDimensions;
+      }
+      const parsedThreshold = parseOptionalSearchSettingForUpdate(
+        tempSmartRoutingConfig.similarityThreshold,
+        smartRoutingConfig.similarityThreshold,
+        isSimilarityThreshold,
+      );
+      if (parsedThreshold !== undefined) {
+        updates.similarityThreshold = parsedThreshold;
+      }
+      const parsedTopN = parseOptionalSearchSettingForUpdate(
+        tempSmartRoutingConfig.fullSchemaTopN,
+        smartRoutingConfig.fullSchemaTopN,
+        isFullSchemaTopN,
+      );
+      if (parsedTopN !== undefined) {
+        updates.fullSchemaTopN = parsedTopN;
+      }
+      const origFields =
+        smartRoutingConfig.toolDefinitionFields ?? DEFAULT_TOOL_DEFINITION_FIELDS;
+      const tempFields = tempSmartRoutingConfig.toolDefinitionFields ?? DEFAULT_TOOL_DEFINITION_FIELDS;
+      if (
+        origFields.length !== tempFields.length ||
+        origFields.some((f) => !tempFields.includes(f))
+      ) {
+        updates.toolDefinitionFields = [...tempFields];
+      }
+
+      // Desktop-only hybrid retrieval settings (temp string → number)
+      const parsedVectorWeight = parseFloat(tempSmartRoutingConfig.vectorWeight);
+      if (!Number.isNaN(parsedVectorWeight) && parsedVectorWeight !== smartRoutingConfig.vectorWeight) {
+        updates.vectorWeight = parsedVectorWeight;
+      }
+      const parsedKeywordWeight = parseFloat(tempSmartRoutingConfig.keywordWeight);
+      if (
+        !Number.isNaN(parsedKeywordWeight) &&
+        parsedKeywordWeight !== smartRoutingConfig.keywordWeight
+      ) {
+        updates.keywordWeight = parsedKeywordWeight;
+      }
+      const parsedMaxResults = parseInt(tempSmartRoutingConfig.maxResults, 10);
+      if (!Number.isNaN(parsedMaxResults) && parsedMaxResults !== smartRoutingConfig.maxResults) {
+        updates.maxResults = parsedMaxResults;
+      }
+      const parsedScoreThreshold = parseFloat(tempSmartRoutingConfig.scoreThreshold);
+      if (
+        !Number.isNaN(parsedScoreThreshold) &&
+        parsedScoreThreshold !== smartRoutingConfig.scoreThreshold
+      ) {
+        updates.scoreThreshold = parsedScoreThreshold;
       }
 
       // Save all changes in a single batch update
@@ -1203,6 +1646,9 @@ const SettingsPage: React.FC = () => {
   };
 
   const handleSaveSmartRoutingConfig = async () => {
+    if (reportInvalidSearchSettings()) {
+      return;
+    }
     const updates: any = {};
 
     if (tempSmartRoutingConfig.dbUrl !== smartRoutingConfig.dbUrl) {
@@ -1223,16 +1669,16 @@ const SettingsPage: React.FC = () => {
     ) {
       updates.embeddingEncodingFormat = tempSmartRoutingConfig.embeddingEncodingFormat;
     }
-    if (tempSmartRoutingConfig.openaiApiBaseUrl !== smartRoutingConfig.openaiApiBaseUrl) {
-      updates.openaiApiBaseUrl = tempSmartRoutingConfig.openaiApiBaseUrl;
+    if (tempSmartRoutingConfig.llmProviderBaseUrl !== smartRoutingConfig.llmProviderBaseUrl) {
+      updates.llmProviderBaseUrl = tempSmartRoutingConfig.llmProviderBaseUrl;
     }
-    if (tempSmartRoutingConfig.openaiApiKey !== smartRoutingConfig.openaiApiKey) {
-      updates.openaiApiKey = tempSmartRoutingConfig.openaiApiKey;
+    if (tempSmartRoutingConfig.llmProviderApiKey !== smartRoutingConfig.llmProviderApiKey) {
+      updates.llmProviderApiKey = tempSmartRoutingConfig.llmProviderApiKey;
     }
     if (
-      tempSmartRoutingConfig.openaiApiEmbeddingModel !== smartRoutingConfig.openaiApiEmbeddingModel
+      tempSmartRoutingConfig.embeddingModel !== smartRoutingConfig.embeddingModel
     ) {
-      updates.openaiApiEmbeddingModel = tempSmartRoutingConfig.openaiApiEmbeddingModel;
+      updates.embeddingModel = tempSmartRoutingConfig.embeddingModel;
     }
 
     if (tempSmartRoutingConfig.azureOpenaiEndpoint !== smartRoutingConfig.azureOpenaiEndpoint) {
@@ -1258,6 +1704,19 @@ const SettingsPage: React.FC = () => {
       updates.azureOpenaiEmbeddingModel = tempSmartRoutingConfig.azureOpenaiEmbeddingModel;
     }
 
+    if (
+      tempSmartRoutingConfig.embeddingQueryPrefix !==
+      (smartRoutingConfig.embeddingQueryPrefix || '')
+    ) {
+      updates.embeddingQueryPrefix = tempSmartRoutingConfig.embeddingQueryPrefix;
+    }
+    if (
+      tempSmartRoutingConfig.embeddingDocumentPrefix !==
+      (smartRoutingConfig.embeddingDocumentPrefix || '')
+    ) {
+      updates.embeddingDocumentPrefix = tempSmartRoutingConfig.embeddingDocumentPrefix;
+    }
+
     // embeddingMaxTokens: empty string → null (clear override), numeric string → number
     const parsedEmbeddingMaxTokens = parseEmbeddingMaxTokensForUpdate(
       tempSmartRoutingConfig.embeddingMaxTokens,
@@ -1266,9 +1725,74 @@ const SettingsPage: React.FC = () => {
     if (parsedEmbeddingMaxTokens !== undefined) {
       updates.embeddingMaxTokens = parsedEmbeddingMaxTokens;
     }
+    const parsedEmbeddingDimensions = parseEmbeddingDimensionsForUpdate(
+      tempSmartRoutingConfig.embeddingDimensions,
+      smartRoutingConfig.embeddingDimensions,
+    );
+    if (parsedEmbeddingDimensions !== undefined) {
+      updates.embeddingDimensions = parsedEmbeddingDimensions;
+    }
+    const parsedSimilarityThreshold = parseOptionalSearchSettingForUpdate(
+      tempSmartRoutingConfig.similarityThreshold,
+      smartRoutingConfig.similarityThreshold,
+      isSimilarityThreshold,
+    );
+    if (parsedSimilarityThreshold !== undefined) {
+      updates.similarityThreshold = parsedSimilarityThreshold;
+    }
+    const parsedFullSchemaTopN = parseOptionalSearchSettingForUpdate(
+      tempSmartRoutingConfig.fullSchemaTopN,
+      smartRoutingConfig.fullSchemaTopN,
+      isFullSchemaTopN,
+    );
+    if (parsedFullSchemaTopN !== undefined) {
+      updates.fullSchemaTopN = parsedFullSchemaTopN;
+    }
+    {
+      const origFields =
+        smartRoutingConfig.toolDefinitionFields ?? DEFAULT_TOOL_DEFINITION_FIELDS;
+      const tempFields =
+        tempSmartRoutingConfig.toolDefinitionFields ?? DEFAULT_TOOL_DEFINITION_FIELDS;
+      if (
+        origFields.length !== tempFields.length ||
+        origFields.some((f) => !tempFields.includes(f))
+      ) {
+        updates.toolDefinitionFields = [...tempFields];
+      }
+    }
+
+    // Desktop-only hybrid retrieval settings (temp string → number)
+    const parsedVectorWeight = parseFloat(tempSmartRoutingConfig.vectorWeight);
+    if (!Number.isNaN(parsedVectorWeight) && parsedVectorWeight !== smartRoutingConfig.vectorWeight) {
+      updates.vectorWeight = parsedVectorWeight;
+    }
+    const parsedKeywordWeight = parseFloat(tempSmartRoutingConfig.keywordWeight);
+    if (
+      !Number.isNaN(parsedKeywordWeight) &&
+      parsedKeywordWeight !== smartRoutingConfig.keywordWeight
+    ) {
+      updates.keywordWeight = parsedKeywordWeight;
+    }
+    const parsedMaxResults = parseInt(tempSmartRoutingConfig.maxResults, 10);
+    if (!Number.isNaN(parsedMaxResults) && parsedMaxResults !== smartRoutingConfig.maxResults) {
+      updates.maxResults = parsedMaxResults;
+    }
+    const parsedScoreThreshold = parseFloat(tempSmartRoutingConfig.scoreThreshold);
+    if (
+      !Number.isNaN(parsedScoreThreshold) &&
+      parsedScoreThreshold !== smartRoutingConfig.scoreThreshold
+    ) {
+      updates.scoreThreshold = parsedScoreThreshold;
+    }
 
     if (Object.keys(updates).length > 0) {
-      await updateSmartRoutingConfigBatch(updates);
+      const ok = await updateSmartRoutingConfigBatch(updates);
+      // Only clear the dirty flag on success — on failure the draft must stay
+      // protected against the rebuild effect (saved object unchanged, but an
+      // immediate-write toggle would otherwise wipe the failed edits).
+      if (ok !== false) {
+        smartRoutingDirtyRef.current = false;
+      }
     } else {
       showToast(t('settings.noChanges') || 'No changes to save', 'info');
     }
@@ -1408,9 +1932,13 @@ const SettingsPage: React.FC = () => {
   };
 
   useEffect(() => {
-    if (sectionsVisible.exportConfig && !mcpSettingsJson) {
+    // Refetch on every open: mcpSettingsJson is a snapshot — after the first
+    // fetch it would serve stale config for Copy/Download even after the user
+    // changed settings.
+    if (sectionsVisible.exportConfig) {
       fetchMcpSettings();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sectionsVisible.exportConfig]);
 
   const handleCopyConfig = async () => {
@@ -1564,13 +2092,18 @@ const SettingsPage: React.FC = () => {
       allowedServers: string;
     },
   ) => {
-    await updateBearerKey(id, {
+    // Propagate failure: BearerKeyRow only closes the editor on success —
+    // swallowing here collapsed the row and silently discarded user input.
+    const ok = await updateBearerKey(id, {
       name: payload.name,
       enabled: payload.enabled,
       accessType: payload.accessType,
       allowedGroups: parseCommaSeparated(payload.allowedGroups),
       allowedServers: parseCommaSeparated(payload.allowedServers),
     } as any);
+    if (ok === null) {
+      throw new Error(t('errors.failedToUpdateBearerKey') || 'Failed to update bearer key');
+    }
     await refreshBearerKeys();
   };
 
@@ -1769,7 +2302,7 @@ const SettingsPage: React.FC = () => {
                           loading={loading}
                           availableServers={availableServers}
                           availableGroups={availableGroups}
-                          searchGroups={groupSearchFn}
+                          groupSearchFn={groupSearchFn}
                           isAdmin={isAdmin}
                           onSave={handleSaveExistingBearerKey}
                           onDelete={handleDeleteExistingBearerKey}
@@ -1966,11 +2499,11 @@ const SettingsPage: React.FC = () => {
           )}
         </div>
 
-      {/* Smart Routing Configuration Settings - Hidden in desktop client */}
-      {!isTauri() && <PermissionChecker permissions={PERMISSIONS.SETTINGS_SMART_ROUTING}>
-        <div className="hub-card mb-6 overflow-hidden">
+      {/* Smart Routing Configuration Settings (desktop: local mode via Model & Vector runtime) */}
+      <PermissionChecker permissions={PERMISSIONS.SETTINGS_SMART_ROUTING}>
+        <div className="hub-card mb-6 overflow-visible">
           <div
-            className="flex justify-between items-center cursor-pointer transition-colors hover:bg-[var(--hub-surface-hover)] px-6 py-3"
+            className="flex justify-between items-center cursor-pointer transition-colors hover:bg-[var(--hub-surface-hover)] py-3 px-5"
             onClick={() => toggleSection('smartRoutingConfig')}
           >
             <div className="flex items-center gap-2.5">
@@ -2002,7 +2535,7 @@ const SettingsPage: React.FC = () => {
           </div>
 
           {sectionsVisible.smartRoutingConfig && (
-            <div className="px-6 py-5 border-t border-[var(--hub-line-2)]">
+            <div className="px-5 py-5 border-t border-[var(--hub-line-2)]">
               {/* Status banner */}
               <div
                 className="hub-card mb-4"
@@ -2063,9 +2596,13 @@ const SettingsPage: React.FC = () => {
                     <div className="hub-sect" style={{ marginBottom: 5 }}>
                       smart endpoint
                     </div>
+                    {/* Same SMART row shape as Dashboard: optional
+                        `(/<server-or-group>)` suffix in the displayed URL,
+                        copied URL stays clean (unscoped /mcp/$smart). */}
                     <EndpointCopy
-                      label="SMART"
-                      url={`${accessBaseUrl}/mcp/$smart`}
+                      label="MCP"
+                      url={`${accessBaseUrl}/mcp/$smart(/${t('pages.dashboard.namePlaceholder') || '<server-or-group>'})`}
+                      copyValue={`${accessBaseUrl}/mcp/$smart`}
                       configValue={() =>
                         buildMcpClientConfig(
                           `${accessBaseUrl}/mcp/$smart`,
@@ -2084,17 +2621,45 @@ const SettingsPage: React.FC = () => {
                               'MCP client config copied (includes Bearer auth header)'
                       }
                     />
+                    {/* SMART OpenAPI spec row (Dashboard parity): the
+                        meta-tool search/describe/call spec for
+                        OpenAPI-compatible clients. Optional scope suffix in
+                        the display; copied URL is the unscoped spec. */}
+                    <div style={{ marginTop: 6 }}>
+                      <EndpointCopy
+                        label="API"
+                        url={`${accessBaseUrl}/api/$smart(/${t('pages.dashboard.openapiNamePlaceholder') || '<server-name>'})/openapi.json`}
+                        copyValue={`${accessBaseUrl}/api/$smart/openapi.json`}
+                      />
+                    </div>
                   </div>
                   <div style={{ background: 'var(--hub-line)', height: 36 }} />
-                  <div className="flex items-center gap-2">
-                    <span style={{ fontSize: 12.5, color: 'var(--hub-ink-2)' }}>
-                      {t('settings.enableSmartRouting')}
-                    </span>
-                    <Switch
-                      disabled={loading}
-                      checked={smartRoutingConfig.enabled}
-                      onCheckedChange={(checked) => handleSmartRoutingEnabledChange(checked)}
-                    />
+                  <div className="flex flex-col items-center gap-2">
+                    <div className="flex items-center gap-2">
+                      <span style={{ fontSize: 12.5, color: 'var(--hub-ink-2)' }}>
+                        {t('settings.enableSmartRouting')}
+                      </span>
+                      <Switch
+                        disabled={loading}
+                        checked={smartRoutingConfig.enabled}
+                        onCheckedChange={(checked) => handleSmartRoutingEnabledChange(checked)}
+                      />
+                    </div>
+                    {/* Rebuild index — directly below the enable switch. Disabled
+                        while Smart Routing is off (nothing to rebuild). */}
+                    <button
+                      type="button"
+                      className="hub-btn"
+                      disabled={!smartRoutingConfig.enabled || srReindexing}
+                      onClick={handleSmartRoutingReindex}
+                    >
+                      {srReindexing && (
+                        <Loader2 size={14} className="animate-spin" />
+                      )}
+                      {srReindexing
+                        ? t('settings.smartReindexing') || 'Rebuilding index...'
+                        : t('settings.smartReindex') || 'Rebuild Index'}
+                    </button>
                   </div>
                 </div>
               </div>
@@ -2105,23 +2670,32 @@ const SettingsPage: React.FC = () => {
                   {t('settings.smartRoutingWorkflow') || 'Workflow'}
                 </h3>
                 <p className="hub-sub" style={{ marginTop: 0, marginBottom: 16 }}>
-                  {t('settings.smartRoutingWorkflowDescription') ||
-                    'Prompt is embedded, top-k similar tools are retrieved from pgvector, only relevant tools are exposed.'}
+                  {isTauri()
+                    ? t('settings.smartRoutingWorkflowDescriptionLocal') ||
+                      'Prompt is embedded by the local model, relevant tools are retrieved from LanceDB (hybrid search), only relevant tools are exposed.'
+                    : t('settings.smartRoutingWorkflowDescription') ||
+                      'Prompt is embedded, top-k similar tools are retrieved from pgvector, only relevant tools are exposed.'}
                 </p>
                 <div
                   className="grid items-center"
                   style={{ gridTemplateColumns: 'repeat(9, 1fr)' }}
                 >
                   {[
-                    { icon: <CodeIcon size={16} />, title: 'Prompt', sub: 'client' },
+                    { icon: <CodeIcon size={16} />, title: t('settings.wfPrompt') || 'Prompt', sub: t('settings.wfClient') || 'client' },
                     null,
-                    { icon: <Zap size={16} />, title: 'Embedding', sub: 'openai · 1536d' },
+                    isTauri()
+                      ? { icon: <Zap size={16} />, title: t('settings.wfEmbedding') || 'Embedding', sub: t('settings.srLocalModeTitle') }
+                      : { icon: <Zap size={16} />, title: t('settings.wfEmbedding') || 'Embedding', sub: 'openai · 1536d' },
                     null,
-                    { icon: <Database size={16} />, title: 'pgvector', sub: 'ann · cosine' },
+                    isTauri()
+                      ? { icon: <Database size={16} />, title: 'LanceDB', sub: t('settings.wfLancedb') || 'hybrid · cosine' }
+                      : { icon: <Database size={16} />, title: 'pgvector', sub: 'ann · cosine' },
                     null,
-                    { icon: <Wrench size={16} />, title: 'Top-K', sub: 'score > 0.7' },
+                    isTauri()
+                      ? { icon: <Wrench size={16} />, title: 'Top-K', sub: t('settings.wfTopk') || 'weight · threshold' }
+                      : { icon: <Wrench size={16} />, title: 'Top-K', sub: 'score > 0.7' },
                     null,
-                    { icon: <Sparkles size={16} />, title: 'LLM', sub: 'relevant subset' },
+                    { icon: <Sparkles size={16} />, title: 'LLM', sub: t('settings.wfLlm') || 'relevant subset' },
                   ].map((step, i) =>
                     step === null ? (
                       <div key={`sep-${i}`} className="flex justify-center">
@@ -2168,24 +2742,26 @@ const SettingsPage: React.FC = () => {
                 </div>
               </div>
 
-              {/* Required Fields Information */}
-              <div
-                className="mb-4 flex items-start gap-2"
-                style={{
-                  padding: '8px 12px',
-                  borderRadius: 7,
-                  background: 'var(--hub-accent-soft)',
-                  color: 'var(--hub-accent)',
-                  fontSize: 12.5,
-                }}
-              >
-                <span>{t('settings.smartRoutingRequiredFields')}</span>
-              </div>
+              {/* Required Fields Information (web external-provider mode only) */}
+              {!isTauri() && (
+                <div
+                  className="mb-4 flex items-start gap-2"
+                  style={{
+                    padding: '8px 12px',
+                    borderRadius: 7,
+                    background: 'var(--hub-accent-soft)',
+                    color: 'var(--hub-accent)',
+                    fontSize: 12.5,
+                  }}
+                >
+                  <span>{t('settings.smartRoutingRequiredFields')}</span>
+                </div>
+              )}
 
               <div className="space-y-3 hub-sr-fields">
 
-              {/* hide when DB_URL env is set */}
-              {smartRoutingConfig.dbUrl !== '${DB_URL}' && (
+              {/* hide when DB_URL env is set; hidden entirely on desktop (local runtime) */}
+              {!isTauri() && smartRoutingConfig.dbUrl !== '${DB_URL}' && (
                 <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
                   <div className="mb-2">
                     <h3 className="font-medium text-gray-700">
@@ -2206,6 +2782,12 @@ const SettingsPage: React.FC = () => {
                 </div>
               )}
 
+              {isTauri() ? (
+                /* 本地模式无独立提示卡：本地模型提示由下方 Workflow 图的
+                   Embedding 节点承载（srLocalModeTitle），无需单独说明块。 */
+                <></>
+              ) : (
+                <>
               <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
                 <div className="mb-2">
                   <h3 className="font-medium text-gray-700">
@@ -2235,66 +2817,112 @@ const SettingsPage: React.FC = () => {
                   <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
                     <div className="mb-2">
                       <h3 className="font-medium text-gray-700">
+                        {t('settings.embeddingProviderPreset') || 'Provider Preset'}
+                      </h3>
+                      <p className="text-xs text-gray-500 mt-1">
+                        {t('settings.embeddingProviderPresetDescription') ||
+                          'Choose a provider to prefill its OpenAI-compatible endpoint and model.'}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <select
+                        value={tempSmartRoutingConfig.embeddingProviderPreset}
+                        onChange={(e) =>
+                          handleEmbeddingProviderPresetChange(
+                            e.target.value as EmbeddingProviderPresetId,
+                          )
+                        }
+                        className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 bg-white dark:bg-gray-800 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-select"
+                        disabled={loading}
+                      >
+                        <option value="openai">
+                          {t('settings.embeddingProviderPresetOpenai') || 'OpenAI'}
+                        </option>
+                        <option value="openrouter">
+                          {t('settings.embeddingProviderPresetOpenrouter') || 'OpenRouter'}
+                        </option>
+                        <option value="siliconflow">
+                          {t('settings.embeddingProviderPresetSiliconflow') ||
+                            'SiliconFlow · free tier'}
+                        </option>
+                        <option value="gemini">
+                          {t('settings.embeddingProviderPresetGemini') ||
+                            'Google Gemini · free tier'}
+                        </option>
+                        <option value="custom">
+                          {t('settings.embeddingProviderPresetCustom') ||
+                            'Other / OpenAI-compatible'}
+                        </option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                    <div className="mb-2">
+                      <h3 className="font-medium text-gray-700">
                         <span className="text-red-500 px-1">*</span>
-                        {t('settings.openaiApiKey')}
+                        {t('settings.llmProviderApiKey')}
                       </h3>
                     </div>
                     <div className="flex items-center gap-3">
                       <input
                         type="password"
-                        value={tempSmartRoutingConfig.openaiApiKey}
+                        value={tempSmartRoutingConfig.llmProviderApiKey}
                         onChange={(e) =>
-                          handleSmartRoutingConfigChange('openaiApiKey', e.target.value)
+                          handleSmartRoutingConfigChange('llmProviderApiKey', e.target.value)
                         }
-                        placeholder={t('settings.openaiApiKeyPlaceholder')}
+                        placeholder={t('settings.llmProviderApiKeyPlaceholder')}
                         className="flex-1 mt-1 block w-full py-2 px-3 border rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm border-gray-300"
                         disabled={loading}
                       />
                     </div>
+                    {renderEnvOverrideWarning('llmProviderApiKey')}
                   </div>
 
                   <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
                     <div className="mb-2">
                       <h3 className="font-medium text-gray-700">
                         <span className="text-red-500 px-1">*</span>
-                        {t('settings.openaiApiBaseUrl')}
+                        {t('settings.llmProviderBaseUrl')}
                       </h3>
                     </div>
                     <div className="flex items-center gap-3">
                       <input
                         type="text"
-                        value={tempSmartRoutingConfig.openaiApiBaseUrl}
+                        value={tempSmartRoutingConfig.llmProviderBaseUrl}
                         onChange={(e) =>
-                          handleSmartRoutingConfigChange('openaiApiBaseUrl', e.target.value)
+                          handleSmartRoutingConfigChange('llmProviderBaseUrl', e.target.value)
                         }
-                        placeholder={t('settings.openaiApiBaseUrlPlaceholder')}
+                        placeholder={t('settings.llmProviderBaseUrlPlaceholder')}
                         className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
                         disabled={loading}
                         required
                       />
                     </div>
+                    {renderEnvOverrideWarning('llmProviderBaseUrl')}
                   </div>
 
                   <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
                     <div className="mb-2">
                       <h3 className="font-medium text-gray-700">
                         <span className="text-red-500 px-1">*</span>
-                        {t('settings.openaiApiEmbeddingModel')}
+                        {t('settings.embeddingModel')}
                       </h3>
                     </div>
                     <div className="flex items-center gap-3">
                       <input
                         type="text"
-                        value={tempSmartRoutingConfig.openaiApiEmbeddingModel}
+                        value={tempSmartRoutingConfig.embeddingModel}
                         onChange={(e) =>
-                          handleSmartRoutingConfigChange('openaiApiEmbeddingModel', e.target.value)
+                          handleSmartRoutingConfigChange('embeddingModel', e.target.value)
                         }
-                        placeholder={t('settings.openaiApiEmbeddingModelPlaceholder')}
+                        placeholder={t('settings.embeddingModelPlaceholder')}
                         className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
                         disabled={loading}
                         required
                       />
                     </div>
+                    {renderEnvOverrideWarning('embeddingModel')}
                   </div>
                 </>
               ) : (
@@ -2321,6 +2949,7 @@ const SettingsPage: React.FC = () => {
                         disabled={loading}
                       />
                     </div>
+                    {renderEnvOverrideWarning('azureOpenaiEndpoint')}
                   </div>
 
                   <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
@@ -2342,6 +2971,7 @@ const SettingsPage: React.FC = () => {
                         disabled={loading}
                       />
                     </div>
+                    {renderEnvOverrideWarning('azureOpenaiApiKey')}
                   </div>
 
                   <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
@@ -2428,7 +3058,59 @@ const SettingsPage: React.FC = () => {
                   </div>
                 </>
               )}
+                </>
+              )}
 
+              {!isTauri() && (
+              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <div className="mb-2">
+                  <h3 className="font-medium text-gray-700">
+                    {t('settings.embeddingDimensions') || 'Embedding Dimensions'}
+                  </h3>
+                  <p className="text-xs text-gray-500 mt-1">
+                    {t('settings.embeddingDimensionsDescription') ||
+                      "Optional output size for providers that support it. Leave empty to use the model's default."}
+                  </p>
+                </div>
+                <div className="flex items-center gap-3">
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={tempSmartRoutingConfig.embeddingDimensions}
+                    onChange={(e) =>
+                      handleSmartRoutingConfigChange('embeddingDimensions', e.target.value)
+                    }
+                    placeholder={
+                      t('settings.embeddingDimensionsPlaceholder') || 'Empty = model default'
+                    }
+                    className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
+                    disabled={loading}
+                  />
+                </div>
+                <div className="flex items-center justify-between mt-3">
+                  <div>
+                    <h4 className="font-medium text-gray-700">
+                      {t('settings.embeddingDimensionsApiPassthrough') ||
+                        'Forward dimensions to API (MRL passthrough)'}
+                    </h4>
+                    <p className="text-xs text-gray-500 mt-1">
+                      {t('settings.embeddingDimensionsApiPassthroughDescription') ||
+                        "Only models known to support Matryoshka (MRL) receive the dimensions parameter. Enable this to force it for other MRL-capable models. Non-MRL models (Qwen3-Embedding, BGE, vLLM/sglang) reject the parameter outright, so leave this off for them."}
+                    </p>
+                  </div>
+                  <Switch
+                    disabled={loading || !smartRoutingConfig.enabled}
+                    checked={smartRoutingConfig.embeddingDimensionsApiPassthrough}
+                    onCheckedChange={(checked) =>
+                      updateSmartRoutingConfig('embeddingDimensionsApiPassthrough', checked)
+                    }
+                  />
+                </div>
+              </div>
+              )}
+
+              {!isTauri() && (
               <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
                 <div className="mb-2">
                   <h3 className="font-medium text-gray-700">
@@ -2469,7 +3151,9 @@ const SettingsPage: React.FC = () => {
 
 
               </div>
+              )}
 
+              {!isTauri() && (
               <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
                 <div className="mb-2">
                   <h3 className="font-medium text-gray-700">
@@ -2499,7 +3183,9 @@ const SettingsPage: React.FC = () => {
                   </select>
                 </div>
               </div>
+              )}
 
+              {!isTauri() && (
               <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
                 <div className="mb-2">
                   <h3 className="font-medium text-gray-700">
@@ -2530,8 +3216,8 @@ const SettingsPage: React.FC = () => {
                       (tempSmartRoutingConfig.embeddingProvider === 'azure_openai'
                         ? tempSmartRoutingConfig.azureOpenaiEmbeddingModel ||
                           smartRoutingConfig.azureOpenaiEmbeddingModel
-                        : tempSmartRoutingConfig.openaiApiEmbeddingModel ||
-                          smartRoutingConfig.openaiApiEmbeddingModel) ||
+                        : tempSmartRoutingConfig.embeddingModel ||
+                          smartRoutingConfig.embeddingModel) ||
                       'text-embedding-3-small';
 
                     return tempSmartRoutingConfig.embeddingMaxTokens.trim()
@@ -2543,6 +3229,225 @@ const SettingsPage: React.FC = () => {
                   })()}
                 </p>
               </div>
+              )}
+
+              {/* Embedding task prefixes: desktop local model handles this internally — web/external-provider only */}
+              {!isTauri() && (
+              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <div className="mb-2">
+                  <h3 className="font-medium text-gray-700">{t('settings.embeddingPrefixes')}</h3>
+                  <p className="text-xs text-gray-500 mt-1">
+                    {t('settings.embeddingPrefixesDescription')}
+                  </p>
+                </div>
+                <label htmlFor="embeddingQueryPrefix" className="block text-xs text-gray-600 mt-2">
+                  {t('settings.embeddingQueryPrefix')}
+                </label>
+                <input
+                  id="embeddingQueryPrefix"
+                  type="text"
+                  value={tempSmartRoutingConfig.embeddingQueryPrefix}
+                  onChange={(e) =>
+                    handleSmartRoutingConfigChange('embeddingQueryPrefix', e.target.value)
+                  }
+                  placeholder="task: search result | query: "
+                  className="mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input font-mono"
+                  disabled={loading}
+                />
+                {renderEnvOverrideWarning('embeddingQueryPrefix')}
+                <label
+                  htmlFor="embeddingDocumentPrefix"
+                  className="block text-xs text-gray-600 mt-3"
+                >
+                  {t('settings.embeddingDocumentPrefix')}
+                </label>
+                <input
+                  id="embeddingDocumentPrefix"
+                  type="text"
+                  value={tempSmartRoutingConfig.embeddingDocumentPrefix}
+                  onChange={(e) =>
+                    handleSmartRoutingConfigChange('embeddingDocumentPrefix', e.target.value)
+                  }
+                  placeholder="title: none | text: "
+                  className="mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input font-mono"
+                  disabled={loading}
+                />
+                {renderEnvOverrideWarning('embeddingDocumentPrefix')}
+              </div>
+              )}
+
+              {/* Search-results settings: origin backend search_tools tuning; desktop
+                  smart_routing uses its own hybrid retrieval sliders, keys not consumed */}
+              {!isTauri() && (
+                <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                  <div className="mb-2">
+                    <h3 className="font-medium text-gray-700">{t('settings.searchResults')}</h3>
+                    <p className="text-xs text-gray-500 mt-1">
+                      {t('settings.searchResultsDescription')}
+                    </p>
+                  </div>
+                  <label htmlFor="similarityThreshold" className="block text-xs text-gray-600 mt-2">
+                    {t('settings.similarityThreshold')}
+                  </label>
+                  <input
+                    id="similarityThreshold"
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    value={tempSmartRoutingConfig.similarityThreshold}
+                    onChange={(e) =>
+                      handleSmartRoutingConfigChange('similarityThreshold', e.target.value)
+                    }
+                    placeholder={t('settings.similarityThresholdPlaceholder')}
+                    className="mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
+                    disabled={loading}
+                  />
+                  {renderEnvOverrideWarning('similarityThreshold')}
+                  <label htmlFor="fullSchemaTopN" className="block text-xs text-gray-600 mt-3">
+                    {t('settings.fullSchemaTopN')}
+                  </label>
+                  <input
+                    id="fullSchemaTopN"
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={tempSmartRoutingConfig.fullSchemaTopN}
+                    onChange={(e) =>
+                      handleSmartRoutingConfigChange('fullSchemaTopN', e.target.value)
+                    }
+                    placeholder={t('settings.fullSchemaTopNPlaceholder')}
+                    className="mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
+                    disabled={loading}
+                  />
+                  {renderEnvOverrideWarning('fullSchemaTopN')}
+                </div>
+              )}
+
+              {/* Origin #1286: configurable optional tool fields in $smart
+                  search/describe results. Consumed by the desktop smart_routing
+                  backend too, so this is NOT web-only. */}
+              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md mt-3">
+                <p className="block text-xs text-gray-600">
+                  {t('settings.toolDefinitionFields')}
+                </p>
+                <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1">
+                  {TOOL_DEFINITION_FIELDS.map((field) => {
+                    const selected =
+                      tempSmartRoutingConfig.toolDefinitionFields ??
+                      DEFAULT_TOOL_DEFINITION_FIELDS;
+                    return (
+                      <label key={field} className="flex items-center gap-1 text-sm font-mono">
+                        <input
+                          type="checkbox"
+                          className="hub-checkbox sm"
+                          checked={selected.includes(field)}
+                          onChange={(e) =>
+                            handleSmartRoutingConfigChange(
+                              'toolDefinitionFields',
+                              TOOL_DEFINITION_FIELDS.filter((name) =>
+                                name === field ? e.target.checked : selected.includes(name),
+                              ),
+                            )
+                          }
+                          disabled={loading}
+                        />
+                        {field}
+                      </label>
+                    );
+                  })}
+                </div>
+                <p className="text-xs text-gray-500 mt-1">
+                  {t('settings.toolDefinitionFieldsDescription')}
+                </p>
+                {renderEnvOverrideWarning('toolDefinitionFields')}
+              </div>
+
+              {/* Desktop: tool description verbosity for the meta-tool catalog */}
+              {isTauri() && (
+                <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                  <div className="mb-2">
+                    <h3 className="font-medium text-gray-700">
+                      {t('settings.serverDescriptionMode')}
+                    </h3>
+                    <p className="text-xs text-gray-500 mt-1">
+                      {t('settings.serverDescriptionModeDescription')}
+                    </p>
+                  </div>
+                  <select
+                    value={smartRoutingConfig.serverDescriptionMode || 'names'}
+                    onChange={(e) =>
+                      updateSmartRoutingConfig(
+                        'serverDescriptionMode',
+                        e.target.value as 'names' | 'full',
+                      )
+                    }
+                    className="w-full py-2 px-3 border border-gray-300 bg-white dark:bg-gray-800 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-select"
+                    disabled={loading}
+                  >
+                    <option value="names">{t('settings.serverDescriptionModeNames')}</option>
+                    <option value="full">{t('settings.serverDescriptionModeFull')}</option>
+                  </select>
+                </div>
+              )}
+
+              {/* Desktop: hybrid retrieval settings (RAG-style sliders + manual input, replaces origin's three-tier thresholds) */}
+              {isTauri() && (
+                <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                  <div className="mb-3">
+                    <h3 className="font-medium text-gray-700">{t('settings.srSearchSection')}</h3>
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-6 gap-y-4">
+                    <SrSlider
+                      label={t('settings.srVectorWeight')}
+                      value={parseFloat(tempSmartRoutingConfig.vectorWeight) || 0}
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      disabled={loading}
+                      onChange={(v) => handleSrWeightChange('vectorWeight', v)}
+                    />
+                    <SrSlider
+                      label={t('settings.srKeywordWeight')}
+                      value={parseFloat(tempSmartRoutingConfig.keywordWeight) || 0}
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      disabled={loading}
+                      onChange={(v) => handleSrWeightChange('keywordWeight', v)}
+                    />
+                    <div
+                      className="col-span-2 text-[12px] hub-mono"
+                      style={{ color: 'var(--hub-ink-3)', marginTop: -8 }}
+                    >
+                      {t('pages.rag.weightSumHint', {
+                        sum: (
+                          (parseFloat(tempSmartRoutingConfig.vectorWeight) || 0) +
+                          (parseFloat(tempSmartRoutingConfig.keywordWeight) || 0)
+                        ).toFixed(2),
+                      })}
+                    </div>
+                    <SrSlider
+                      label={t('settings.srMaxResults')}
+                      value={parseInt(tempSmartRoutingConfig.maxResults, 10) || 50}
+                      min={1}
+                      max={200}
+                      step={1}
+                      disabled={loading}
+                      onChange={(v) => handleSmartRoutingConfigChange('maxResults', String(v))}
+                    />
+                    <SrSlider
+                      label={t('settings.srScoreThreshold')}
+                      value={parseFloat(tempSmartRoutingConfig.scoreThreshold) || 0}
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      disabled={loading}
+                      onChange={(v) => handleSmartRoutingConfigChange('scoreThreshold', String(v))}
+                    />
+                  </div>
+                </div>
+              )}
 
               <div
                 className="flex items-center justify-between"
@@ -2580,10 +3485,16 @@ const SettingsPage: React.FC = () => {
                   {t('common.save')}
                 </button>
               </div>
+
+              <div style={{ marginTop: 20 }}>
+                {!isTauri() && (
+                  <SmartRoutingIndexPanel enabled={smartRoutingConfig.enabled} />
+                )}
+              </div>
             </div>
           )}
         </div>
-      </PermissionChecker>}
+      </PermissionChecker>
 
       {/* Tool Result Compression Settings - Hidden in desktop client */}
       {!isTauri() && <PermissionChecker permissions={PERMISSIONS.SETTINGS_SMART_ROUTING}>
@@ -3005,6 +3916,45 @@ const SettingsPage: React.FC = () => {
                     }
                   />
                 </div>
+
+                <div>
+                  <div className="mb-2">
+                    <h3 className="font-medium text-gray-700">
+                      {t('settings.dynamicRegistrationClientTtl')}
+                    </h3>
+                    <p className="text-sm text-gray-500">
+                      {t('settings.dynamicRegistrationClientTtlDescription')}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="number"
+                      min={0}
+                      value={tempOAuthServerConfig.dynamicRegistrationClientTtl}
+                      onChange={(e) =>
+                        handleOAuthServerNumberChange('dynamicRegistrationClientTtl', e.target.value)
+                      }
+                      placeholder={t('settings.dynamicRegistrationClientTtlPlaceholder')}
+                      className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
+                      disabled={
+                        loading ||
+                        !oauthServerConfig.enabled ||
+                        !oauthServerConfig.dynamicRegistration.enabled
+                      }
+                    />
+                    <button
+                      onClick={saveDynamicRegistrationClientTtl}
+                      disabled={
+                        loading ||
+                        !oauthServerConfig.enabled ||
+                        !oauthServerConfig.dynamicRegistration.enabled
+                      }
+                      className="hub-btn primary"
+                    >
+                      {t('common.save')}
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
           )}
@@ -3135,6 +4085,44 @@ const SettingsPage: React.FC = () => {
                   disabled={loading}
                   checked={betterAuthConfig.enabled}
                   onCheckedChange={(checked) => handleBetterAuthToggle({ enabled: checked })}
+                />
+              </div>
+
+              <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <div>
+                  <h3 className="font-medium text-gray-700">
+                    {t('settings.disablePasswordLogin')}
+                  </h3>
+                  <p className="text-sm text-gray-500">
+                    {t('settings.disablePasswordLoginDescription')}
+                  </p>
+                </div>
+                <Switch
+                  disabled={loading}
+                  checked={betterAuthConfig.disablePasswordLogin}
+                  onCheckedChange={(checked) =>
+                    handleBetterAuthToggle({ disablePasswordLogin: checked })
+                  }
+                />
+              </div>
+
+              <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <div className="mb-2">
+                  <h3 className="font-medium text-gray-700">
+                    {t('settings.betterAuthBaseUrl') || 'Base URL'}
+                  </h3>
+                  <p className="text-sm text-gray-500">
+                    {t('settings.betterAuthBaseUrlDescription') ||
+                      'Public base URL used to build Better Auth redirect URIs. Falls back to the install base URL when empty; the BETTER_AUTH_URL environment variable takes precedence.'}
+                  </p>
+                </div>
+                <input
+                  type="text"
+                  value={tempBetterAuthConfig.baseUrl}
+                  onChange={(e) => handleBetterAuthTextChange('baseUrl', e.target.value)}
+                  placeholder="https://mcphub.example.com"
+                  className="flex-1 mt-1 block w-full py-2 px-3 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm form-input"
+                  disabled={loading}
                 />
               </div>
 
@@ -3475,6 +4463,11 @@ const SettingsPage: React.FC = () => {
         </div>
       </PermissionChecker>
 
+      {/* 模型和向量（桌面端专属）：共享的本地 embedding 模型与向量库运行时
+          管理入口（单实例，RAG / Smart Routing 共享）。Web 模式无本地运行时，
+          不渲染。见 doc/smart_routing_port_plan_20260925.md §3.4。 */}
+      {isTauri() && <ModelVectorSettings />}
+
       {/* Route Configuration Settings */}
       <PermissionChecker permissions={PERMISSIONS.SETTINGS_ROUTE_CONFIG}>
         <div className="hub-card mb-6 overflow-hidden">
@@ -3573,6 +4566,18 @@ const SettingsPage: React.FC = () => {
                 />
               </div>
 
+              <div className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
+                <div>
+                  <h3 className="font-medium text-gray-700">{t('settings.mcpStrictValidation', '严格协议校验')}</h3>
+                  <p className="text-sm text-gray-500">{t('settings.mcpStrictValidationDescription', '开启后按 MCP 规范严格校验请求头与参数；默认关闭，宽容不完整请求以兼容未跟进新规范的客户端')}</p>
+                </div>
+                <Switch
+                  disabled={loading}
+                  checked={routingConfig.mcpStrictValidation}
+                  onCheckedChange={(checked) => handleRoutingConfigChange('mcpStrictValidation', checked)}
+                />
+              </div>
+
               <div className="p-3 bg-gray-50 dark:bg-gray-800 rounded-md">
                 <div className="mb-2">
                   <h3 className="font-medium text-gray-700">{t('settings.httpPort', 'HTTP 服务端口')}</h3>
@@ -3581,8 +4586,23 @@ const SettingsPage: React.FC = () => {
                 <div className="flex items-center gap-3">
                   <input
                     type="number"
-                    value={routingConfig.httpPort}
-                    onChange={(e) => handleRoutingConfigChange('httpPort', parseInt(e.target.value) || 23333)}
+                    value={httpPortDraft}
+                    onChange={(e) => setHttpPortDraft(e.target.value)}
+                    onBlur={() => {
+                      // Commit on blur (not per keystroke): every commit
+                      // flips global `loading` + toasts, and `|| 23333`
+                      // bounced an intentionally-empty input back. Validate
+                      // the range explicitly — min/max attrs are hints only.
+                      const n = parseInt(httpPortDraft, 10);
+                      if (Number.isFinite(n) && n >= 1024 && n <= 65535) {
+                        if (n !== routingConfig.httpPort) {
+                          handleRoutingConfigChange('httpPort', n);
+                        }
+                      } else {
+                        setHttpPortDraft(String(routingConfig.httpPort));
+                        showToast(t('settings.httpPortInvalid', '端口需在 1024–65535 之间'), 'error');
+                      }
+                    }}
                     placeholder="23333"
                     min="1024"
                     max="65535"

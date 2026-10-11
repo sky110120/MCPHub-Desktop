@@ -3,9 +3,18 @@ import { useTranslation } from 'react-i18next';
 import { Edit3, Trash2, Copy, Check, Link as LinkIcon, FileCode, ChevronDown } from 'lucide-react';
 import { Group, Server, IGroupServerConfig, GroupCost } from '@/types';
 import DeleteDialog from '@/components/ui/DeleteDialog';
+import CopyClientConfigDialog from '@/components/ui/CopyClientConfigDialog';
+import {
+  ACCESS_TOKEN_PLACEHOLDER,
+  type ClientSnippetTarget,
+} from '@/utils/mcpClientSnippets';
+import { copyText } from '@/utils/clipboard';
 import { useToast } from '@/contexts/ToastContext';
 import { useSettingsData } from '@/hooks/useSettingsData';
 import { formatTokens, percentSaved } from '@/utils/contextCost';
+
+/** Smart Routing meta tools — exclusive to $smart, never group-visible. */
+const SMART_META_TOOLS = ['smart_route_search', 'smart_route_describe', 'smart_route_call'];
 
 interface GroupCardProps {
   group: Group;
@@ -34,31 +43,6 @@ const getServerDisplayName = (group: Group, serverName: string): string => {
   return config.alias?.trim() || serverName;
 };
 
-const copyText = async (value: string): Promise<boolean> => {
-  try {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(value);
-      return true;
-    }
-  } catch {
-    /* noop */
-  }
-  try {
-    const el = document.createElement('textarea');
-    el.value = value;
-    el.style.position = 'fixed';
-    el.style.left = '-9999px';
-    document.body.appendChild(el);
-    el.focus();
-    el.select();
-    const ok = document.execCommand('copy');
-    document.body.removeChild(el);
-    return ok;
-  } catch {
-    return false;
-  }
-};
-
 const GroupCard = ({ group, servers, onEdit, onDelete, cost }: GroupCardProps) => {
   const { t } = useTranslation();
   const { showToast } = useToast();
@@ -72,6 +56,7 @@ const GroupCard = ({ group, servers, onEdit, onDelete, cost }: GroupCardProps) =
   }, [installConfig?.baseUrl, routingConfig?.httpPort]);
 
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [clientConfigTarget, setClientConfigTarget] = useState<ClientSnippetTarget | null>(null);
   const [copied, setCopied] = useState(false);
   const [showCopyDropdown, setShowCopyDropdown] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
@@ -98,15 +83,29 @@ const GroupCard = ({ group, servers, onEdit, onDelete, cost }: GroupCardProps) =
     }
   };
 
-  const groupEndpoint = `${baseUrl}/mcp/${group.name}`;
+  // Path segments are URL-encoded for ALL consumers: group names may contain
+  // spaces/CJK, and the copy buttons hand users a URL every MCP/REST client
+  // must be able to request — a raw `my tools` in the clipboard is simply a
+  // broken URL, not a style choice.
+  const groupEndpoint = `${baseUrl}/mcp/${encodeURIComponent(group.name)}`;
+  const clientConfigEndpoint = groupEndpoint;
+  const groupOpenApiEndpoint = `${baseUrl}/api/${encodeURIComponent(group.name)}`;
 
   const serverNames = getServerNames(group.servers);
-  const groupServers = servers.filter((s) => serverNames.includes(s.name));
+  // Disabled member servers are hidden from the routing diagram — they
+  // contribute nothing (no live tools, not callable) and would otherwise
+  // render as confusing "0/0 tools" rows. Their membership is preserved
+  // in the group config (re-enabling the server restores the row).
+  const groupServers = servers.filter(
+    (s) => serverNames.includes(s.name) && s.enabled !== false,
+  );
 
   const tally = (server: Server) => {
     const cfg = getServerConfig(group, server.name);
     const prefix = `${server.name}${nameSeparator}`;
-    const allTools = server.tools || [];
+    // Smart meta tools never count toward group visibility (excluded from
+    // the selection UI and filtered server-side in group scopes).
+    const allTools = (server.tools || []).filter((t) => !SMART_META_TOOLS.includes(t.name));
     const allPrompts = server.prompts || [];
     const allResources = server.resources || [];
 
@@ -202,25 +201,23 @@ const GroupCard = ({ group, servers, onEdit, onDelete, cost }: GroupCardProps) =
                   <LinkIcon size={12} /> {t('common.copyUrl')}
                 </button>
                 <button
-                  onClick={() =>
-                    doCopy(
-                      JSON.stringify(
-                        {
-                          mcpServers: {
-                            mcphub: {
-                              url: groupEndpoint,
-                              headers: { Authorization: 'Bearer <your-access-token>' },
-                            },
-                          },
-                        },
-                        null,
-                        2,
-                      ),
-                    )
-                  }
+                  onClick={() => doCopy(groupOpenApiEndpoint)}
                   className="flex items-center gap-2 w-full px-2.5 py-1.5 text-[13px] rounded-md hover:bg-[var(--hub-surface-hover)] text-left"
                 >
-                  <FileCode size={12} /> {t('common.copyJson')}
+                  <LinkIcon size={12} /> {t('common.copyOpenApiUrl')}
+                </button>
+                <button
+                  onClick={() => {
+                    setShowCopyDropdown(false);
+                    setClientConfigTarget({
+                      name: group.name,
+                      url: clientConfigEndpoint,
+                      headers: { Authorization: ACCESS_TOKEN_PLACEHOLDER },
+                    });
+                  }}
+                  className="flex items-center gap-2 w-full px-2.5 py-1.5 text-[13px] rounded-md hover:bg-[var(--hub-surface-hover)] text-left"
+                >
+                  <FileCode size={12} /> {t('clientConfig.menuItem')}
                 </button>
               </div>
             )}
@@ -339,12 +336,27 @@ const GroupCard = ({ group, servers, onEdit, onDelete, cost }: GroupCardProps) =
             <span style={{ color: 'var(--hub-ink-3)' }}>/mcp/</span>
             <b style={{ color: 'var(--hub-ink)', fontWeight: 600 }}>{group.name}</b>
           </div>
+          <div
+            className="hub-mono break-all"
+            style={{ fontSize: 12, color: 'var(--hub-ink-2)', lineHeight: 1.4 }}
+          >
+            <span style={{ color: 'var(--hub-ink-3)' }}>/api/</span>
+            <b style={{ color: 'var(--hub-ink)', fontWeight: 600 }}>{group.name}</b>
+          </div>
           <div className="flex gap-1.5 mt-2">
             <button
               className="hub-btn sm flex-1 justify-center"
               onClick={() => doCopy(groupEndpoint)}
+              title={t('common.copyUrl')}
             >
-              <Copy size={11} /> {t('common.copy')}
+              <Copy size={11} /> MCP
+            </button>
+            <button
+              className="hub-btn sm flex-1 justify-center"
+              onClick={() => doCopy(groupOpenApiEndpoint)}
+              title={t('common.copyOpenApiUrl')}
+            >
+              <Copy size={11} /> OpenAPI
             </button>
           </div>
         </div>
@@ -408,6 +420,12 @@ const GroupCard = ({ group, servers, onEdit, onDelete, cost }: GroupCardProps) =
           <ChevronDown size={11} style={{ transform: 'rotate(-90deg)' }} />
         </button>
       </div>
+
+      <CopyClientConfigDialog
+        isOpen={clientConfigTarget !== null}
+        target={clientConfigTarget}
+        onClose={() => setClientConfigTarget(null)}
+      />
 
       <DeleteDialog
         isOpen={showDeleteDialog}

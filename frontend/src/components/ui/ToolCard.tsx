@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Tool } from '@/types';
+import { Pin } from 'lucide-react';
 import {
   ChevronDown,
   ChevronRight,
@@ -25,6 +26,9 @@ import ResetDescriptionButton from './ResetDescriptionButton';
 import { formatTokens } from '@/utils/contextCost';
 import { getToolDescriptionInfo } from '@/utils/toolDescription';
 
+/** Smart Routing meta tools (only exposed via /mcp/$smart). */
+const SMART_META_TOOLS = ['smart_route_search', 'smart_route_describe', 'smart_route_call'];
+
 interface ToolCardProps {
   server: string;
   tool: Tool;
@@ -35,6 +39,9 @@ interface ToolCardProps {
     description: string,
     options?: { restored?: boolean },
   ) => void;
+  /** Server-level $smart pin (desktop extension). */
+  pinned?: boolean;
+  onPinToggle?: (toolName: string, pinned: boolean) => void;
   cost?: number;
 }
 
@@ -47,10 +54,11 @@ function isEmptyValue(value: any): boolean {
   return false;
 }
 
-const ToolCard = ({ tool, server, readOnly = false, onToggle, onDescriptionUpdate, cost }: ToolCardProps) => {
+const ToolCard = ({ tool, server, readOnly = false, onToggle, onDescriptionUpdate, pinned, onPinToggle, cost }: ToolCardProps) => {
   const { t } = useTranslation();
   const { showToast } = useToast();
-  const { nameSeparator } = useSettingsData();
+  const { nameSeparator, smartRoutingConfig } = useSettingsData();
+  const smartRoutingEnabled = smartRoutingConfig.enabled === true;
   const [isExpanded, setIsExpanded] = useState(false);
   const [showRunForm, setShowRunForm] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
@@ -85,7 +93,9 @@ const ToolCard = ({ tool, server, readOnly = false, onToggle, onDescriptionUpdat
     setCustomDescription(tool.description || '');
   }, [tool.description]);
 
-  const toolDisplayName = tool.name.replace(server + nameSeparator, '');
+  const toolDisplayName = tool.name.startsWith(server + nameSeparator)
+    ? tool.name.slice(server.length + nameSeparator.length)
+    : tool.name;
   const descriptionInfo = getToolDescriptionInfo(tool, t('tool.noDescription'));
   const defaultDescriptionTooltip = descriptionInfo.hasDescriptionOverride
     ? t('tool.defaultDescriptionTooltip', {
@@ -124,8 +134,9 @@ const ToolCard = ({ tool, server, readOnly = false, onToggle, onDescriptionUpdat
           onDescriptionUpdate(tool.name, customDescription);
         }
       } else {
-        // Revert on error
+        // Revert on error and exit editing (parity with the catch branch)
         setCustomDescription(tool.description || '');
+        setIsEditingDescription(false);
         console.error('Failed to update tool description:', result.error);
       }
     } catch (error) {
@@ -260,6 +271,17 @@ const ToolCard = ({ tool, server, readOnly = false, onToggle, onDescriptionUpdat
           <span className="hub-mono font-medium" style={{ fontSize: 13, color: 'var(--hub-ink)' }}>
             {toolDisplayName}
           </span>
+          {/* Smart Routing meta tools: highlighted so users see they belong to
+              the $smart access point, not the server's own toolset. */}
+          {SMART_META_TOOLS.includes(toolDisplayName) && (
+            <span
+              className="hub-tag flex-shrink-0"
+              style={{ background: 'var(--hub-accent-soft)', color: 'var(--hub-accent)' }}
+              title={t('server.smartMetaTooltip')}
+            >
+              {t('server.smartBadge')}
+            </span>
+          )}
           <button
             className="hub-icon-btn sm"
             onClick={handleCopyToolName}
@@ -343,6 +365,22 @@ const ToolCard = ({ tool, server, readOnly = false, onToggle, onDescriptionUpdat
             >
               Σ {formatTokens(cost)}
             </span>
+          )}
+          {/* Shown while Smart Routing is on, and for an existing pin even
+              when it is off, so a pin is never left invisible. Pinned tools
+              surface on the $smart endpoints next to the meta tools. */}
+          {(smartRoutingEnabled || pinned) && !readOnly && onPinToggle && (
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onPinToggle(tool.name, !pinned); }}
+              title={t(pinned ? 'groups.unpinTool' : 'groups.pinTool')}
+              aria-label={t('groups.pinToolLabel')}
+              aria-pressed={!!pinned}
+              className="flex-shrink-0 transition-colors"
+              style={{ color: pinned ? 'var(--hub-accent)' : 'var(--hub-ink-4, #9ca3af)' }}
+            >
+              <Pin size={12} fill={pinned ? 'currentColor' : 'none'} />
+            </button>
           )}
           <div className="flex h-[26px] items-center" onClick={(e) => e.stopPropagation()}>
             <Switch

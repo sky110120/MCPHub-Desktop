@@ -161,6 +161,30 @@ pub async fn call_tool_isolated(
     };
 
     let client_arc = Arc::new(Mutex::new(client));
+    // Re-check the server is still enabled/registered before inserting: the
+    // slow path raced a disable/delete between lock acquisition and connect
+    // completion — inserting would leave an orphan isolated client that the
+    // next lifecycle cleanup will never see (it lives until the downstream
+    // session is deleted, and keeps serving calls to a dead server name).
+    match server_service::get_by_name(&server_name).await {
+        Ok(Some(cfg)) if cfg.enabled => {}
+        _ => {
+            let msg = format!(
+                "[session-pool] Server '{server_name}' disabled/removed during connect; discarding isolated client for session {session_id}"
+            );
+            log::warn!("{msg}");
+            app_logger::log_to_db("warn", &msg);
+            // Disconnect before returning: the client (and its stdio child
+            // process tree) is fully connected at this point — dropping the
+            // Arc alone orphans the npx/uvx grandchildren, since nothing else
+            // holds a reference to this isolated client (review round 8,
+            // 2026-10-04). Mirrors the handshake-failure/timeout branches.
+            let _ = client_arc.lock().await.disconnect().await;
+            return Err(anyhow::anyhow!(
+                "Server '{server_name}' is disabled or removed"
+            ));
+        }
+    }
     {
         let mut map = store().write().await;
         map.insert(key.clone(), client_arc.clone());
@@ -226,6 +250,12 @@ async fn run_call(
     arguments: Value,
 ) -> Result<ToolCallResult> {
     let call_start = std::time::Instant::now();
+    // Known limitation (deliberate): the isolated path uses plain `call_tool`
+    // — request-level `_meta` (MRTR inputResponses retry, OTel trace) is NOT
+    // forwarded upstream here, unlike the shared `pool::call_tool_with_meta`
+    // path. Per-session clients are short-lived and session-scoped, so the
+    // retry/trace surfaces matter less; extending `call_tool_isolated` with a
+    // meta parameter is the follow-up if parity is ever required.
     let result = {
         let client = client_arc.lock().await;
         client.call_tool(tool, arguments).await
@@ -240,13 +270,42 @@ async fn run_call(
             Ok(r)
         }
         Err(e) => {
-            // Heuristic: treat any call failure as a stale connection. Evict
-            // the entry so the next call rebuilds. (Origin does fine-grained
-            // HTTP 40x / SSE retry; we keep it simple — a single reconnect on
-            // the next call.)
+            // Evict ONLY on a genuinely broken connection. An upstream
+            // JSON-RPC application error (e.g. "tool not found", business
+            // validation) also surfaces as Err here, but the client and its
+            // underlying connection remain healthy — evicting on those would
+            // destroy per-session state (e.g. a Playwright browser session)
+            // for a mere tool-level failure. rmcp transports report unhealthy
+            // once their service or peer channel closes, including an exited
+            // stdio child.
+            let still_connected = client_arc.lock().await.is_connected();
+            if still_connected {
+                log::warn!(
+                    "[session-pool] Tool '{}' failed on session {} -> {} but connection healthy, keeping client: {}",
+                    tool, key.0, key.1, e
+                );
+                return Err(e);
+            }
             let mut map = store().write().await;
-            map.remove(key);
+            // Only evict if the map still holds THIS client: a concurrent
+            // slow path may have rebuilt the entry between our fast-path read
+            // and this eviction — removing unconditionally would destroy the
+            // freshly built client.
+            let evict = map
+                .get(key)
+                .map(|c| Arc::ptr_eq(c, &client_arc))
+                .unwrap_or(false);
+            if evict {
+                map.remove(key);
+            }
             drop(map);
+            // Symmetric with on_demand eviction: disconnect the evicted client
+            // so its (stdio) process tree is reaped instead of leaking until a
+            // future cleanup_session pass.
+            {
+                let mut client = client_arc.lock().await;
+                let _ = client.disconnect().await;
+            }
             let msg = format!(
                 "[session-pool] Isolated tool '{}' call failed for session {} -> {} ({}ms), evicted client: {}",
                 tool, key.0, key.1, call_start.elapsed().as_millis(), e

@@ -11,6 +11,7 @@ import { ApiResponse, BearerKey } from '@/types';
 import { useToast } from '@/contexts/ToastContext';
 import { useAuth } from '@/contexts/AuthContext';
 import { apiGet, apiPut, apiPost, apiDelete } from '@/utils/fetchInterceptor';
+import { resolveSmartRoutingConfig } from '@/utils/settingsCompatibility';
 
 // Define types for the settings data
 interface RoutingConfig {
@@ -23,6 +24,7 @@ interface RoutingConfig {
   skipAuth: boolean;
   httpPort: number;
   exposeHttp: boolean;
+  mcpStrictValidation: boolean;
 }
 
 interface InstallConfig {
@@ -37,9 +39,11 @@ interface SmartRoutingConfig {
   basePacingDelayMs?: number;
   embeddingProvider?: 'openai' | 'azure_openai';
   embeddingEncodingFormat?: 'auto' | 'base64' | 'float';
-  openaiApiBaseUrl: string;
-  openaiApiKey: string;
-  openaiApiEmbeddingModel: string;
+  embeddingDimensions?: number;
+  embeddingDimensionsApiPassthrough: boolean;
+  llmProviderBaseUrl: string;
+  llmProviderApiKey: string;
+  embeddingModel: string;
   azureOpenaiEndpoint?: string;
   azureOpenaiApiKey?: string;
   azureOpenaiApiVersion?: string;
@@ -47,6 +51,25 @@ interface SmartRoutingConfig {
   azureOpenaiEmbeddingModel?: string;
   progressiveDisclosure: boolean;
   embeddingMaxTokens?: number;
+  embeddingQueryPrefix?: string;
+  embeddingDocumentPrefix?: string;
+  similarityThreshold?: number;
+  fullSchemaTopN?: number;
+  // Unset = server default (title, annotations). Origin #1286.
+  toolDefinitionFields?: string[];
+  /** Desktop local mode: tool description verbosity for the meta-tool catalog */
+  serverDescriptionMode?: 'names' | 'full';
+  /** Desktop hybrid retrieval settings (RAG-style, replacing origin's three-tier thresholds) */
+  vectorWeight?: number;
+  keywordWeight?: number;
+  maxResults?: number;
+  scoreThreshold?: number;
+  /**
+   * Read-only metadata from the server (issue #642): fields whose runtime value
+   * comes from an environment variable, so whatever is typed into the form for
+   * them is currently ignored. Never sent back on save.
+   */
+  envOverriddenFields?: Array<{ field: string; envVar: string }>;
 }
 
 type ToolResultCompressionStrategy = 'auto' | 'json' | 'log' | 'search' | 'diff' | 'text';
@@ -77,6 +100,7 @@ interface OAuthServerConfig {
     enabled: boolean;
     allowedGrantTypes: string[];
     requiresAuthentication: boolean;
+    clientTtl: number;
   };
 }
 
@@ -98,6 +122,7 @@ interface BetterAuthConfig {
   baseUrl: string;
   basePath: string;
   trustedOrigins: string[];
+  disablePasswordLogin: boolean;
   providers: {
     google: BetterAuthProviderToggle;
     github: BetterAuthProviderToggle;
@@ -110,6 +135,7 @@ interface SystemSettings {
     routing?: RoutingConfig;
     install?: InstallConfig;
     smartRouting?: SmartRoutingConfig;
+    smartRoutingConfig?: SmartRoutingConfig;
     toolResultCompression?: ToolResultCompressionConfig;
     mcpRouter?: MCPRouterConfig;
     nameSeparator?: string;
@@ -123,6 +149,8 @@ interface SystemSettings {
     };
     httpPort?: number;
     exposeHttp?: boolean;
+    mcpStrictValidation?: boolean;
+    mcp?: { strictValidation?: boolean };
   };
   bearerKeys?: BearerKey[];
 }
@@ -210,6 +238,7 @@ const getDefaultOAuthServerConfig = (): OAuthServerConfig => ({
     enabled: true,
     allowedGrantTypes: ['authorization_code', 'refresh_token'],
     requiresAuthentication: false,
+    clientTtl: 2592000,
   },
 });
 
@@ -220,6 +249,7 @@ const getDefaultBetterAuthConfig = (): BetterAuthConfig => ({
   baseUrl: '',
   basePath: '/api/auth/better',
   trustedOrigins: [],
+  disablePasswordLogin: false,
   providers: {
     google: {
       enabled: true,
@@ -259,6 +289,7 @@ const normalizeBetterAuthConfig = (
     baseUrl: config?.baseUrl?.trim() || defaults.baseUrl,
     basePath: config?.basePath?.trim() || defaults.basePath,
     trustedOrigins: normalizeStringArray(config?.trustedOrigins, defaults.trustedOrigins),
+    disablePasswordLogin: config?.disablePasswordLogin ?? defaults.disablePasswordLogin,
     providers: {
       google: {
         enabled: config?.providers?.google?.enabled ?? defaults.providers.google.enabled,
@@ -331,13 +362,17 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
   const [routingConfig, setRoutingConfig] = useState<RoutingConfig>({
     enableGlobalRoute: true,
     enableGroupNameRoute: true,
-    enableBearerAuth: true,
+    // Initial values mirror the Rust runtime defaults (enableBearerAuth
+    // unwrap_or(false), skipAuth default true) so the pre-fetch render never
+    // lies about the actual auth state (review round 8, 2026-10-04).
+    enableBearerAuth: false,
     bearerAuthKey: '',
     bearerAuthHeaderName: 'Authorization',
     jsonBodyLimit: '1mb',
-    skipAuth: false,
+    skipAuth: true,
     httpPort: 23333,
     exposeHttp: true,
+    mcpStrictValidation: false,
   });
 
   const [tempRoutingConfig, setTempRoutingConfig] = useState<TempRoutingConfig>({
@@ -358,9 +393,11 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
     basePacingDelayMs: undefined,
     embeddingProvider: 'openai',
     embeddingEncodingFormat: 'auto',
-    openaiApiBaseUrl: '',
-    openaiApiKey: '',
-    openaiApiEmbeddingModel: '',
+    embeddingDimensions: undefined,
+    embeddingDimensionsApiPassthrough: false,
+    llmProviderBaseUrl: '',
+    llmProviderApiKey: '',
+    embeddingModel: '',
     azureOpenaiEndpoint: '',
     azureOpenaiApiKey: '',
     azureOpenaiApiVersion: '',
@@ -368,6 +405,15 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
     azureOpenaiEmbeddingModel: '',
     progressiveDisclosure: false,
     embeddingMaxTokens: undefined,
+    embeddingQueryPrefix: '',
+    embeddingDocumentPrefix: '',
+    similarityThreshold: undefined,
+    fullSchemaTopN: undefined,
+    serverDescriptionMode: 'names' as 'names' | 'full',
+    vectorWeight: 0.5,
+    keywordWeight: 0.5,
+    maxResults: 20,
+    scoreThreshold: 0.5,
   });
 
   const [toolResultCompressionConfig, setToolResultCompressionConfig] =
@@ -415,17 +461,27 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
       const data: ApiResponse<SystemSettings> = await apiGet('/settings');
 
       if (data.success && data.data?.systemConfig) {
-        const routing: Partial<RoutingConfig> = data.data.systemConfig.routing || {};
+        const routing: Record<string, any> = data.data.systemConfig.routing || {};
         setRoutingConfig({
           enableGlobalRoute: routing.enableGlobalRoute ?? true,
           enableGroupNameRoute: routing.enableGroupNameRoute ?? true,
-          enableBearerAuth: routing.enableBearerAuth ?? true,
+          // Rust (http_server.rs) reads enableBearerAuth with unwrap_or(false) —
+          // a fresh install without a `routing` config node runs bearer auth
+          // OFF. The UI default must match or the toggle lies about protection.
+          enableBearerAuth: routing.enableBearerAuth ?? false,
           bearerAuthKey: routing.bearerAuthKey || '',
           bearerAuthHeaderName: routing.bearerAuthHeaderName || 'Authorization',
           jsonBodyLimit: routing.jsonBodyLimit || '1mb',
-          skipAuth: routing.skipAuth ?? false,
+          // Rust get_public_config defaults skipAuth to TRUE (desktop login-free
+          // mode); the UI default must match or the toggle shows OFF while the
+          // app is actually in login-free mode.
+          skipAuth: routing.skipAuth ?? true,
           httpPort: data.data.systemConfig.httpPort ?? 23333,
           exposeHttp: data.data.systemConfig.exposeHttp ?? true,
+          mcpStrictValidation:
+            data.data.systemConfig.mcp?.strictValidation ??
+            data.data.systemConfig.mcpStrictValidation ??
+            false,
         });
       }
       if (data.success && data.data?.systemConfig?.install) {
@@ -435,34 +491,54 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
           baseUrl: data.data.systemConfig.install.baseUrl || 'http://localhost:23333',
         });
       }
-      if (data.success && data.data?.systemConfig?.smartRouting) {
+      const smartRouting = data.data?.systemConfig
+        ? resolveSmartRoutingConfig(data.data.systemConfig)
+        : undefined;
+      if (data.success && smartRouting) {
         setSmartRoutingConfig({
-          enabled: data.data.systemConfig.smartRouting.enabled ?? false,
-          dbUrl: data.data.systemConfig.smartRouting.dbUrl || '',
-          basePacingDelayMs: data.data.systemConfig.smartRouting.basePacingDelayMs,
+          enabled: smartRouting.enabled ?? false,
+          dbUrl: smartRouting.dbUrl || '',
+          basePacingDelayMs: smartRouting.basePacingDelayMs,
           embeddingProvider:
-            data.data.systemConfig.smartRouting.embeddingProvider === 'azure_openai'
+            smartRouting.embeddingProvider === 'azure_openai'
               ? 'azure_openai'
               : 'openai',
           embeddingEncodingFormat:
-            data.data.systemConfig.smartRouting.embeddingEncodingFormat === 'base64'
+            smartRouting.embeddingEncodingFormat === 'base64'
               ? 'base64'
-              : data.data.systemConfig.smartRouting.embeddingEncodingFormat === 'float'
+              : smartRouting.embeddingEncodingFormat === 'float'
                 ? 'float'
                 : 'auto',
-          openaiApiBaseUrl: data.data.systemConfig.smartRouting.openaiApiBaseUrl || '',
-          openaiApiKey: data.data.systemConfig.smartRouting.openaiApiKey || '',
-          openaiApiEmbeddingModel:
-            data.data.systemConfig.smartRouting.openaiApiEmbeddingModel || '',
-          azureOpenaiEndpoint: data.data.systemConfig.smartRouting.azureOpenaiEndpoint || '',
-          azureOpenaiApiKey: data.data.systemConfig.smartRouting.azureOpenaiApiKey || '',
-          azureOpenaiApiVersion: data.data.systemConfig.smartRouting.azureOpenaiApiVersion || '',
+          embeddingDimensions: smartRouting.embeddingDimensions,
+          embeddingDimensionsApiPassthrough:
+            smartRouting.embeddingDimensionsApiPassthrough ?? false,
+          llmProviderBaseUrl: smartRouting.llmProviderBaseUrl || '',
+          llmProviderApiKey: smartRouting.llmProviderApiKey || '',
+          embeddingModel: smartRouting.embeddingModel || '',
+          azureOpenaiEndpoint: smartRouting.azureOpenaiEndpoint || '',
+          azureOpenaiApiKey: smartRouting.azureOpenaiApiKey || '',
+          azureOpenaiApiVersion: smartRouting.azureOpenaiApiVersion || '',
           azureOpenaiEmbeddingDeployment:
-            data.data.systemConfig.smartRouting.azureOpenaiEmbeddingDeployment || '',
+            smartRouting.azureOpenaiEmbeddingDeployment || '',
           azureOpenaiEmbeddingModel:
-            data.data.systemConfig.smartRouting.azureOpenaiEmbeddingModel || '',
-          progressiveDisclosure: data.data.systemConfig.smartRouting.progressiveDisclosure ?? false,
-          embeddingMaxTokens: data.data.systemConfig.smartRouting.embeddingMaxTokens,
+            smartRouting.azureOpenaiEmbeddingModel || '',
+          progressiveDisclosure: smartRouting.progressiveDisclosure ?? false,
+          embeddingMaxTokens: smartRouting.embeddingMaxTokens,
+          embeddingQueryPrefix: smartRouting.embeddingQueryPrefix || '',
+          embeddingDocumentPrefix:
+            smartRouting.embeddingDocumentPrefix || '',
+          similarityThreshold: smartRouting.similarityThreshold,
+          fullSchemaTopN: smartRouting.fullSchemaTopN,
+          toolDefinitionFields: smartRouting.toolDefinitionFields,
+          serverDescriptionMode:
+            smartRouting.serverDescriptionMode === 'full'
+              ? 'full'
+              : 'names',
+          vectorWeight: smartRouting.vectorWeight ?? 0.5,
+          keywordWeight: smartRouting.keywordWeight ?? 0.5,
+          maxResults: smartRouting.maxResults ?? 20,
+          scoreThreshold: smartRouting.scoreThreshold ?? 0.5,
+          envOverriddenFields: smartRouting.envOverriddenFields ?? [],
         });
       }
       if (data.success && data.data?.systemConfig?.toolResultCompression) {
@@ -517,6 +593,8 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
               requiresAuthentication:
                 oauth.dynamicRegistration?.requiresAuthentication ??
                 defaultDynamic.requiresAuthentication,
+              clientTtl:
+                oauth.dynamicRegistration?.clientTtl ?? defaultDynamic.clientTtl,
             },
           });
         } else {
@@ -562,10 +640,10 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
       });
 
       if (data.success) {
-        setRoutingConfig({
-          ...routingConfig,
+        setRoutingConfig((prev) => ({
+          ...prev,
           [key]: value,
-        });
+        }));
         showToast(t('settings.systemConfigUpdated'));
         return true;
       } else {
@@ -596,10 +674,10 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
       });
 
       if (data.success) {
-        setInstallConfig({
-          ...installConfig,
+        setInstallConfig((prev) => ({
+          ...prev,
           [key]: value,
-        });
+        }));
         showToast(t('settings.systemConfigUpdated'));
         return true;
       } else {
@@ -633,6 +711,9 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
         if ('httpPort' in updates) {
           setRoutingConfig((prev) => ({ ...prev, httpPort: updates.httpPort }));
         }
+        if ('mcpStrictValidation' in updates) {
+          setRoutingConfig((prev) => ({ ...prev, mcpStrictValidation: updates.mcpStrictValidation }));
+        }
         showToast(t('settings.systemConfigUpdated'));
         return true;
       } else {
@@ -663,10 +744,10 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
       });
 
       if (data.success) {
-        setSmartRoutingConfig({
-          ...smartRoutingConfig,
+        setSmartRoutingConfig((prev) => ({
+          ...prev,
           [key]: value,
-        });
+        }));
         showToast(t('settings.systemConfigUpdated'));
         return true;
       } else {
@@ -695,10 +776,10 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
       });
 
       if (data.success) {
-        setSmartRoutingConfig({
-          ...smartRoutingConfig,
+        setSmartRoutingConfig((prev) => ({
+          ...prev,
           ...updates,
-        });
+        }));
         showToast(t('settings.systemConfigUpdated'));
         return true;
       } else {
@@ -732,10 +813,10 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
       });
 
       if (data.success) {
-        setToolResultCompressionConfig({
-          ...toolResultCompressionConfig,
+        setToolResultCompressionConfig((prev) => ({
+          ...prev,
           [key]: value,
-        });
+        }));
         showToast(t('settings.systemConfigUpdated'));
         return true;
       } else {
@@ -770,10 +851,10 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
       });
 
       if (data.success) {
-        setToolResultCompressionConfig({
-          ...toolResultCompressionConfig,
+        setToolResultCompressionConfig((prev) => ({
+          ...prev,
           ...updates,
-        });
+        }));
         showToast(t('settings.systemConfigUpdated'));
         return true;
       } else {
@@ -809,10 +890,10 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
       });
 
       if (data.success) {
-        setRoutingConfig({
-          ...routingConfig,
+        setRoutingConfig((prev) => ({
+          ...prev,
           ...updates,
-        });
+        }));
         showToast(t('settings.systemConfigUpdated'));
         return true;
       } else {
@@ -843,10 +924,10 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
       });
 
       if (data.success) {
-        setMCPRouterConfig({
-          ...mcpRouterConfig,
+        setMCPRouterConfig((prev) => ({
+          ...prev,
           [key]: value,
-        });
+        }));
         showToast(t('settings.systemConfigUpdated'));
         return true;
       } else {
@@ -875,10 +956,10 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
       });
 
       if (data.success) {
-        setMCPRouterConfig({
-          ...mcpRouterConfig,
+        setMCPRouterConfig((prev) => ({
+          ...prev,
           ...updates,
-        });
+        }));
         showToast(t('settings.systemConfigUpdated'));
         return true;
       } else {
@@ -909,10 +990,10 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
       });
 
       if (data.success) {
-        setOAuthServerConfig({
-          ...oauthServerConfig,
+        setOAuthServerConfig((prev) => ({
+          ...prev,
           [key]: value,
-        });
+        }));
         showToast(t('settings.systemConfigUpdated'));
         return true;
       } else {
@@ -941,10 +1022,10 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
       });
 
       if (data.success) {
-        setOAuthServerConfig({
-          ...oauthServerConfig,
+        setOAuthServerConfig((prev) => ({
+          ...prev,
           ...updates,
-        });
+        }));
         showToast(t('settings.systemConfigUpdated'));
         return true;
       } else {
@@ -1085,7 +1166,7 @@ export const SettingsProvider: React.FC<SettingsProviderProps> = ({ children }) 
     setLoading(true);
     setError(null);
     try {
-      return await apiGet(`/mcp-settings/export?serverName=${serverName ? serverName : ''}`);
+      return await apiGet(`/mcp-settings/export?serverName=${serverName ? encodeURIComponent(serverName) : ''}`);
     } catch (error) {
       console.error('Failed to export MCP settings', { serverName, error });
       const errorMessage = error instanceof Error ? error.message : 'Failed to export MCP settings';

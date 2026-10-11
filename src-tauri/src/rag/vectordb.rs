@@ -41,8 +41,9 @@ pub struct SearchHit {
     pub doc_name: String,
     pub chunk_index: i64,
     pub chunk_text: String,
-    /// lancedb `_distance` (lower = closer). Convert to a similarity score at
-    /// the caller (embeddings are normalized, so ranking == cosine ranking).
+    /// lancedb `_distance` (lower = closer) with `DistanceType::Cosine`:
+    /// `_distance = 1 - cos similarity`, so the caller converts to a similarity
+    /// score via `1 - distance` (clamp [0,1] for numerical safety).
     pub distance: f32,
     pub tags: Vec<String>,
 }
@@ -56,6 +57,7 @@ pub struct ChunkRecord {
     pub chunk_index: i64,
     pub chunk_text: String,
     pub embedding: Vec<f32>,
+    pub tags: Vec<String>,
 }
 
 /// A chunk to insert.
@@ -100,6 +102,14 @@ impl VectorDb {
             .execute()
             .await
             .map_err(|e| anyhow!("lancedb connect {}: {}", dir.display(), e))?;
+        let needs_reindex = Self::ensure_table(&conn, embed_dim).await?;
+        Ok(Self { conn, embed_dim, needs_reindex })
+    }
+
+    /// Same as `open`, but on the SHARED mv connection (Phase 2): consumers
+    /// must not open their own lancedb connections — the mv runtime owns the
+    /// single connection process-wide. `dir` is only used for error messages.
+    pub async fn open_with_conn(conn: Connection, _dir: &Path, embed_dim: usize) -> Result<Self> {
         let needs_reindex = Self::ensure_table(&conn, embed_dim).await?;
         Ok(Self { conn, embed_dim, needs_reindex })
     }
@@ -165,6 +175,11 @@ impl VectorDb {
                     _ => false,
                 },
             };
+            // Self-heal: a missing or wrong-typed embedding column means the
+            // table can never accept rows (RecordBatch schema mismatch fails
+            // every add_chunks forever) — recreate, matching the tags
+            // column's treatment. Silently keeping it left the table in a
+            // permanently broken state with no path back.
             let need_recreate = need_recreate
                 || match schema.field_with_name("embedding") {
                     Ok(f) => match f.data_type() {
@@ -179,9 +194,18 @@ impl VectorDb {
                                 false
                             }
                         }
-                        _ => false,
+                        other => {
+                            log::info!(
+                                "[RAG] rag_chunk 'embedding' has unexpected type {:?} — recreating table",
+                                other
+                            );
+                            true
+                        }
                     },
-                    Err(_) => false,
+                    Err(_) => {
+                        log::info!("[RAG] rag_chunk table missing 'embedding' column - recreating");
+                        true
+                    }
                 };
             if need_recreate {
                 let _ = conn.drop_table(TABLE_NAME, &[]).await;
@@ -241,8 +265,18 @@ impl VectorDb {
         let texts: Vec<&str> = chunks.iter().map(|c| c.chunk_text.as_str()).collect();
 
         // Embedding: flat f32 array of n*dim, wrapped in FixedSizeList.
+        // Validate lengths first — a mismatch would panic inside
+        // FixedSizeListArray::new instead of returning an error.
         let mut flat = Vec::with_capacity(n * dim);
         for c in chunks {
+            if c.embedding.len() != dim {
+                return Err(anyhow!(
+                    "add_chunks: embedding length {} != dim {} (chunk {})",
+                    c.embedding.len(),
+                    dim,
+                    c.chunk_id
+                ));
+            }
             flat.extend_from_slice(c.embedding);
         }
 
@@ -299,11 +333,12 @@ impl VectorDb {
     }
 
     /// Vector nearest-neighbor search. Returns up to `limit` hits sorted by
-    /// distance (closest first). Uses **cosine** distance (magnitude-invariant)
-    /// so ranking reflects semantic direction, not vector magnitude - this
-    /// matters for models whose embeddings aren't L2-normalized (e.g. LFM2);
-    /// with L2 distance, small-magnitude docs would rank high regardless of
-    /// relevance. There's no vector index on this table (only a LabelList index
+    /// distance (closest first). Uses **cosine** distance (explicit
+    /// `DistanceType::Cosine`): `_distance` = 1 - cos similarity ∈ [0,2], so
+    /// the caller's `1 - distance` = cos similarity clamped to [0,1].
+    /// Embeddings are L2-normalized at the model layer regardless (every GGUF
+    /// arch normalizes), making cosine well-defined even for un-normalized
+    /// models. There's no vector index on this table (only a LabelList index
     /// on `tags`), so this is a brute-force cosine scan.
     pub async fn search(&self, query: &[f32], limit: usize) -> Result<Vec<SearchHit>> {
         let table = self
@@ -384,13 +419,20 @@ impl VectorDb {
             let chunk_idx = col::<Int64Array>(&batch, "chunk_index");
             let texts = col::<StringArray>(&batch, "chunk_text");
             let embs = col::<FixedSizeListArray>(&batch, "embedding");
+            let tags = col::<ListArray>(&batch, "tags");
             for i in 0..n {
                 let cell = embs.value(i);
+                // A failed downcast means the stored schema is not what we
+                // expect — returning an empty embedding would later panic in
+                // add_chunks (FixedSizeListArray length mismatch) far from
+                // the cause. Surface it as an error.
                 let embedding = cell
                     .as_any()
                     .downcast_ref::<Float32Array>()
                     .map(|a| a.values().to_vec())
-                    .unwrap_or_default();
+                    .ok_or_else(|| {
+                        anyhow!("read_chunks: embedding cell {} is not Float32Array (schema mismatch)", i)
+                    })?;
                 out.push(ChunkRecord {
                     chunk_id: ids.value(i).to_string(),
                     doc_id: doc_ids.value(i).to_string(),
@@ -398,6 +440,7 @@ impl VectorDb {
                     chunk_index: chunk_idx.value(i),
                     chunk_text: texts.value(i).to_string(),
                     embedding,
+                    tags: extract_tags(tags.value(i)),
                 });
             }
         }
@@ -420,6 +463,23 @@ impl VectorDb {
         Ok(())
     }
 
+    /// Total vector rows in the table. Used by the startup consistency check:
+    /// metas claiming chunks while this returns 0 means the vector data was
+    /// lost (dir wiped / corrupted) while the doc list stayed — every listed
+    /// doc MUST be vector-searchable, so that state triggers a full reindex.
+    pub async fn count_rows(&self) -> Result<usize> {
+        let table = self
+            .conn
+            .open_table(TABLE_NAME)
+            .execute()
+            .await
+            .map_err(|e| anyhow!("open table: {}", e))?;
+        table
+            .count_rows(None)
+            .await
+            .map_err(|e| anyhow!("count rows: {}", e))
+    }
+
     /// Keyword search: return chunks whose `chunk_text` contains any of the
     /// query terms (case-insensitive LIKE). `distance` is 0.0 (the service
     /// scores keyword hits by term frequency, not by vector distance).
@@ -431,11 +491,22 @@ impl VectorDb {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        // Build a case-insensitive OR filter, one LIKE per term. Single-quote
-        // is escaped; %/_ are left as-is (rare in search terms).
+        // Build a case-insensitive OR filter, one LIKE per term. Escape
+        // single-quotes AND the LIKE wildcards (% _) with backslash (the
+        // default LIKE escape in DataFusion/Postgres semantics): `_` is a
+        // single-char wildcard and code identifiers (`parse_json`,
+        // `snake_case`) are the CORE content of this index — an unescaped
+        // bare `_` query would match every row (`'%_%'`), injecting pure
+        // noise hits with fabricated 0.0 distance.
+        let esc = |t: &str| {
+            t.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+                .replace('\'', "''")
+        };
         let clauses: Vec<String> = terms
             .iter()
-            .map(|t| format!("lower(chunk_text) LIKE lower('%{}%')", t.replace('\'', "''")))
+            .map(|t| format!("lower(chunk_text) LIKE lower('%{}%')", esc(t)))
             .collect();
         let filter = clauses.join(" OR ");
 
@@ -571,5 +642,52 @@ fn extract_tags(cell: ArrayRef) -> Vec<String> {
         (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
     } else {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn read_chunks_by_doc_preserves_each_chunks_tags() {
+        let dir = std::env::temp_dir().join(format!(
+            "rag-vectordb-tags-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let db = VectorDb::open(&dir, 2).await.unwrap();
+        let first_embedding = [1.0, 0.0];
+        let second_embedding = [0.0, 1.0];
+        let inputs = vec![
+            ChunkInput {
+                chunk_id: "chunk-a".to_string(),
+                doc_id: "doc".to_string(),
+                doc_name: "doc.txt".to_string(),
+                chunk_index: 0,
+                chunk_text: "first".to_string(),
+                embedding: &first_embedding,
+                tags: vec!["old-a".to_string()],
+            },
+            ChunkInput {
+                chunk_id: "chunk-b".to_string(),
+                doc_id: "doc".to_string(),
+                doc_name: "doc.txt".to_string(),
+                chunk_index: 1,
+                chunk_text: "second".to_string(),
+                embedding: &second_embedding,
+                tags: vec!["old-b".to_string(), "shared".to_string()],
+            },
+        ];
+        db.add_chunks(&inputs).await.unwrap();
+
+        let mut records = db.read_chunks_by_doc("doc").await.unwrap();
+        records.sort_by_key(|record| record.chunk_index);
+        assert_eq!(records[0].tags, vec!["old-a"]);
+        assert_eq!(records[1].tags, vec!["old-b", "shared"]);
+        assert_eq!(records[0].embedding, first_embedding);
+        assert_eq!(records[1].embedding, second_embedding);
+
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

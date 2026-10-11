@@ -10,6 +10,7 @@
 //! content file + one `.meta` JSON per doc) so the list works even when RAG
 //! is OFF. Chunks + embeddings live in lancedb.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -22,18 +23,20 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::models::rag::{
-    BatchPreview, RagChunkPage, RagDoc, RagDocInfo, RagDocPage, RagPickedFile, RagSearchResult,
-    RagSettings, RagStatus, RagTagPage, RagTagStat, RagUpdateCheck,
+    BatchPreview, GitSourceError, RagDoc, RagDocInfo, RagFolderScan, RagPickedFile, RagScanFile,
+    RagScanGroup, RagSearchResult, RagSettings, RagStatus, RagDocPage, RagTagPage, RagTagStat,
+    RagUpdateCheck,
 };
-use crate::rag::chunker::chunk_document;
-use crate::rag::embedder::{
-    check_memory_sufficient, detect_format, load_embedder, read_max_context, Embedder,
-};
+use crate::rag::chunker::chunk_document_with_progress;
+use crate::mv::{self, embedder::check_memory_sufficient};
 use crate::rag::vectordb::{ChunkInput, VectorDb};
+pub use crate::mv::RagModelInfo;
 
 /// Write a RAG log line to both the env logger and the DB log panel (visible
 /// in the Logs page, filterable by server = "rag"). `level` is "info"/"warn"/"error".
-fn rag_log(level: &str, msg: impl std::fmt::Display) {
+/// `pub(crate)` so sibling modules (`rag::extract::*`) log their extraction /
+/// OCR progress into the same pipeline.
+pub(crate) fn rag_log(level: &str, msg: impl std::fmt::Display) {
     let line = format!("[RAG] {}", msg);
     match level {
         "warn" => log::warn!("{}", line),
@@ -47,11 +50,15 @@ fn rag_log(level: &str, msg: impl std::fmt::Display) {
 /// can show a SECOND progress bar (character-based) under the per-file bar.
 /// Frontend listens on `rag://upload-progress` (see `useRagData.tsx`).
 ///
-/// `chars_done` / `chars_total` advance as each embedding batch finishes; the
-/// service caps `chars_done` at `chars_total` (chunk overlap double-counts a
-/// little, so the raw sum can slightly overshoot — the bar should never jump
-/// past 100% mid-file). `name` lets the UI match the event to the file the
-/// outer upload loop is currently on.
+/// `chars_done` / `chars_total` advance as each embedding batch finishes.
+/// During the embed loop `chars_total` is the SUM of chunk char counts (which
+/// includes the overlap text, since the loop accumulates per-chunk chars) so
+/// the bar reaches 100% exactly when the last chunk embeds — against the raw
+/// document char count the overlap double-count made the bar saturate EARLY
+/// (capped at 100%) while chunks still remained. The pre-chunking 0% tick
+/// uses the document char count (chunk sum unknown before chunking). The
+/// `min` cap stays as a safety net. `name` lets the UI match the event to the
+/// file the outer upload loop is currently on.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RagUploadProgress {
@@ -62,15 +69,70 @@ struct RagUploadProgress {
     chars_done: u64,
     /// Total characters in the document.
     chars_total: u64,
+    /// Chunks embedded so far (drives the third "chunks" progress bar).
+    /// 0 until chunking finishes and the embed loop starts ticking.
+    #[serde(default)]
+    chunks_done: u32,
+    /// Total chunks the document was split into (0 while still chunking —
+    /// the count is unknown until `chunk_document` returns).
+    #[serde(default)]
+    chunks_total: u32,
+    /// Chunking-phase progress: chars of source text scanned by the chunker
+    /// so far (fires per code AST partition on the >64KB path). Lets the UI
+    /// fill the "分片中…" row instead of a static label through the long
+    /// chunking pass. 0/0 = not applicable (small file / non-code strategy /
+    /// chunking already done).
+    #[serde(default)]
+    chunking_done: u64,
+    /// Total document chars for the chunking phase (matches `chars_total`).
+    #[serde(default)]
+    chunking_total: u64,
 }
 
 const UPLOAD_PROGRESS_EVENT: &str = "rag://upload-progress";
 
 fn emit_upload_progress(app: &AppHandle, name: &str, chars_done: u64, chars_total: u64) {
+    emit_upload_progress_chunks(app, name, chars_done, chars_total, 0, 0);
+}
+
+/// Same event with chunk counts filled in (embed-loop ticks). `chunks_total=0`
+/// means "not yet known" (still chunking); the frontend hides the chunk bar
+/// until the total is positive.
+fn emit_upload_progress_chunks(
+    app: &AppHandle,
+    name: &str,
+    chars_done: u64,
+    chars_total: u64,
+    chunks_done: u32,
+    chunks_total: u32,
+) {
     let payload = RagUploadProgress {
         name: name.to_string(),
         chars_done: chars_done.min(chars_total),
         chars_total,
+        chunks_done,
+        chunks_total,
+        chunking_done: 0,
+        chunking_total: 0,
+    };
+    if let Err(e) = app.emit(UPLOAD_PROGRESS_EVENT, &payload) {
+        log::warn!("[RAG] emit upload-progress failed: {e}");
+    }
+}
+
+/// Chunking-phase tick: `chunking_done`/`chunking_total` carry the chunker's
+/// scanned-chars progress (fired per code AST partition). `chars_done` stays 0
+/// so the embed bar doesn't move yet; `chars_total` mirrors the document total
+/// for a consistent bar denominator across the phase switch.
+fn emit_chunking_progress(app: &AppHandle, name: &str, chunking_done: u64, chunking_total: u64) {
+    let payload = RagUploadProgress {
+        name: name.to_string(),
+        chars_done: 0,
+        chars_total: chunking_total,
+        chunks_done: 0,
+        chunks_total: 0,
+        chunking_done: chunking_done.min(chunking_total),
+        chunking_total,
     };
     if let Err(e) = app.emit(UPLOAD_PROGRESS_EVENT, &payload) {
         log::warn!("[RAG] emit upload-progress failed: {e}");
@@ -128,7 +190,20 @@ struct RagBatchUpdateProgress {
 
 const BATCH_UPDATE_PROGRESS_EVENT: &str = "rag://batch-update-progress";
 
-fn emit_batch_update_progress(app: &AppHandle, current: u32, total: u32, name: &str, phase: &str) {
+/// Preview-scan progress event (the confirm dialog's live scan progress —
+/// the dialog used to show only a bare spinner line while the preview ran).
+/// Phases: "metas" (reading .meta files) | "git" (refreshing repo i/n) |
+/// "scan" (source sync plan: scanning folders) | "checking" (md5 check per
+/// doc, i/n with the doc name).
+const PREVIEW_PROGRESS_EVENT: &str = "rag://preview-progress";
+
+fn emit_batch_update_progress(
+    app: &AppHandle,
+    current: u32,
+    total: u32,
+    name: &str,
+    phase: &str,
+) {
     let payload = RagBatchUpdateProgress {
         current,
         total,
@@ -140,17 +215,25 @@ fn emit_batch_update_progress(app: &AppHandle, current: u32, total: u32, name: &
     }
 }
 
+/// Emit one preview-scan progress frame (same shape as the batch progress —
+/// consumed by the confirm dialog's live scan-progress row).
+fn emit_preview_progress(app: &AppHandle, current: u32, total: u32, name: &str, phase: &str) {
+    let payload = RagBatchUpdateProgress {
+        current,
+        total,
+        name: name.to_string(),
+        phase: phase.to_string(),
+    };
+    if let Err(e) = app.emit(PREVIEW_PROGRESS_EVENT, &payload) {
+        log::warn!("[RAG] emit preview-progress failed: {e}");
+    }
+}
+
 /// Single running batch-update task handle. Guards against a second trigger
 /// restarting the task while one is in flight (the frontend button re-open the
 /// progress dialog instead of re-triggering, but this is the backend guard).
 static BATCH_UPDATE_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-
-/// Generation for the optional scheduled update loop. Incrementing it retires
-/// the previous loop without cancelling a Tokio task while it holds a model or
-/// database lock.
-static AUTO_UPDATE_GENERATION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 /// Serializes all doc-mutating operations (update from original/file, MCP
 /// rag_file_update, delete, set-tags) so concurrent read-modify-write of the
@@ -158,88 +241,1078 @@ static AUTO_UPDATE_GENERATION: std::sync::atomic::AtomicU64 =
 /// ALWAYS meta_lock -> runtime: every holder acquires this first, then awaits
 /// `reindex_doc`/vector ops (which take the runtime lock internally). Never
 /// acquire in the reverse order (deadlock).
-static META_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static META_LOCK: OnceLock<std::sync::Arc<Mutex<()>>> = OnceLock::new();
 
-async fn meta_lock() -> &'static Mutex<()> {
-    META_LOCK.get_or_init(|| Mutex::new(()))
+async fn meta_lock() -> &'static std::sync::Arc<Mutex<()>> {
+    META_LOCK.get_or_init(|| std::sync::Arc::new(Mutex::new(())))
 }
 
-#[derive(Default)]
-struct DeferredPruneState {
-    generation: u64,
-    running: bool,
+/// Once a document mutation owns META_LOCK, detach its complete operation from
+/// the request future. Cancellation stops waiting, but the worker keeps the
+/// lock through file/vector/meta/SQL commit or error compensation.
+async fn run_doc_mutation<T, F, Fut>(operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(DocMutationCancellation) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T>> + Send + 'static,
+{
+    let guard = meta_lock().await.clone().lock_owned().await;
+    spawn_doc_mutation_with_guard(guard, operation).await
 }
 
-impl DeferredPruneState {
-    fn request(&mut self) -> bool {
-        self.generation = self.generation.wrapping_add(1);
-        if self.running {
-            false
-        } else {
-            self.running = true;
-            true
-        }
-    }
+#[derive(Clone)]
+struct DocMutationCancellation(std::sync::Arc<std::sync::atomic::AtomicU8>);
 
-    fn complete(&mut self, observed_generation: u64) -> bool {
-        if self.generation == observed_generation {
-            self.running = false;
-            false
-        } else {
-            true
-        }
+struct DocMutationRequest(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl DocMutationRequest {
+    fn new() -> (Self, DocMutationCancellation) {
+        let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        (Self(state.clone()), DocMutationCancellation(state))
     }
 }
 
-static DEFERRED_PRUNE_STATE: OnceLock<std::sync::Mutex<DeferredPruneState>> = OnceLock::new();
-
-fn deferred_prune_state() -> &'static std::sync::Mutex<DeferredPruneState> {
-    DEFERRED_PRUNE_STATE.get_or_init(|| std::sync::Mutex::new(DeferredPruneState::default()))
-}
-
-/// Coalesce expensive LanceDB pruning outside mutation IPC calls.
-fn schedule_deferred_prune() {
-    let should_spawn = {
-        let mut state = deferred_prune_state()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.request()
-    };
-    if !should_spawn {
-        return;
-    }
-
-    tauri::async_runtime::spawn(async {
+impl Drop for DocMutationRequest {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let mut state = self.0.load(Ordering::SeqCst);
         loop {
-            let observed_generation = {
-                deferred_prune_state()
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .generation
+            let cancelled = match state {
+                0 => 2,
+                1 => 3,
+                _ => return,
             };
+            match self.0.compare_exchange(state, cancelled, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return,
+                Err(current) => state = current,
+            }
+        }
+    }
+}
 
-            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-            let result = {
-                let guard = runtime().lock().await;
-                match guard.as_ref() {
-                    Some(rt) => rt.db.optimize().await,
-                    None => Ok(()),
+impl DocMutationCancellation {
+    /// Linearization point: before this succeeds cancellation may abort; after
+    /// it succeeds the worker must finish commit or compensation.
+    fn begin_transaction(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        match self.0.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) | Err(1 | 3) => true,
+            Err(2) => false,
+            Err(_) => unreachable!("unknown document mutation state"),
+        }
+    }
+}
+
+async fn spawn_doc_mutation_with_guard<T, F, Fut>(
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    operation: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(DocMutationCancellation) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T>> + Send + 'static,
+{
+    let (request, cancellation) = DocMutationRequest::new();
+    let worker_cancellation = cancellation.clone();
+    tokio::spawn(async move {
+        let _guard = guard;
+        let result = operation(cancellation).await;
+        if worker_cancellation.0.load(std::sync::atomic::Ordering::SeqCst) == 3 {
+            if let Err(error) = &result {
+                rag_log(
+                    "error",
+                    format!("detached document mutation failed after caller cancellation: {error:#}"),
+                );
+            }
+        }
+        result
+    })
+    .await
+    .map_err(|error| anyhow!("document mutation worker failed: {error}"))?
+    .map(|value| {
+        drop(request);
+        value
+    })
+}
+
+#[cfg(test)]
+async fn run_doc_mutation_with_lock<T, F, Fut>(
+    lock: std::sync::Arc<Mutex<()>>,
+    operation: F,
+) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(DocMutationCancellation) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T>> + Send + 'static,
+{
+    let guard = lock.lock_owned().await;
+    spawn_doc_mutation_with_guard(guard, operation).await
+}
+
+/// True while a frontend import loop is running: the upload dialog calls
+/// `begin_rag_import_session` before iterating `upload_rag_doc` per file and
+/// `end_rag_import_session` when the loop finishes or is cancelled. While a
+/// session is active:
+/// - git-source refreshes are deferred (`refresh_git_repo`): a refresh
+///   re-clones and RENAMES the persistent clone dir into place, which must
+///   not race the in-flight per-file imports reading that same dir;
+/// - the auto-update tick skips itself entirely (its refresh + md5 pass +
+///   source sync would all contend with the import loop);
+/// - source-sync "add" imports are suppressed (they'd race the loop's own
+///   uploads of the same files and could double-import them).
+/// Bool-with-store semantics (not a counter): the import dialog is modal so
+/// at most one loop runs at a time, and `end` clearing unconditionally also
+/// self-heals a leaked session if a begin/end pair is ever interrupted.
+static IMPORT_SESSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Begin an import session (see `IMPORT_SESSION`).
+pub fn begin_import_session() {
+    IMPORT_SESSION.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// End the import session — unconditional so a leaked `begin` can never pin
+/// the flag on (the next begin/end pair clears any stale state).
+pub fn end_import_session() {
+    IMPORT_SESSION.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether an import loop is currently running.
+pub fn import_session_active() -> bool {
+    IMPORT_SESSION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
+mod import_session_tests {
+    use super::*;
+
+    /// Store semantics (not a counter): `end` clears unconditionally so a
+    /// leaked `begin` (interrupted pair) can never pin the flag on — a second
+    /// begin/end pair self-heals any stale state.
+    #[test]
+    fn import_session_end_clears_even_after_double_begin() {
+        begin_import_session();
+        begin_import_session();
+        assert!(import_session_active());
+        end_import_session();
+        assert!(!import_session_active());
+    }
+}
+
+/// Window closed mid-import: ask the frontend upload loop to stop at the
+/// next file boundary. The in-flight file still finishes and stays in the
+/// doc list; the remaining files are NOT imported. Without this the loop
+/// would keep importing everything in the hidden (tray-minimized) webview
+/// and the doc list would fill up as if the user had let the import run to
+/// completion — "closing" the app mid-import must mean "cancel the rest".
+pub fn request_import_cancel(app: &AppHandle) {
+    rag_log("info", "import: cancel requested (window closed mid-import)");
+    let _ = app.emit("rag://import-cancel-requested", ());
+}
+
+// ── git data source refresh (P4) ───────────────────────────────────────────
+
+/// Dedup cache for git repo refreshes: repo_hash -> last successful refresh.
+/// Within GIT_REFRESH_TTL_SECS a second refresh attempt for the same repo is
+/// a no-op (batch preview + batch run + single-doc check can all fire in one
+/// user action; the clone itself is shallow depth-1 but still network-bound).
+/// 10 min (was 60s): a refresh is a full network re-clone (~60s+ for a real
+/// repo), so a TTL at/below the clone duration made every auto-update tick
+/// (interval can be set to 60s) re-clone the same repo back-to-back — an
+/// infinite re-clone loop (269 refreshes/day observed) that also starved
+/// concurrent imports of network/CPU. 10 min bounds the re-clone frequency
+/// while still being fresh enough for update detection (md5 compares against
+/// a clone at most 10 min old).
+static GIT_REFRESH_CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+    OnceLock::new();
+const GIT_REFRESH_TTL_SECS: u64 = 600;
+
+fn git_refresh_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    GIT_REFRESH_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Per-repo in-flight refresh locks. The TTL cache only records COMPLETED
+/// refreshes, so a single-doc check firing while a batch refresh for the same
+/// repo is mid-clone would race on the `{hash}.new` dir (both sides do
+/// remove_dir_all + write). Serializing per repo makes the second caller wait
+/// and then hit the TTL (no second clone).
+static GIT_REFRESH_LOCKS: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Mutex<()>>>>,
+> = OnceLock::new();
+
+fn git_refresh_lock(hash: &str) -> std::sync::Arc<Mutex<()>> {
+    let m = GIT_REFRESH_LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    m.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(hash.to_string())
+        .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Last refresh OUTCOME per repo (success + failure both recorded), so the
+/// UI can query "which git sources are failing and why" on demand (the
+/// progress dialog's warning icon) without triggering a network refresh.
+/// Failure entries hold the structured GitSourceError; success entries are
+/// cleared from this map (success = absence of an error).
+static GIT_REFRESH_ERRORS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, GitSourceError>>> =
+    OnceLock::new();
+
+fn git_refresh_errors() -> &'static std::sync::Mutex<std::collections::HashMap<String, GitSourceError>> {
+    GIT_REFRESH_ERRORS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Refresh one git repo's persistent clone (local credential file ->
+/// re-clone + swap). Returns Ok(true) if refreshed now, Ok(false) if skipped
+/// (fresh within TTL). Failures return a structured `GitSourceError` (auth vs
+/// other) so callers can surface "credentials changed / address moved" to the
+/// user instead of silently checking md5 against a stale clone. Callers treat
+/// Err as "repo not updated" — the existing clone content is still usable for
+/// md5 classification.
+async fn refresh_git_repo(app: &AppHandle, repo_url: &str) -> Result<bool, GitSourceError> {
+    // Defer while an import loop is running: the refresh re-clones and
+    // RENAMES the persistent clone dir into place — it must not race the
+    // in-flight per-file imports reading that same dir (and a "refreshed"
+    // log line mid-import is confusing + wasteful: the clone is at most a
+    // few minutes old). The next tick / manual batch after the import
+    // finishes picks it up (TTL cache is not written, so it refreshes then).
+    if import_session_active() {
+        rag_log("info", format!("git: refresh deferred (import in progress): {repo_url}"));
+        return Ok(false);
+    }
+    // Canonicalize BEFORE keying the lock/TTL: two raw spellings of the
+    // same repo (http vs https redirect form) otherwise get different locks
+    // and race concurrent refresh_persistent calls on the SAME canonical
+    // `{hash}.new` clone dir (the second remove_dir_all wipes the first's
+    // in-flight fetch → corrupt clone can be swapped in). TTL bypass per
+    // spelling has the same root cause.
+    let hash = super::git::repo_hash(&super::git::canonicalize_url(repo_url).await);
+    // Serialize per repo (see GIT_REFRESH_LOCKS), then re-check the TTL
+    // inside the lock — a concurrent caller may have just refreshed.
+    let repo_lock = git_refresh_lock(&hash);
+    let _repo_guard = repo_lock.lock().await;
+    if let Ok(cache) = git_refresh_cache().lock() {
+        if let Some(t) = cache.get(&hash) {
+            if t.elapsed().as_secs() < GIT_REFRESH_TTL_SECS {
+                return Ok(false);
+            }
+        }
+    }
+    match super::git::refresh_registered(app, repo_url).await {
+        Ok(res) => {
+            if let Ok(mut cache) = git_refresh_cache().lock() {
+                cache.insert(hash.clone(), std::time::Instant::now());
+            }
+            // Success clears any previously-recorded failure.
+            if let Ok(mut errs) = git_refresh_errors().lock() {
+                errs.remove(&hash);
+            }
+            let short = res.commit.chars().take(10).collect::<String>();
+            rag_log("info", format!("git: refreshed repo {repo_url} -> commit {short}"));
+            Ok(true)
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            // GIT_AUTH_REQUIRED prefix (from refresh_registered's auth
+            // mapping) -> the fix is credentials; anything else (not found /
+            // network) -> the address may have moved or be unreachable.
+            let auth = msg.starts_with("GIT_AUTH_REQUIRED");
+            let detail = crate::rag::git::scrub_credentials(
+                msg.strip_prefix("GIT_AUTH_REQUIRED:")
+                    .unwrap_or(&msg)
+                    .trim(),
+            )
+            .to_string();
+            rag_log(
+                "warn",
+                format!("git: refresh {repo_url} failed: {}", crate::rag::git::scrub_credentials(&msg)),
+            );
+            let branch = String::new();
+            let err = GitSourceError {
+                url: repo_url.to_string(),
+                branch,
+                auth,
+                message: detail,
+            };
+            // Record for the on-demand health query (progress dialog icon).
+            if let Ok(mut errs) = git_refresh_errors().lock() {
+                errs.insert(hash, err.clone());
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Report the last recorded refresh failure per git source (no network I/O —
+/// reads the failure cache written by `refresh_git_repo`). Sources that
+/// refreshed fine (or were never refreshed since startup) are absent.
+pub async fn get_git_source_errors(_app: &AppHandle) -> Vec<GitSourceError> {
+    // Best-effort label from the registry (url @ branch), falling back to the
+    // url captured in the error itself.
+    let errs = match git_refresh_errors().lock() {
+        Ok(m) => m.clone(),
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<GitSourceError> = Vec::new();
+    for (_hash, err) in errs {
+        let label_url = err.url.clone();
+        out.push(GitSourceError {
+            url: label_url,
+            branch: err.branch,
+            auth: err.auth,
+            message: err.message,
+        });
+    }
+    out.sort_by(|a, b| a.url.cmp(&b.url));
+    out
+}
+
+/// Best-effort variant: refresh and swallow the error (logged inside). Used by
+/// the batch RUN flow where one repo failing must not abort the whole batch
+/// (the preview already surfaced the errors to the user).
+async fn refresh_git_repo_best_effort(app: &AppHandle, repo_url: &str) {
+    let _ = refresh_git_repo(app, repo_url).await;
+}
+
+/// Drop the recorded refresh failure for a repo. Called after a successful
+/// re-pick with fresh credentials, so the progress dialog's warning icon
+/// clears immediately instead of showing a stale warning until the next
+/// successful refresh.
+pub async fn clear_git_source_error_for(repo_url: &str) {
+    // Cache/errors are keyed by the CANONICAL hash (see refresh_git_repo) —
+    // canonicalize first or the clear silently no-ops for re-spelled urls.
+    let hash = super::git::repo_hash(&super::git::canonicalize_url(repo_url).await);
+    if let Ok(mut errs) = git_refresh_errors().lock() {
+        errs.remove(&hash);
+    }
+}
+
+/// Collect the distinct git repo URLs referenced by `docs` (kind == "git").
+fn collect_git_repo_urls(docs: &[DocMeta]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut urls = Vec::new();
+    for meta in docs {
+        if let Some(src) = meta.source.as_ref() {
+            if src.kind == "git" {
+                if let Some(git) = src.git.as_ref() {
+                    if !git.url.is_empty() && seen.insert(git.url.clone()) {
+                        urls.push(git.url.clone());
+                    }
+                }
+            }
+        }
+    }
+    urls
+}
+
+// ── source-level sync: files added to / removed from folder & git sources ──
+
+/// A file detected in a source (folder dir / git clone) that no doc
+/// references yet — a batch sync will import it.
+struct SourceSyncAdd {
+    path: String,
+    source: crate::models::rag::DocSource,
+    /// Import method: folder additions use "symlink" (UI default, the file
+    /// stays where it is), git additions "copy" (matches the git force-copy
+    /// semantics).
+    method: &'static str,
+}
+
+/// Prefix helper: does `path` live inside `root`? String-prefix with an
+/// explicit separator so `/a/b` doesn't match `/a/bc/...`. Both sides are
+/// normalized to forward slashes first — Windows scan paths and stored
+/// exclusion entries use `\`, and a raw prefix `C:\dir/` would never match
+/// (directory exclusions silently no-op otherwise). Case-insensitive compare
+/// ONLY on case-preserving filesystems (macOS APFS / Windows NTFS) — on Linux
+/// ext4 two paths differing in case are distinct directories and must not
+/// over-match.
+fn path_under_root(path: &str, root: &str) -> bool {
+    let norm = |s: &str| s.replace('\\', "/");
+    let root = norm(root);
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return false;
+    }
+    let path = norm(path);
+    let case_fold = cfg!(windows) || cfg!(target_os = "macos");
+    if case_fold {
+        path.eq_ignore_ascii_case(root)
+            || path.to_ascii_lowercase().starts_with(&format!("{root}/").to_ascii_lowercase())
+    } else {
+        path == root || path.starts_with(&format!("{root}/"))
+    }
+}
+
+// ── exclusion registry: paths the update pipeline must ignore ───────────────
+//
+// Users can exclude individual files (or whole directories) from update
+// processing. Excluded paths live in `config_json.rag.excludedPaths` (a JSON
+// array of absolute paths) — same store as the other RAG settings, no schema
+// change. Semantics:
+// - `preview_batch_update` / `run_batch_update` / the auto-update tick: an
+//   excluded doc is never re-indexed, never source-sync-removed, and its file
+//   is never source-sync-re-imported.
+// - `check_rag_update` (single-doc dialog): reports `excluded: true` so the UI
+//   can explain why nothing will auto-update + offer to re-include.
+// - `plan_source_sync`: a scanned file whose match path is excluded is not
+//   "new"; a doc whose original_path is excluded is not "removable".
+// A directory entry excludes everything under it (`path_under_root`).
+
+/// Read the exclusion registry. Best-effort: a config read failure returns an
+/// empty set (fail-open — updates keep working; the UI just won't see flags).
+pub async fn list_excluded_paths() -> Vec<String> {
+    let cfg = match crate::services::config_service::get().await {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    cfg.get("rag")
+        .and_then(|r| r.get("excludedPaths"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+/// Replace the whole exclusion registry with `paths` (deduped, trimmed,
+/// non-empty). Called by the import dialog (persist its dialog-local toggles)
+/// and the doc-list toggle (add/remove one path). Returns the stored list.
+pub async fn set_excluded_paths(paths: Vec<String>) -> Result<Vec<String>> {
+    let cleaned = normalize_excluded_paths(paths);
+    let patch = json!({ "rag": { "excludedPaths": cleaned } });
+    crate::services::config_service::update(&patch).await?;
+    Ok(cleaned)
+}
+
+/// Normalize a caller-supplied path list: trim, drop empties, dedup
+/// (order-preserving). Shared by `set_excluded_paths` and its unit test.
+fn normalize_excluded_paths(paths: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    paths
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty() && seen.insert(p.clone()))
+        .collect()
+}
+
+// ── source aliases（folder/git 数据源的自定义别名） ─────────────────────────
+// Registry: config_json.rag.sourceAliases — identity -> alias, where identity
+// is the folder's absolute root path or the git canonical URL. Applied at
+// read time in doc_info_from_meta (an alias set on a source shows on every
+// doc of that source in the tree); an empty alias removes the entry (falls
+// back to the derived default label).
+
+/// Read the alias registry. Best-effort: a config read failure returns an
+/// empty map (labels just fall back to defaults). Entries with an empty
+/// string value are tombstones (set by `set_source_alias` on clear) and are
+/// filtered out — config_service::update deep-merges objects key-by-key, so
+/// a removed key would otherwise survive; the tombstone overwrites it.
+pub async fn list_source_aliases() -> std::collections::HashMap<String, String> {
+    let cfg = match crate::services::config_service::get().await {
+        Ok(c) => c,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    cfg.get("rag")
+        .and_then(|r| r.get("sourceAliases"))
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| {
+                    v.as_str()
+                        .map(|s| (k.clone(), s.trim().to_string()))
+                        .filter(|(_, s)| !s.is_empty())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Set (alias non-empty) or clear (alias empty) the alias for a folder/git
+/// source identity. `kind` is only validated for sanity ("folder" | "git").
+/// Clear writes an EMPTY-STRING tombstone rather than removing the key:
+/// `config_service::update` deep-merges object values key-by-key, so an
+/// absent key would leave the old alias in place (observed: clearing in the
+/// rename dialog kept the alias until another set overwrote it). The reader
+/// filters empty values out.
+pub async fn set_source_alias(kind: String, identity: String, alias: String) -> Result<()> {
+    if kind != "folder" && kind != "git" {
+        return Err(anyhow!("unsupported source kind: {}", kind));
+    }
+    let identity = identity.trim().to_string();
+    if identity.is_empty() {
+        return Err(anyhow!("source identity is empty"));
+    }
+    let mut aliases = list_source_aliases().await;
+    let alias = alias.trim();
+    if alias.is_empty() {
+        // Tombstone (deep-merge can't express key removal).
+        aliases.insert(identity, String::new());
+    } else {
+        aliases.insert(identity, alias.to_string());
+    }
+    let patch = json!({ "rag": { "sourceAliases": aliases } });
+    crate::services::config_service::update(&patch).await?;
+    Ok(())
+}
+
+/// Is `path` (or any of its ancestors) in the exclusion registry?
+pub(crate) async fn is_path_excluded(path: &str, excluded: &[String]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    excluded.iter().any(|e| path_under_root(path, e))
+}
+
+/// Convenience wrapper for single-path checks (no registry in hand).
+pub(crate) async fn path_excluded(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let excluded = list_excluded_paths().await;
+    is_path_excluded(path, &excluded).await
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GitSourceSyncBranch {
+    Sync(Option<String>),
+    SkipAmbiguous,
+    SkipCloneBranchMismatch(String),
+}
+
+struct GitSourceSyncGroup {
+    persistent: PathBuf,
+    urls: Vec<String>,
+}
+
+fn group_git_source_urls(
+    resolved_urls: impl IntoIterator<Item = (String, PathBuf)>,
+) -> Vec<GitSourceSyncGroup> {
+    let mut groups: Vec<GitSourceSyncGroup> = Vec::new();
+    for (url, persistent) in resolved_urls {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.persistent == persistent)
+        {
+            if !group.urls.contains(&url) {
+                group.urls.push(url);
+            }
+        } else {
+            groups.push(GitSourceSyncGroup {
+                persistent,
+                urls: vec![url],
+            });
+        }
+    }
+    for group in &mut groups {
+        group.urls.sort();
+    }
+    groups.sort_by(|a, b| a.persistent.cmp(&b.persistent));
+    groups
+}
+
+fn group_git_source_urls_with_recorded_paths<'a>(
+    resolved_urls: impl IntoIterator<Item = (String, PathBuf)>,
+    recorded_paths: impl IntoIterator<Item = (&'a str, &'a Path)>,
+    resolve_path: impl Fn(&Path) -> Option<PathBuf>,
+) -> Vec<GitSourceSyncGroup> {
+    let mut resolved_urls: Vec<_> = resolved_urls.into_iter().collect();
+    resolved_urls.extend(recorded_paths.into_iter().filter_map(|(url, path)| {
+        resolve_path(path).map(|persistent| (url.to_string(), persistent))
+    }));
+    group_git_source_urls(resolved_urls)
+}
+
+fn git_source_group_for_recorded_path<'a>(
+    recorded_paths: impl IntoIterator<Item = (&'a str, &'a Path)>,
+    selected_path: &Path,
+    resolve_path: impl Fn(&Path) -> Option<PathBuf>,
+) -> Option<GitSourceSyncGroup> {
+    let persistent = resolve_path(selected_path)?;
+    group_git_source_urls_with_recorded_paths([], recorded_paths, &resolve_path)
+        .into_iter()
+        .find(|group| group.persistent == persistent)
+}
+
+async fn resolve_git_source_groups(app: &AppHandle, docs: &[DocMeta]) -> Vec<GitSourceSyncGroup> {
+    let mut resolved_urls = Vec::new();
+    for url in collect_git_repo_urls(docs) {
+        if let Some(persistent) = super::git::persistent_repo_dir_for_url(app, &url).await {
+            resolved_urls.push((url, persistent));
+        }
+    }
+    let recorded_paths = docs.iter().filter_map(|meta| {
+        let source = meta.source.as_ref().filter(|source| source.kind == "git")?;
+        let git = source.git.as_ref()?;
+        let original_path = meta.original_path.as_deref().filter(|path| !path.is_empty())?;
+        Some((git.url.as_str(), Path::new(original_path)))
+    });
+    group_git_source_urls_with_recorded_paths(resolved_urls, recorded_paths, |path| {
+        super::git::persistent_repo_dir_for_path(app, path)
+    })
+}
+
+fn git_source_sync_branch(
+    branches: impl IntoIterator<Item = Option<String>>,
+    read_clone_branch: impl FnOnce() -> Result<Option<String>>,
+) -> GitSourceSyncBranch {
+    let mut branches = branches.into_iter();
+    let Some(branch) = branches.next() else {
+        return GitSourceSyncBranch::SkipAmbiguous;
+    };
+    if branches.any(|other| other != branch) {
+        return GitSourceSyncBranch::SkipAmbiguous;
+    }
+    let Some(selected) = branch.as_deref() else {
+        return GitSourceSyncBranch::Sync(branch);
+    };
+
+    match read_clone_branch() {
+        Ok(Some(clone_branch)) if clone_branch == selected => GitSourceSyncBranch::Sync(branch),
+        Ok(Some(clone_branch)) => GitSourceSyncBranch::SkipCloneBranchMismatch(format!(
+            "recorded branch {selected} differs from clone HEAD {clone_branch}"
+        )),
+        Ok(None) => GitSourceSyncBranch::SkipCloneBranchMismatch(format!(
+            "clone HEAD has no identifiable branch (recorded {selected})"
+        )),
+        Err(error) => GitSourceSyncBranch::SkipCloneBranchMismatch(format!(
+            "clone HEAD could not be read (recorded {selected}): {error}"
+        )),
+    }
+}
+
+fn git_source_sync_branch_for_group<'a>(
+    urls: &[String],
+    source_branches: impl IntoIterator<Item = (&'a str, Option<String>)>,
+    read_clone_branch: impl FnOnce() -> Result<Option<String>>,
+) -> GitSourceSyncBranch {
+    let aliases: std::collections::HashSet<&str> = urls.iter().map(String::as_str).collect();
+    git_source_sync_branch(
+        source_branches
+            .into_iter()
+            .filter_map(|(url, branch)| aliases.contains(url).then_some(branch)),
+        read_clone_branch,
+    )
+}
+
+fn git_source_group_branch_safe_for_original_update<'a>(
+    urls: &[String],
+    source_branches: impl IntoIterator<Item = (&'a str, Option<String>)>,
+    read_clone_branch: impl FnOnce() -> Result<Option<String>>,
+) -> bool {
+    matches!(
+        git_source_sync_branch_for_group(urls, source_branches, read_clone_branch),
+        GitSourceSyncBranch::Sync(_)
+    )
+}
+
+fn unique_unreferenced_git_paths<'a>(
+    candidates: impl IntoIterator<Item = (&'a str, &'a str)>,
+    referenced: &std::collections::HashSet<String>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut additions = Vec::new();
+    for (path, rel_path) in candidates {
+        if !referenced.contains(path) && seen.insert(path) {
+            additions.push((path, rel_path));
+        }
+    }
+    additions
+}
+
+#[cfg(test)]
+#[path = "service_git_tests.rs"]
+mod service_git_tests;
+
+/// Scan the known folder/git sources for level changes: files that appeared
+/// (no doc references them) and docs whose file vanished from the source.
+/// Pure detection (no writes) — the batch preview reports the counts and the
+/// batch run executes them. Sources whose scan hits the file cap
+/// (`truncated`) are SKIPPED entirely: a truncated scan is not authoritative
+/// and treating missing entries as deletions would mass-delete docs.
+async fn plan_source_sync(
+    app: &AppHandle,
+    docs: &[DocMeta],
+) -> Result<(Vec<SourceSyncAdd>, Vec<(String, String)>)> {
+    let dir = files_dir(app)?;
+    if !dir.exists() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    // Every original_path any doc references — a scanned file already
+    // referenced by ANY doc (even one from a different source) is not "new".
+    let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for meta in docs {
+        if let Some(op) = meta.original_path.as_deref().filter(|p| !p.is_empty()) {
+            referenced.insert(op.to_string());
+        }
+    }
+    let mut added: Vec<SourceSyncAdd> = Vec::new();
+    let mut removed: Vec<(String, String)> = Vec::new();
+    // Exclusion registry: paths (or dirs) the user told us to ignore. A
+    // scanned file whose path is excluded is never "new"; a doc whose
+    // original_path is excluded is never "removable".
+    let excluded = list_excluded_paths().await;
+
+    // Distinct folder roots (kind == "folder" with a recorded root).
+    let mut folder_roots: Vec<String> = Vec::new();
+    for meta in docs {
+        if let Some(src) = meta.source.as_ref() {
+            if src.kind == "folder" {
+                if let Some(root) = src.root.as_deref().filter(|r| !r.is_empty()) {
+                    if !folder_roots.iter().any(|r| r == root) {
+                        folder_roots.push(root.to_string());
+                    }
+                }
+            }
+        }
+    }
+    for root in &folder_roots {
+        let root_path = std::path::Path::new(root);
+        if !root_path.exists() {
+            // Root gone entirely: do NOT mass-delete its docs — the existing
+            // "lost original" badge + skip semantics cover this safely.
+            rag_log("warn", format!("sync: folder root missing, skipping: {root}"));
+            continue;
+        }
+        let scan = scan_folder_public(root_path, true);
+        if scan.truncated {
+            rag_log("warn", format!("sync: folder scan truncated, skipping add/remove detection: {root}"));
+            continue;
+        }
+        let mut current: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for group in &scan.groups {
+            for f in &group.files {
+                current.insert(f.path.clone());
+                if !referenced.contains(&f.path) && !is_path_excluded(&f.path, &excluded).await {
+                    added.push(SourceSyncAdd {
+                        path: f.path.clone(),
+                        source: crate::models::rag::DocSource {
+                            kind: "folder".to_string(),
+                            label: root.clone(),
+                            root: Some(root.clone()),
+                            rel_path: Some(group.rel_path.clone()),
+                            git: None,
+                        },
+                        method: "symlink",
+                    });
+                }
+            }
+        }
+        for meta in docs {
+            if let Some(op) = meta.original_path.as_deref().filter(|p| !p.is_empty()) {
+                // Removal requires BOTH: not in the fresh scan AND actually
+                // gone from disk. The scan applies extension/ignore filters —
+                // a file that merely fell out of the scan's candidate set
+                // (filter drift) must not delete its doc. Excluded docs are
+                // never removed (the user pinned them).
+                if path_under_root(op, root)
+                    && !current.contains(op)
+                    && !std::path::Path::new(op).exists()
+                    && !is_path_excluded(op, &excluded).await
+                {
+                    removed.push((meta.id.clone(), meta.name.clone()));
+                }
+            }
+        }
+    }
+
+    // Resolve each distinct URL once, then group aliases that share the same
+    // canonical persistent clone before checking branches or scanning.
+    for group in resolve_git_source_groups(app, docs).await {
+        let Some(url) = group.urls.first() else { continue };
+        let persistent = &group.persistent;
+        if !persistent.exists() {
+            // Clone dir gone (fresh import never persisted / refresh failed):
+            // skip — never treat that as mass deletion.
+            rag_log("warn", format!("sync: git clone dir missing, skipping: {url}"));
+            continue;
+        }
+        // All raw URL aliases of this clone must agree on a branch. In
+        // particular, None and Some(branch) conflict.
+        let source_branches = docs.iter().filter_map(|meta| {
+            meta.source
+                .as_ref()
+                .filter(|source| source.kind == "git")
+                .and_then(|source| source.git.as_ref())
+                .map(|git| (git.url.as_str(), git.branch.clone()))
+        });
+        let branch = match git_source_sync_branch_for_group(&group.urls, source_branches, || {
+            super::git::persistent_clone_branch(persistent)
+        }) {
+            GitSourceSyncBranch::Sync(branch) => branch,
+            GitSourceSyncBranch::SkipAmbiguous => {
+                rag_log(
+                    "warn",
+                    format!("sync: canonical git clone has docs from multiple branches, skipping add/remove detection: {url}"),
+                );
+                continue;
+            }
+            GitSourceSyncBranch::SkipCloneBranchMismatch(reason) => {
+                rag_log(
+                    "warn",
+                    format!("sync: git branch validation failed, skipping add/remove detection for {url}: {reason}"),
+                );
+                continue;
+            }
+        };
+        let scan = scan_folder_public(&persistent, true);
+        if scan.truncated {
+            rag_log("warn", format!("sync: git scan truncated, skipping add/remove detection: {url}"));
+            continue;
+        }
+        let mut current: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let candidates = scan.groups.iter().flat_map(|scan_group| {
+            scan_group
+                .files
+                .iter()
+                .map(move |file| (file.path.as_str(), scan_group.rel_path.as_str()))
+        });
+        let additions = unique_unreferenced_git_paths(candidates, &referenced);
+        for group in &scan.groups {
+            for f in &group.files {
+                current.insert(f.path.clone());
+            }
+        }
+        for (path, rel_path) in additions {
+            if !is_path_excluded(path, &excluded).await {
+                added.push(SourceSyncAdd {
+                    path: path.to_string(),
+                    source: crate::models::rag::DocSource {
+                        kind: "git".to_string(),
+                        label: match &branch {
+                            Some(b) => format!("{url} @ {b}"),
+                            None => url.clone(),
+                        },
+                        root: Some(persistent.to_string_lossy().into_owned()),
+                        rel_path: Some(rel_path.to_string()),
+                        git: Some(crate::models::rag::GitSource {
+                            url: url.clone(),
+                            branch: branch.clone(),
+                            commit: None,
+                            subdir: None,
+                        }),
+                    },
+                    method: "copy",
+                });
+            }
+        }
+        for meta in docs {
+            if let Some(op) = meta.original_path.as_deref().filter(|p| !p.is_empty()) {
+                // Same dual check as folders: scan-miss + file really gone.
+                // Excluded docs are never removed.
+                if path_under_root(op, &persistent.to_string_lossy())
+                    && !current.contains(op)
+                    && !std::path::Path::new(op).exists()
+                    && !is_path_excluded(op, &excluded).await
+                {
+                    removed.push((meta.id.clone(), meta.name.clone()));
+                }
+            }
+        }
+    }
+
+    // Single-file data sources (kind == "file", incl. legacy docs with no
+    // recorded source): the original IS the source — vanished file = doc
+    // removable. Dual check unnecessary (no scan/filter involved): the file
+    // simply must not exist on disk. Excluded docs are never removed.
+    for meta in docs {
+        let is_file_source = match meta.source.as_ref() {
+            Some(src) => src.kind == "file",
+            None => true,
+        };
+        if !is_file_source {
+            continue;
+        }
+        if let Some(op) = meta.original_path.as_deref().filter(|p| !p.is_empty()) {
+            if !removed.iter().any(|(id, _)| id == &meta.id)
+                && !std::path::Path::new(op).exists()
+                && !is_path_excluded(op, &excluded).await
+            {
+                removed.push((meta.id.clone(), meta.name.clone()));
+            }
+        }
+    }
+    Ok((added, removed))
+}
+
+/// Execute a sync plan: import the added files, delete the removed docs.
+/// Called by run_batch_update AFTER the git refresh; returns (added, removed)
+/// counts actually applied.
+async fn run_source_sync(app: &AppHandle, added: Vec<SourceSyncAdd>, removed: Vec<(String, String)>) -> (u32, u32) {
+    let mut added_count = 0u32;
+    for a in added {
+        // Race guard + import in ONE META_LOCK critical section: the plan
+        // (plan_source_sync) classified this file as "unreferenced" from a
+        // meta snapshot taken BEFORE the import. A concurrent manual
+        // upload/update may record the same path as a doc's original_path —
+        // re-scan the metas fresh AND import while still holding META_LOCK
+        // (the upload path itself does not acquire it, so no re-entrant
+        // deadlock; releasing before import would reopen the observed
+        // "same file twice" window).
+        let meta_guard = meta_lock().await.clone().lock_owned().await;
+        {
+            let dir = match files_dir(app) {
+                Ok(d) => d,
+                Err(e) => {
+                    rag_log("warn", format!("sync: files_dir failed: {:#}", e));
+                    continue;
                 }
             };
-            if let Err(e) = result {
-                rag_log("warn", format!("deferred LanceDB prune failed: {:#}", e));
+            let mut referenced = false;
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) != Some("meta") {
+                        continue;
+                    }
+                    let Ok(bytes) = std::fs::read(&p) else { continue };
+                    let Ok(meta) = serde_json::from_slice::<DocMeta>(&bytes) else { continue };
+                    if meta.original_path.as_deref() == Some(a.path.as_str()) {
+                        referenced = true;
+                        break;
+                    }
+                }
             }
-
-            let should_continue = {
-                let mut state = deferred_prune_state()
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state.complete(observed_generation)
-            };
-            if !should_continue {
-                break;
+            if referenced {
+                rag_log(
+                    "info",
+                    format!("sync: skip importing {} — a doc now references it (raced with manual update)", a.path),
+                );
+                continue;
             }
         }
+        let app = app.clone();
+        let path = a.path.clone();
+        let method = a.method.to_string();
+        let source = a.source;
+        match spawn_doc_mutation_with_guard(meta_guard, move |cancellation| async move {
+            let name = Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone());
+            let result = upload_one_path_inner(
+                &app,
+                &path,
+                Vec::new(),
+                Some(method),
+                Some(source),
+                cancellation,
+            )
+            .await;
+            if let Err(ref error) = result {
+                rag_log("error", format!("upload failed for '{}': {:#}", name, error));
+            }
+            result
+        })
+        .await
+        {
+            Ok(()) => {
+                added_count += 1;
+                rag_log("info", format!("sync: imported new source file {}", a.path));
+            }
+            Err(e) => rag_log("warn", format!("sync: import {} failed: {:#}", a.path, e)),
+        }
+    }
+    let mut removed_count = 0u32;
+    for (id, name) in removed {
+        match delete_doc(app, &id).await {
+            Ok(()) => {
+                removed_count += 1;
+                rag_log("info", format!("sync: removed doc '{}' (source file gone)", name));
+            }
+            Err(e) => rag_log("warn", format!("sync: delete doc '{}' failed: {:#}", name, e)),
+        }
+    }
+    (added_count, removed_count)
+}
+
+/// Dedup gate for the deferred lancedb prune. LanceDB is append-only: `delete`
+/// and overwrite just create new dataset versions that omit the old rows, and
+/// the old versions (with their embeddings) linger on disk until a prune runs.
+/// `optimize()` runs that prune — but it rewrites every surviving version and
+/// is slow (seconds), so calling it inline in `delete_doc`/overwrite blocks the
+/// IPC response for that whole duration, which is exactly why the doc list
+/// "doesn't refresh" after delete (the `await` never returns until prune ends).
+///
+/// Instead we kick off ONE deduped background prune: the first caller arms a
+/// spawned task that waits briefly (so a burst of deletes coalesces into a
+/// single prune) and then prunes once. While that task is pending, further
+/// callers are no-ops — they know a prune is already queued, so one prune
+/// covers them all. The caller's request returns immediately, and disk space
+/// is reclaimed a moment later without blocking the UI refresh.
+static PRUNE_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Wakes the parked prune task when a fresh delete/overwrite arrives after the
+/// coalesce delay has already elapsed but before the task re-checks the gate.
+static PRUNE_NOTIFY: OnceLock<tokio::sync::Notify> = OnceLock::new();
+
+fn prune_notify() -> &'static tokio::sync::Notify {
+    PRUNE_NOTIFY.get_or_init(|| tokio::sync::Notify::new())
+}
+
+/// Schedule a deduped background prune. Safe to call on every delete/overwrite;
+/// extra calls while one is queued or running are coalesced into that single
+/// prune. The caller does NOT wait — this returns immediately. If the runtime
+/// was just dropped (RAG disabled) between the caller's check and the task's,
+/// the task acquires the runtime lock, sees `None`, and exits harmlessly.
+fn schedule_deferred_prune(app: &AppHandle) {
+    // CAS: only the FIRST caller after an idle period arms a task. Concurrent
+    // callers (burst delete) lose the CAS and return — they rely on the armed
+    // task's prune (which will see their deletes too, since delete_by_doc
+    // already wrote the new versions before we get here).
+    if PRUNE_PENDING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return; // a prune is already queued/running — nothing to do
+    }
+    // Move the AppHandle into the spawned task so it owns 'static data (kept
+    // for future prune-event diagnostics; the prune itself only needs the
+    // runtime, which it re-acquires via the global lock below). Prefixed `_`
+    // because no current prune path reads it, but holding it prevents a future
+    // emit/diagnostics addition from silently dropping the handle.
+    let _app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // Coalesce window: a burst of deletes (batch delete, overwrite-many)
+        // should fold into ONE prune. Wait briefly so later deletes that lost
+        // the CAS land before we prune. Short enough that disk reclaim feels
+        // immediate, long enough that a 50-doc batch delete prunes once not
+        // 50×. The Notify lets a delete arriving just after this delay cut the
+        // wait short so reclaim still happens promptly in the single-doc case.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(800),
+            prune_notify().notified(),
+        )
+        .await;
+        // Take the runtime lock (same meta->runtime ordering invariant: we hold
+        // no meta lock here, and the inline delete paths have already released
+        // theirs, so there's no ordering risk). Holding it for the prune
+        // serializes against a concurrent reindex_doc/search on the same table.
+        let guard = runtime().lock().await;
+        let Some(rt) = guard.as_ref() else {
+            // RAG was disabled between the delete and the prune. The deleted
+            // rows' old versions will be reclaimed on next enable's optimize or
+            // a reset's drop_table; no orphan vectors are left queryable (the
+            // delete already wrote a version omitting them).
+            PRUNE_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
+        };
+        if let Err(e) = rt.db.optimize().await {
+            rag_log("warn", format!("deferred prune failed: {:#}", e));
+        }
+        // Clear the gate LAST so a delete that arrived during this prune (and
+        // lost the CAS) leaves PRUNE_PENDING=true — the next idle caller arms a
+        // fresh prune for those newer deletes.
+        PRUNE_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
+        // If a delete arrived during the prune (lost CAS, still pending), wake
+        // so the next armed task doesn't sit through the full coalesce delay.
+        prune_notify().notify_one();
     });
 }
 
@@ -250,15 +1323,276 @@ fn schedule_deferred_prune() {
 fn write_meta_atomic(meta_path: &Path, meta: &DocMeta) -> Result<()> {
     let bytes = serde_json::to_vec(meta)?;
     let tmp = meta_path.with_extension("meta.tmp");
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, meta_path)?;
+    if let Err(error) = std::fs::write(&tmp, &bytes) {
+        remove_failed_temp(&tmp);
+        return Err(error.into());
+    }
+    if let Err(error) = std::fs::rename(&tmp, meta_path) {
+        remove_failed_temp(&tmp);
+        return Err(error.into());
+    }
     Ok(())
 }
 
-/// The loaded runtime. Dropped on disable to release resources. `model` is a
-/// GGUF `Embedder` (candle) selected at load by `embedder::load_embedder`.
+fn remove_failed_temp(path: &Path) {
+    if let Err(error) = std::fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            rag_log(
+                "warn",
+                format!("remove temporary file {} failed: {}", path.display(), error),
+            );
+        }
+    }
+}
+
+/// Keep the original file recoverable until the document update is committed.
+/// This Drop-based guard handles returned errors and cancellation, not process
+/// crashes; a crash after the rename can leave a backup without startup recovery.
+struct FileBackup {
+    original: PathBuf,
+    backup: Option<PathBuf>,
+    committed: bool,
+}
+
+impl FileBackup {
+    fn new(path: &Path) -> Result<Self> {
+        let backup = if path.is_file() {
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+            let backup =
+                path.with_file_name(format!(".{}.mcphub-backup-{}", file_name, Uuid::new_v4()));
+            std::fs::rename(path, &backup)?;
+            Some(backup)
+        } else {
+            None
+        };
+        Ok(Self {
+            original: path.to_path_buf(),
+            backup,
+            committed: false,
+        })
+    }
+
+    fn stage_regular_file(path: &Path) -> Result<Option<Self>> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(anyhow!(
+                "cannot delete document because owned content path is not a regular file: {}",
+                path.display()
+            ));
+        }
+        let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("file");
+        let backup =
+            path.with_file_name(format!(".{}.mcphub-backup-{}", file_name, Uuid::new_v4()));
+        std::fs::rename(path, &backup)?;
+        Ok(Some(Self {
+            original: path.to_path_buf(),
+            backup: Some(backup),
+            committed: false,
+        }))
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+        if let Some(backup) = self.backup.take() {
+            if let Err(e) = std::fs::remove_file(&backup) {
+                rag_log(
+                    "warn",
+                    format!("remove temporary backup {} failed: {}", backup.display(), e),
+                );
+            }
+        }
+    }
+}
+
+struct DocFileBackups {
+    content: Option<FileBackup>,
+    meta: MetaFileBackup,
+}
+
+impl DocFileBackups {
+    fn new(content_path: Option<&Path>, meta_path: &Path) -> Result<Self> {
+        let content = content_path.map(FileBackup::new).transpose()?;
+        let meta = MetaFileBackup::new(meta_path)?;
+        Ok(Self { content, meta })
+    }
+
+    fn commit(self) {
+        if let Some(content) = self.content {
+            content.commit();
+        }
+        self.meta.commit();
+    }
+}
+
+/// Keep the published metadata visible during indexing. Unlike content files,
+/// readers and SQL pruning do not take META_LOCK, so renaming the old `.meta`
+/// away would make an in-flight update look like a deletion.
+struct MetaFileBackup {
+    original: PathBuf,
+    backup: Option<PathBuf>,
+    had_original: bool,
+    committed: bool,
+}
+
+impl MetaFileBackup {
+    fn new(path: &Path) -> Result<Self> {
+        let had_original = path.is_file();
+        let backup = if had_original {
+            let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("meta");
+            let backup =
+                path.with_file_name(format!(".{}.mcphub-backup-{}", file_name, Uuid::new_v4()));
+            if let Err(error) = std::fs::copy(path, &backup) {
+                remove_failed_temp(&backup);
+                return Err(error.into());
+            }
+            Some(backup)
+        } else {
+            None
+        };
+        Ok(Self {
+            original: path.to_path_buf(),
+            backup,
+            had_original,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+        if let Some(backup) = self.backup.take() {
+            if let Err(error) = std::fs::remove_file(&backup) {
+                rag_log(
+                    "warn",
+                    format!("remove temporary backup {} failed: {}", backup.display(), error),
+                );
+            }
+        }
+    }
+}
+
+impl Drop for MetaFileBackup {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.had_original {
+            if let Some(backup) = self.backup.take() {
+                let file_name = self
+                    .original
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("meta");
+                let restore_tmp = self
+                    .original
+                    .with_file_name(format!(".{}.restore-{}", file_name, Uuid::new_v4()));
+                let restored = std::fs::copy(&backup, &restore_tmp)
+                    .and_then(|_| std::fs::rename(&restore_tmp, &self.original));
+                match restored {
+                    Ok(()) => remove_failed_temp(&backup),
+                    Err(error) => {
+                        remove_failed_temp(&restore_tmp);
+                        rag_log(
+                            "error",
+                            format!(
+                                "restore metadata backup {} failed; backup retained: {}",
+                                backup.display(),
+                                error
+                            ),
+                        );
+                    }
+                }
+            }
+        } else if let Err(error) = std::fs::remove_file(&self.original) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                rag_log(
+                    "error",
+                    format!("remove uncommitted metadata {} failed: {}", self.original.display(), error),
+                );
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DocTransactionFailure {
+    Content(anyhow::Error),
+    Index(anyhow::Error),
+    Metadata(anyhow::Error),
+}
+
+async fn commit_doc_files<T, U, I, IFut, M>(
+    content: Option<(&Path, &str)>,
+    meta_path: &Path,
+    index: I,
+    write_meta: M,
+) -> std::result::Result<(T, U), DocTransactionFailure>
+where
+    I: FnOnce() -> IFut,
+    IFut: Future<Output = Result<T>>,
+    M: FnOnce(&T) -> Result<U>,
+{
+    let backups = DocFileBackups::new(content.map(|(path, _)| path), meta_path)
+        .map_err(DocTransactionFailure::Content)?;
+    if let Some((content_path, content)) = content {
+        let file_stem = content_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("content");
+        let tmp_path = content_path.with_file_name(format!(".{}.tmp", file_stem));
+        if let Err(error) = std::fs::write(&tmp_path, content) {
+            remove_failed_temp(&tmp_path);
+            return Err(DocTransactionFailure::Content(error.into()));
+        }
+        if let Err(error) = std::fs::rename(&tmp_path, content_path) {
+            remove_failed_temp(&tmp_path);
+            return Err(DocTransactionFailure::Content(error.into()));
+        }
+    }
+
+    // Direct future drops restore files; production calls run this helper in
+    // a detached, lock-owning worker so vector compensation also completes.
+    let indexed = index().await.map_err(DocTransactionFailure::Index)?;
+    let meta = write_meta(&indexed).map_err(DocTransactionFailure::Metadata)?;
+    backups.commit();
+    Ok((indexed, meta))
+}
+
+fn doc_content_path_for_write(
+    dir: &Path,
+    file_stem: &str,
+    method: Option<&str>,
+) -> Option<PathBuf> {
+    (method != Some("symlink")).then(|| dir.join(file_stem))
+}
+
+impl Drop for FileBackup {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if self.original.exists() {
+            let _ = std::fs::remove_file(&self.original);
+        }
+        if let Some(backup) = self.backup.take() {
+            if let Err(e) = std::fs::rename(&backup, &self.original) {
+                rag_log(
+                    "error",
+                    format!("restore file backup {} failed: {}", backup.display(), e),
+                );
+            }
+        }
+    }
+}
+
+/// The loaded runtime. Dropped on disable to release resources. The embedding
+/// MODEL lives in the shared mv runtime (`crate::mv`) since Phase 2 — this
+/// struct holds only RAG's own table handle + per-model deploy knobs read
+/// from the active model's deploy.json at start.
 struct Runtime {
-    model: Box<dyn Embedder>,
     db: VectorDb,
     /// Prefix prepended to each search query before embedding (from the loaded
     /// model's deploy.json `searchQueryPrefix`). "" for symmetric models. Used
@@ -278,7 +1612,6 @@ struct Runtime {
 }
 
 static RUNTIME: OnceLock<Mutex<Option<Runtime>>> = OnceLock::new();
-static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static INITIALIZING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Set when the vector table was recreated on the last enable (model swapped
 /// to a different embedding dim). The frontend reads `RagStatus.needs_reindex`
@@ -286,6 +1619,12 @@ static INITIALIZING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// embeddings are gone (table recreated), so the docs are still on disk but
 /// search returns nothing until re-indexed with the new model.
 static NEEDS_REINDEX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether the RAG consumer is currently registered with the shared mv
+/// runtime (i.e. RAG's own feature surface — MCP tools / search / reindex —
+/// is active). Replaces the old ENABLED semantics ("model loaded"): with the
+/// shared runtime the model may be up for Smart Routing while RAG is off, so
+/// RAG's gates must key on RAG's own registration, not on mv::is_running().
+static RAG_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn runtime() -> &'static Mutex<Option<Runtime>> {
     RUNTIME.get_or_init(|| Mutex::new(None))
@@ -300,584 +1639,31 @@ fn files_dir(app: &AppHandle) -> Result<PathBuf> {
     Ok(data_dir(app)?.join("files"))
 }
 
-fn lancedb_dir(app: &AppHandle) -> Result<PathBuf> {
-    Ok(data_dir(app)?.join("lancedb"))
-}
-
-/// Bundled model root. In **dev** (`tauri dev`) the source dir
-/// (`CARGO_MANIFEST_DIR/runtimes/rag/model`) is preferred so edits to the
-/// model files take effect live WITHOUT tauri recopying them to the target
-/// dir - and so deleted size dirs don't linger as stale copies under
-/// `target/debug/runtimes/` (tauri copies resources to target but does NOT
-/// remove dirs deleted from source, which made phantom `f16`/`q4` entries
-/// appear in the dropdown). In a packaged build the source path doesn't exist
-/// on the user's machine, so we fall back to the bundled resource dir.
-fn model_root(app: &AppHandle) -> Result<PathBuf> {
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("runtimes")
-        .join("rag")
-        .join("model");
-    if src.exists() {
-        return Ok(src);
+/// Validate a document id before it is ever joined into a filesystem path.
+/// Doc ids reach `dir.join(format!("{}.meta", id))` and friends from MCP tool
+/// arguments (`rag_get` / `rag_file_delete` / ...) that are exposed through
+/// the public HTTP MCP gateway — an unvalidated id containing `/`, `\` or a
+/// `..` segment escapes `rag/files/` (path traversal: arbitrary file delete /
+/// read-probe). Ids are generated as UUIDs; accept only a conservative
+/// charset so no legitimate id is rejected.
+pub(crate) fn validate_doc_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 128
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains("..")
+        || id.contains('\0')
+    {
+        return Err(anyhow!("invalid document id"));
     }
-    if let Ok(resource) = app.path().resource_dir() {
-        let p = resource.join("runtimes").join("rag").join("model");
-        if p.exists() {
-            return Ok(p);
-        }
+    if !id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+        return Err(anyhow!("invalid document id"));
     }
-    Ok(src)
-}
-
-/// Writable store for DOWNLOADED models: `<app_data>/rag/models/<family>/<size>/`.
-/// The bundled resource dir is read-only in a signed app, so models fetched via
-/// `download.url` land here. Mirrors the bundled layout.
-fn download_root(app: &AppHandle) -> Result<PathBuf> {
-    Ok(data_dir(app)?.join("models"))
-}
-
-/// The out-of-box default ready size: the size whose `deploy.json` has
-/// `"default": true` (and is ready), else the first ready size. Also the
-/// fallback when the persisted selection is gone (a model deleted in a later
-/// version). Sync (scans the model dirs).
-fn default_size(app: &AppHandle) -> Option<String> {
-    let models = list_models(app).ok()?;
-    models
-        .iter()
-        .find(|m| m.is_default && m.ready)
-        .or_else(|| models.iter().find(|m| m.ready))
-        .map(|m| m.size.clone())
-}
-
-/// The model's context window in tokens, from the SELECTED (or default) size
-/// dir's `config.json` `max_position_embeddings`. Used by the UI to cap the
-/// `chunk_size` input. Async because it reads the persisted selection; reads
-/// the file directly (no runtime) so the bound is available with RAG off.
-/// GGUF size dirs ship a config.json, so this works without loading the model.
-/// Falls back to 2048 if no size resolves.
-pub async fn model_max_context(app: &AppHandle) -> u32 {
-    let size = current_model().await.or_else(|| default_size(app));
-    let dir = size.and_then(|s| resolve_model_paths(app, &s).ok().flatten());
-    dir.map(|d| read_max_context(&d)).unwrap_or(2048)
-}
-
-/// The loaded model's chunk-size recommendation: `(max_context, chunk_size?,
-/// chunk_overlap?)`. The chunk values come from the selected size's
-/// `deploy.json` (`chunkSize` / `chunkOverlap`) — the model author's
-/// recommended retrieval granularity. `None` when the size dir isn't ready or
-/// the deploy.json omits the fields (the service falls back to 1024/100).
-/// Surfaced via `rag_model_limits` so the frontend's Auto mode can SHOW the
-/// resolved values (sliders disabled) and seed them when the user switches to
-/// manual. `max_context` is read the same way as `model_max_context`.
-pub async fn model_chunk_recommendation(app: &AppHandle) -> (u32, Option<u32>, Option<u32>) {
-    let size = current_model().await.or_else(|| default_size(app));
-    let dir = size.and_then(|s| resolve_model_paths(app, &s).ok().flatten());
-    let Some(d) = dir else {
-        return (2048, None, None);
-    };
-    let max_ctx = read_max_context(&d);
-    let cfg = crate::rag::embedder::read_deploy_config(&d);
-    (max_ctx, cfg.chunk_size, cfg.chunk_overlap)
-}
-
-/// Sum the on-disk size of the model file(s) in a ready size dir: any `*.gguf`
-/// file (bundled `model.gguf` or downloaded `model.gguf`). Small aux files
-/// (tokenizer.json/config.json) are excluded so the number reflects the model
-/// payload only.
-fn model_file_size(dir: &Path) -> u64 {
-    let mut total = 0u64;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for e in entries.flatten() {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            if name.ends_with(".gguf") {
-                if let Ok(m) = e.metadata() {
-                    total += m.len();
-                }
-            }
-        }
-    }
-    total
-}
-
-/// The parsed `download.url` (stage-18 JSON format): a `type` (must be "gguf")
-/// + an array of model-file URLs to fetch.
-#[derive(Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct DownloadUrl {
-    #[serde(default, rename = "type")]
-    format: String,
-    #[serde(default)]
-    model_url: Vec<String>,
-}
-
-fn read_download_url(path: &Path) -> Result<DownloadUrl> {
-    let text =
-        std::fs::read_to_string(path).map_err(|e| anyhow!("read {}: {}", path.display(), e))?;
-    let dl = serde_json::from_str::<DownloadUrl>(&text).map_err(|e| {
-        anyhow!(
-            "parse {} as JSON ({{type, modelUrl}}): {}",
-            path.display(),
-            e
-        )
-    })?;
-    if !dl.format.is_empty() && dl.format != "gguf" {
-        return Err(anyhow!(
-            "download.url in {} has type '{}' - only 'gguf' is supported (ONNX backend was removed)",
-            path.display(),
-            dl.format
-        ));
-    }
-    Ok(dl)
-}
-
-// ── model selection ─────────────────────────────────────────────────────────
-
-/// One selectable model size, surfaced to the frontend dropdown.
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct RagModelInfo {
-    /// Size key, e.g. "default", "q4", "f16". Used as the selection key
-    /// (persisted in `config_json.rag.model`).
-    pub size: String,
-    /// Dropdown label, e.g. "model_q4".
-    pub label: String,
-    /// "ready" (model file present, bundled or downloaded) | "downloadable"
-    /// (only download.url, not yet downloaded) | "unavailable".
-    pub status: String,
-    /// True if the model file (*.gguf) is available now
-    /// (selectable).
-    pub ready: bool,
-    /// True if a download.url exists (can be fetched).
-    pub downloadable: bool,
-    /// Backend format: "gguf" | "" (not ready). Drives the strategy
-    /// (`embedder::load_embedder`) and shows as a dropdown badge. For
-    /// downloadable sizes the future format is read from download.url's `type`
-    /// so the badge shows even before download.
-    #[serde(default)]
-    pub format: String,
-    /// Total size in bytes of the model file(s) on disk (ready sizes only);
-    /// 0 for downloadable sizes (unknown until downloaded). Shown in the
-    /// dropdown.
-    #[serde(default)]
-    pub file_size: u64,
-    /// Human description from the size dir's `deploy.json` `"description"` field
-    /// (shown in the dropdown next to the file size). Empty when absent.
-    #[serde(default)]
-    pub description: String,
-    /// True if this size's `deploy.json` has `"default": true` - the out-of-box
-    /// model and the fallback when the persisted selection is gone (a model
-    /// deleted in a later version). Surfaced so the dropdown can badge it.
-    #[serde(default, rename = "default")]
-    pub is_default: bool,
-    /// Sort order from deploy.json `"sort"` (lower = higher in dropdown; 0 default).
-    #[serde(default)]
-    pub sort: i32,
-}
-
-/// Scan `model/<family>/<size>/` and return one entry per size. A size is
-/// "ready" if its size dir (downloaded copy preferred, else the bundled dir)
-/// contains a `*.gguf` file; "downloadable" if a `download.url` is
-/// present but no model file yet. `format` is detected from the file present
-/// (ready) or read from download.url's `type` (downloadable).
-pub fn list_models(app: &AppHandle) -> Result<Vec<RagModelInfo>> {
-    let root = model_root(app)?;
-    let dl_root = download_root(app)?;
-    let mut out: Vec<RagModelInfo> = Vec::new();
-    if !root.exists() {
-        return Ok(out);
-    }
-    for fam in std::fs::read_dir(&root)? {
-        let fam_path = fam?.path();
-        if !fam_path.is_dir() {
-            continue;
-        }
-        let fam_name = fam_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        for sz in std::fs::read_dir(&fam_path)? {
-            let sz_path = sz?.path();
-            if !sz_path.is_dir() {
-                continue;
-            }
-            let size = sz_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-            if size.is_empty() {
-                continue;
-            }
-            let downloaded_dir = dl_root.join(fam_name).join(&size);
-            // Ready dir = downloaded copy if it has a model file, else bundled.
-            // `detect_format` returns "gguf"/"" by file presence.
-            let ready_dir = if !detect_format(&downloaded_dir).is_empty() {
-                Some(downloaded_dir)
-            } else if !detect_format(&sz_path.clone()).is_empty() {
-                Some(sz_path.clone())
-            } else {
-                None
-            };
-            let (ready, format, file_size) = match &ready_dir {
-                Some(d) => (true, detect_format(d).to_string(), model_file_size(d)),
-                None => (false, String::new(), 0u64),
-            };
-            let downloadable = sz_path.join("download.url").exists() && !ready;
-            // For downloadable sizes, surface the FUTURE format from
-            // download.url's `type` so the badge shows before download.
-            let format = if !format.is_empty() {
-                format
-            } else if downloadable {
-                read_download_url(&sz_path.join("download.url"))
-                    .map(|d| d.format)
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            let deploy_cfg = crate::rag::embedder::read_deploy_config(&sz_path);
-            out.push(RagModelInfo {
-                // Label = "<family-dir>-<size-dir>" (e.g. "embeddinggemma-default"),
-                // so multiple families/sizes are distinguishable in the dropdown.
-                label: format!("{}-{}", fam_name, size),
-                status: if ready {
-                    "ready".into()
-                } else if downloadable {
-                    "downloadable".into()
-                } else {
-                    "unavailable".into()
-                },
-                ready,
-                downloadable,
-                format,
-                file_size,
-                // Description, default flag, sort order from the bundled size
-                // dir's deploy.json (one read).
-                description: deploy_cfg.description.clone(),
-                is_default: deploy_cfg.is_default,
-                sort: deploy_cfg.sort,
-                size,
-            });
-        }
-    }
-    // `read_dir` returns entries in filesystem (arbitrary) order; sort by label
-    // for a stable ASCII-ordered dropdown (default < f16 < q4 < quantized ...).
-    // Sort by deploy.json `sort` (lower = higher), then label as tiebreaker.
-    out.sort_by(|a, b| a.sort.cmp(&b.sort).then(a.label.cmp(&b.label)));
-    Ok(out)
-}
-
-/// Resolve the size dir for the given size: the downloaded copy (under
-/// `<app_data>/rag/models/<family>/<size>/`) if it has a model file, else the
-/// bundled size dir if it has a model file. Returns `None` if the size isn't
-/// found or not ready (download.url only). Each size dir is self-contained
-/// (holds a *.gguf file + tokenizer.json + config.json).
-fn resolve_model_paths(app: &AppHandle, size: &str) -> Result<Option<PathBuf>> {
-    let root = model_root(app)?;
-    let dl_root = download_root(app)?;
-    for fam in std::fs::read_dir(&root)? {
-        let fam_path = fam?.path();
-        if !fam_path.is_dir() {
-            continue;
-        }
-        let fam_name = fam_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let bundled = fam_path.join(size);
-        if !bundled.is_dir() {
-            continue;
-        }
-        let downloaded_dir = dl_root.join(fam_name).join(size);
-        let size_dir = if !detect_format(&downloaded_dir).is_empty() {
-            downloaded_dir
-        } else if !detect_format(&bundled).is_empty() {
-            bundled
-        } else {
-            return Ok(None);
-        };
-        return Ok(Some(size_dir));
-    }
-    Ok(None)
-}
-
-/// The persisted selected model size (`config_json.rag.model`), or None.
-pub async fn current_model() -> Option<String> {
-    crate::services::config_service::get()
-        .await
-        .ok()
-        .and_then(|c| {
-            c.get("rag")
-                .and_then(|r| r.get("model"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
-}
-
-/// Persist `rag.model = <size>` (deep-merge; leaves other rag settings intact).
-async fn set_current_model(size: &str) {
-    let patch = json!({ "rag": { "model": size } });
-    if let Err(e) = crate::services::config_service::update(&patch).await {
-        rag_log("warn", format!("failed to persist rag.model: {}", e));
-    }
-}
-
-/// Select a model size: persist it, then auto-restart RAG if currently enabled
-/// (stop + start reloads the new model). If RAG is off, the next enable loads
-/// it. Returns the post-restart status (with `needs_reindex` if the dim
-/// changed). Errors if the size isn't ready.
-pub async fn select_model(app: &AppHandle, size: &str) -> Result<RagStatus> {
-    if resolve_model_paths(app, size)?.is_none() {
-        return Err(anyhow!("model '{}' is not ready - download it first", size));
-    }
-    set_current_model(size).await;
-    rag_log("info", format!("selected model size '{}'", size));
-    if is_enabled() {
-        stop().await;
-        start(app).await?;
-    }
-    Ok(status())
-}
-
-// ── model download ──────────────────────────────────────────────────────────
-
-/// Progress for a model download, emitted on `rag://model-download` so the
-/// dropdown's download item can show a rich progress bar. `phase` is
-/// "downloading" | "done" | "error". The bar shows total %, speed (B/s), ETA
-/// (seconds), and which file out of how many.
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RagModelDownloadProgress {
-    size: String,
-    phase: String,
-    /// Bytes downloaded so far (phase "downloading"), cumulative across files.
-    downloaded: u64,
-    /// Total bytes across all files (0 if unknown).
-    total: u64,
-    /// 0..100 (best-effort; 0 when total unknown).
-    percent: u8,
-    /// Download speed in bytes/sec (sliding-window estimate; 0 at the start).
-    speed: u64,
-    /// Estimated seconds remaining (0 if unknown / just started).
-    eta: u64,
-    /// 1-based index of the file currently downloading.
-    file_current: u32,
-    /// Total number of files in this model (length of download.url modelUrl).
-    file_total: u32,
-    /// Human message (current file name / "done").
-    message: Option<String>,
-}
-
-const MODEL_DOWNLOAD_EVENT: &str = "rag://model-download";
-
-fn emit_model_download(app: &AppHandle, p: RagModelDownloadProgress) {
-    if let Err(e) = app.emit(MODEL_DOWNLOAD_EVENT, &p) {
-        log::warn!("[RAG] emit model-download failed: {e}");
-    }
-}
-
-/// Download a model size via its `download.url` (stage-18 JSON format:
-/// `{"type":"gguf", "modelUrl":[...]}`). Each URL is streamed directly into
-/// `<app_data>/rag/models/<family>/<size>/`: file 0 -> `model.gguf`; additional
-/// URLs (if any) keep their URL basename. After success the size becomes
-/// "ready" and selectable. Emits `rag://model-download` throughout with
-/// cumulative %, speed, ETA, and file index/total.
-pub async fn download_model(app: &AppHandle, size: &str) -> Result<()> {
-    // Locate the download.url + family for this size.
-    let root = model_root(app)?;
-    let dl_root = download_root(app)?;
-    let mut family: Option<String> = None;
-    let mut dl_url: Option<DownloadUrl> = None;
-    for fam in std::fs::read_dir(&root)? {
-        let fam_path = fam?.path();
-        if !fam_path.is_dir() {
-            continue;
-        }
-        let url_file = fam_path.join(size).join("download.url");
-        if url_file.exists() {
-            family = fam_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(String::from);
-            dl_url = Some(read_download_url(&url_file)?);
-            break;
-        }
-    }
-    let family = family.ok_or_else(|| anyhow!("family dir not found for '{}'", size))?;
-    let dl_url = dl_url.ok_or_else(|| anyhow!("no download.url found for model '{}'", size))?;
-    if dl_url.model_url.is_empty() {
-        return Err(anyhow!(
-            "download.url for '{}' has no modelUrl entries",
-            size
-        ));
-    }
-    let fmt = dl_url.format.as_str();
-    let urls = dl_url.model_url.clone();
-    let file_total = urls.len() as u32;
-    let target_dir = dl_root.join(&family).join(size);
-    std::fs::create_dir_all(&target_dir)?;
-
-    rag_log(
-        "info",
-        format!(
-            "downloading model '{}': format={} files={}",
-            size,
-            fmt,
-            urls.len()
-        ),
-    );
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3600))
-        .build()
-        .map_err(|e| anyhow!("http client: {}", e))?;
-
-    // HEAD each URL first to learn the total size (for the cumulative % bar +
-    // ETA). Missing/zero content-length is tolerated (total stays 0 -> bar
-    // shows speed + file count but not %).
-    let mut sizes: Vec<u64> = Vec::with_capacity(urls.len());
-    for url in &urls {
-        let len = client
-            .head(url.as_str())
-            .send()
-            .await
-            .ok()
-            .and_then(|r| r.error_for_status().ok())
-            .and_then(|r| r.content_length())
-            .unwrap_or(0);
-        sizes.push(len);
-    }
-    let total: u64 = sizes.iter().sum();
-
-    // Download each file sequentially, accumulating cumulative progress across
-    // files. Speed/ETA use a sliding window reset every emit tick.
-    let mut cumulative: u64 = 0;
-    for (idx, url) in urls.iter().enumerate() {
-        let file_current = (idx as u32) + 1;
-        // Output filename: file 0 -> model.gguf; others keep URL basename.
-        let out_name = if idx == 0 {
-            "model.gguf".to_string()
-        } else {
-            url_basename(url)
-        };
-        let out_path = target_dir.join(&out_name);
-
-        emit_model_download(
-            app,
-            RagModelDownloadProgress {
-                size: size.to_string(),
-                phase: "downloading".into(),
-                downloaded: cumulative,
-                total,
-                percent: pct(cumulative, total),
-                speed: 0,
-                eta: 0,
-                file_current,
-                file_total,
-                message: Some(out_name.clone()),
-            },
-        );
-
-        let resp = client
-            .get(url.as_str())
-            .send()
-            .await
-            .map_err(|e| anyhow!("{} request: {}", out_name, e))?
-            .error_for_status()
-            .map_err(|e| anyhow!("{} status: {}", out_name, e))?;
-        {
-            use futures_util::StreamExt;
-            use tokio::io::AsyncWriteExt;
-            let mut file = tokio::fs::File::create(&out_path)
-                .await
-                .map_err(|e| anyhow!("create {}: {}", out_name, e))?;
-            let mut stream = resp.bytes_stream();
-            let mut last_emit = std::time::Instant::now();
-            let mut since_emit: u64 = 0; // bytes since last speed sample
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| anyhow!("{} stream: {}", out_name, e))?;
-                file.write_all(&chunk)
-                    .await
-                    .map_err(|e| anyhow!("write {}: {}", out_name, e))?;
-                let n = chunk.len() as u64;
-                cumulative = cumulative.saturating_add(n);
-                since_emit = since_emit.saturating_add(n);
-                if last_emit.elapsed() >= std::time::Duration::from_millis(200) {
-                    let elapsed_secs = last_emit.elapsed().as_secs_f64().max(0.001);
-                    let speed = (since_emit as f64 / elapsed_secs) as u64;
-                    let downloaded = cumulative;
-                    let percent = pct(downloaded, total);
-                    let eta = if speed > 0 && total > downloaded {
-                        (total - downloaded) / speed
-                    } else {
-                        0
-                    };
-                    emit_model_download(
-                        app,
-                        RagModelDownloadProgress {
-                            size: size.to_string(),
-                            phase: "downloading".into(),
-                            downloaded,
-                            total,
-                            percent,
-                            speed,
-                            eta,
-                            file_current,
-                            file_total,
-                            message: Some(out_name.clone()),
-                        },
-                    );
-                    last_emit = std::time::Instant::now();
-                    since_emit = 0;
-                }
-            }
-            file.flush()
-                .await
-                .map_err(|e| anyhow!("flush {}: {}", out_name, e))?;
-        }
-        let _ = &sizes[idx]; // per-file size available if needed for logging
-    }
-
-    // Verify the model file landed.
-    let model_file = "model.gguf";
-    if !target_dir.join(model_file).exists() {
-        return Err(anyhow!("{} download failed for '{}'", model_file, size));
-    }
-
-    rag_log(
-        "info",
-        format!("model '{}' downloaded ({} files)", size, file_total),
-    );
-    emit_model_download(
-        app,
-        RagModelDownloadProgress {
-            size: size.to_string(),
-            phase: "done".into(),
-            downloaded: total,
-            total,
-            percent: 100,
-            speed: 0,
-            eta: 0,
-            file_current: file_total,
-            file_total,
-            message: Some("done".into()),
-        },
-    );
     Ok(())
 }
 
-/// 0..100 percent of `done / total`; 0 when total is unknown.
-fn pct(done: u64, total: u64) -> u8 {
-    if total == 0 {
-        0
-    } else {
-        ((done as f64 / total as f64) * 100.0).min(100.0) as u8
-    }
-}
-
-/// Basename of a URL's path - used to save an additional model file under its
-/// URL basename. Strips a trailing query string first; falls back to
-/// "model_data.bin".
-fn url_basename(url: &str) -> String {
-    let path = url.split('?').next().unwrap_or(url);
-    path.rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("model_data.bin")
-        .to_string()
+fn lancedb_dir(app: &AppHandle) -> Result<PathBuf> {
+    Ok(data_dir(app)?.join("lancedb"))
 }
 
 // ── lifecycle ───────────────────────────────────────────────────────────────
@@ -894,6 +1680,25 @@ pub async fn toggle(app: &AppHandle, enabled: bool) -> Result<RagStatus> {
     // Persist the intent (only reached on success — start() returns early on
     // failure, so a failed enable leaves the previous intent unchanged).
     persist_enabled(app, enabled).await;
+    // The builtin server's SR-index rows must follow the toggle: enabling
+    // adds rag_* tools to smart_route_search's corpus, disabling removes
+    // them (stale rows would advertise tools that now error "RAG disabled").
+    // Meta tools are excluded by the indexer itself. Best-effort.
+    {
+        let h = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let desc = Some("Built-in capabilities (RAG, Smart Routing, prompts, resources)".to_string());
+            if enabled {
+                let tools = builtin_tools();
+                if !tools.is_empty() {
+                    let _ = crate::smart_routing::index::save_server_embeddings(crate::rag::service::BUILTIN_SERVER_NAME, desc.as_deref(), &tools).await;
+                }
+            } else {
+                let _ = crate::smart_routing::index::remove_server_embeddings(crate::rag::service::BUILTIN_SERVER_NAME).await;
+            }
+            let _ = h;
+        });
+    }
     Ok(status())
 }
 
@@ -923,30 +1728,26 @@ async fn persist_enabled(app: &AppHandle, enabled: bool) {
 
 pub async fn start(app: &AppHandle) -> Result<()> {
     INITIALIZING.store(true, std::sync::atomic::Ordering::SeqCst);
-    rag_log(
-        "info",
-        "enabling RAG (loading embedding model + opening vector DB)…",
-    );
-    let res = async {
+    rag_log("info", "enabling RAG (ensuring shared mv runtime + opening rag_chunk table)…");
+    let res: Result<bool, anyhow::Error> = async {
         check_memory_sufficient()?;
-        // Resolve the selected model size: the persisted selection, else the
-        // out-of-box default (the size whose deploy.json has "default": true).
-        // If the persisted size can't be resolved (deleted in a later version),
-        // fall back to the default and persist it so we don't keep trying the
-        // gone one. The size dir is self-contained (*.gguf file +
-        // tokenizer + config); `embedder::load_embedder` detects the format.
+        // Resolve the selected model size: the persisted selection (mv.model,
+        // fallback rag.model), else the out-of-box default (the size whose
+        // deploy.json has "default": true). If the persisted size can't be
+        // resolved (deleted in a later version), fall back to the default and
+        // persist it so we don't keep trying the gone one.
         let size = {
-            let persisted = current_model().await;
+            let persisted = mv::current_model().await;
             let resolved = persisted
                 .as_ref()
-                .and_then(|s| resolve_model_paths(app, s).ok().flatten());
+                .and_then(|s| mv::models::resolve_model_paths(app, s).ok().flatten());
             match resolved {
                 // Persisted selection is still ready - use it.
                 Some(_) => persisted.unwrap(),
                 None => {
                     // No selection, OR the persisted one is gone (deleted) -
                     // fall back to the default ready size and persist it.
-                    let default = default_size(app)
+                    let default = mv::models::default_size(app)
                         .ok_or_else(|| anyhow!("no ready model - download one first"))?;
                     if persisted.as_deref() != Some(&default) {
                         rag_log(
@@ -957,20 +1758,23 @@ pub async fn start(app: &AppHandle) -> Result<()> {
                                 default
                             ),
                         );
-                        set_current_model(&default).await;
+                        mv::models::persist_selection(&default).await;
                     }
                     default
                 }
             }
         };
-        let size_dir = resolve_model_paths(app, &size)?
-            .ok_or_else(|| anyhow!("model '{}' not ready - download it first", size))?;
-        let model = load_embedder(&size_dir)?;
+        let _ = &size; // ensure_started reads the same persisted selection
+        // Shared runtime: loads the model (or reuses/reloads it when another
+        // consumer kept it alive and the persisted selection differs).
+        let info = mv::ensure_started("rag", app).await?;
+        let size_dir = mv::models::resolve_model_paths(app, &info.active_model)?
+            .ok_or_else(|| anyhow!("model '{}' not ready - download it first", info.active_model))?;
         // Read the model's deploy.json once for the asymmetric embedding
         // prefixes (searchQueryPrefix / importDocPrefix) - applied per-call in
         // `search` (query side) and `reindex_doc` (document side). "" for
         // symmetric models (Gemma) so behavior is unchanged when unset.
-        let deploy = crate::rag::embedder::read_deploy_config(&size_dir);
+        let deploy = mv::embedder::read_deploy_config(&size_dir);
         // Model name = "<family>-<size>" (the dropdown label, e.g.
         // "embeddinggemma-default") - derived from the resolved size dir so it
         // works for the GGUF backend and matches what the user sees.
@@ -979,46 +1783,83 @@ pub async fn start(app: &AppHandle) -> Result<()> {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("");
-        let model_name = format!("{}-{}", family, size);
+        let model_name = format!("{}-{}", family, info.active_model);
         // Surface the model + backend + execution-provider decision to the Logs
-        // page so slow imports can be diagnosed. `backend()` = gguf;
-        // `ep_label()` carries the EP detail (e.g. "Metal", "CoreML+CPU", "CPU").
-        // This is THE signal for whether the model is on GPU or stuck on CPU.
+        // page (same line as pre-mv, so log-based diagnostics keep working).
         rag_log(
             "info",
             format!(
-                "model loaded: name={} dim={} max_context={} backend={} ep={} query_prefix={:?} doc_prefix={:?}",
-                model_name,
-                model.embed_dim(),
-                model.max_context(),
-                model.backend(),
-                model.ep_label(),
-                deploy.search_query_prefix,
-                deploy.import_doc_prefix,
+                "model loaded: name={} dim={} backend=gguf query_prefix={:?} doc_prefix={:?}",
+                model_name, info.embed_dim, deploy.search_query_prefix, deploy.import_doc_prefix,
             ),
         );
-        // Open the vector DB for the loaded model's embed_dim. If an existing
+        // Open the RAG table on the SHARED mv connection (mv owns the single
+        // lancedb connection; consumers own their tables). If an existing
         // table has a different dim (model swapped), it's dropped+recreated —
         // `db.needs_reindex()` then tells us to re-index all docs (old
         // embeddings are gone / meaningless under the new model).
-        let db = VectorDb::open(&lancedb_dir(app)?, model.embed_dim()).await?;
-        let needs_reindex = db.needs_reindex();
+        let conn = mv::connection_async().await?;
+        let db = VectorDb::open_with_conn(conn, &lancedb_dir(app)?, info.embed_dim).await?;
+        let mut needs_reindex = db.needs_reindex();
+        // Same-dim model swap fix (Phase 2): the table's dim check can't see a
+        // model change that kept the dim (e.g. f16 -> q4 of the same family).
+        // Compare the model the index was built with against the now-active
+        // one; a difference forces a re-embed even though the schema matches.
+        let indexed_model = get_indexed_model().await;
+        if !needs_reindex && indexed_model.as_deref().is_some_and(|m| m != info.active_model) {
+            rag_log(
+                "info",
+                format!(
+                    "model changed ({} -> {}) at the same embedding dim — reindex required",
+                    indexed_model.as_deref().unwrap_or("(none)"),
+                    info.active_model
+                ),
+            );
+            needs_reindex = true;
+        }
         if needs_reindex {
             // Old embeddings are gone; zero the on-disk `.meta` chunk_count so
             // the list view reflects reality (0) until reindex repopulates.
-            zero_all_chunk_counts(app)?;
+            zero_all_chunk_counts(app).await?;
+        } else {
+            // List-vs-vector consistency check (the "起码的数据一致" invariant):
+            // every doc whose meta claims chunks must be vector-searchable.
+            // `open_with_conn` above silently creates a FRESH table when the
+            // lancedb dir was wiped / corrupted / deleted — that case reports
+            // needs_reindex=false (no prior data from the table's view) while
+            // the .meta files still say chunk_count>0, which would leave the
+            // doc list showing "indexed" docs that vector search can never
+            // find. Detect it here and treat it exactly like a dim swap:
+            // zero the chunk counts + request a full reindex.
+            let indexed_metas = count_indexed_metas(app).unwrap_or(0);
+            if indexed_metas > 0 {
+                let rows = db.count_rows().await.unwrap_or(0);
+                if rows == 0 {
+                    rag_log(
+                        "warn",
+                        format!(
+                            "vector store is empty but {indexed_metas} doc(s) claim indexed chunks — vectors lost, reindex required"
+                        ),
+                    );
+                    zero_all_chunk_counts(app).await?;
+                    needs_reindex = true;
+                }
+            }
         }
         let mut guard = runtime().lock().await;
         *guard = Some(Runtime {
-            model,
             db,
             search_query_prefix: deploy.search_query_prefix,
             import_doc_prefix: deploy.import_doc_prefix,
             deploy_chunk_size: deploy.chunk_size,
             deploy_chunk_overlap: deploy.chunk_overlap,
         });
-        let rss_after_load = crate::rag::embedder::process_rss_mib().unwrap_or(0);
-        rag_log("info", format!("model stored in runtime (RSS: {} MiB)", rss_after_load));
+        drop(guard);
+        if !needs_reindex {
+            // Embeddings are valid under this model — record it so a future
+            // same-dim swap is detectable.
+            set_indexed_model(&info.active_model).await;
+        }
         Ok::<_, anyhow::Error>(needs_reindex)
     }
     .await;
@@ -1030,42 +1871,45 @@ pub async fn start(app: &AppHandle) -> Result<()> {
             return Err(e);
         }
     };
-    ENABLED.store(true, std::sync::atomic::Ordering::SeqCst);
+    RAG_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
     NEEDS_REINDEX.store(needs_reindex, std::sync::atomic::Ordering::SeqCst);
     // Startup reconciliation: rebuild the SQL mirror tables (rag_docs /
     // rag_doc_tags / rag_tags) from the on-disk .meta files. Cheap (one scan +
     // one transaction) and heals any drift from a crash mid-CRUD or manual
     // .meta edits. Non-fatal: queries fall back to whatever is in the tables.
     if let Err(e) = rebuild_rag_sql_index(app).await {
-        rag_log(
-            "warn",
-            format!("startup rebuild_rag_sql_index failed: {}", e),
-        );
+        rag_log("warn", format!("startup rebuild_rag_sql_index failed: {}", e));
     }
     if needs_reindex {
         rag_log("info", "RAG enabled (model + vector DB ready); embedding dim changed — reindex required (frontend will prompt)");
     } else {
         rag_log("info", "RAG enabled (model + vector DB ready)");
     }
+    // Re-arm the auto doc-update timer now that the runtime is up (a no-op if
+    // the setting is off — the loop exits on its first settings read). The
+    // generation bump retires any loop left over from a previous enable.
     restart_auto_update_timer(app);
     Ok(())
 }
 
 pub async fn stop() {
-    AUTO_UPDATE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let rss_before = crate::rag::embedder::process_rss_mib().unwrap_or(0);
+    // Don't race an in-flight start(): wait (bounded) for INITIALIZING to
+    // clear, otherwise a boot auto-restore / toggle enable could re-assert
+    // RAG_ACTIVE AFTER this stop ran and leave RAG "enabled" against the
+    // user's intent.
+    let waited = std::time::Instant::now();
+    while INITIALIZING.load(std::sync::atomic::Ordering::SeqCst) {
+        if waited.elapsed() > std::time::Duration::from_secs(180) {
+            rag_log("warn", "stop: start() still initializing after 180s — proceeding anyway");
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     let mut guard = runtime().lock().await;
     if let Some(rt) = guard.take() {
-        rag_log("info", "stop: runtime found, dropping model + db");
-        let Runtime { model, db, .. } = rt;
-        drop(db); // lancedb Connection -> freed
-                  // Drop the model (candle GgufEmbedder). For candle:
-                  //   CPU: Tensors (CpuStorage Vec<f32>) freed by Rust drop; mi_collect
-                  //        returns freed pages to OS.
-                  //   Metal: Tensors (MetalStorage Arc<Buffer>) freed when the buffer
-                  //        pool Arc hits 0 (all MetalDevice clones dropped). Metal
-                  //        framework releases GPU buffers (not mimalloc-managed).
-        drop(model);
+        rag_log("info", "stop: runtime found, dropping rag_chunk table handle");
+        let Runtime { db, .. } = rt;
+        drop(db);    // lancedb table/connection handle -> freed
     } else {
         rag_log(
             "info",
@@ -1073,52 +1917,112 @@ pub async fn stop() {
         );
     }
     drop(guard);
-    ENABLED.store(false, std::sync::atomic::Ordering::SeqCst);
+    RAG_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
     NEEDS_REINDEX.store(false, std::sync::atomic::Ordering::SeqCst);
-    // Use the `libmimalloc-sys` binding (not a raw extern): referencing the
-    // crate forces its static archive into this (cdylib) link, so the
-    // `mi_collect` symbol resolves. See Cargo.toml for why the bin's
-    // #[global_allocator] alone isn't enough for the lib.
-    unsafe {
-        libmimalloc_sys::mi_collect(true);
-    }
-    // Wait 5s for mimalloc's purge_delay (default 10ms) to complete so the
-    // RSS measurement reflects the actual freed memory (MADV_DONTNEED returns
-    // pages to OS asynchronously on macOS).
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    let rss_after = crate::rag::embedder::process_rss_mib().unwrap_or(0);
-    rag_log(
-        "info",
-        format!(
-            "RAG disabled (RSS: {} -> {} MiB, freed {} MiB, mi_collect done)",
-            rss_before,
-            rss_after,
-            rss_before.saturating_sub(rss_after)
-        ),
-    );
+    // Shared runtime: release the consumer slot. When no other consumer (e.g.
+    // Smart Routing) is registered, mv drops the model + connection and does
+    // the mimalloc collect + RSS logging (the old stop semantics); otherwise
+    // the model stays up for the remaining consumer.
+    // Wait for an mv-level model load first: release() takes the runtime slot
+    // only if populated — if Smart Routing just triggered ensure_started, the
+    // slot is filled AFTER release returns and the model would run with zero
+    // consumers (leaked, never released). See mv/mod.rs release docs.
+    crate::mv::wait_while_initializing(std::time::Duration::from_secs(180)).await;
+    crate::mv::release("rag").await;
 }
 
 // `mi_collect` is provided by `libmimalloc-sys` (the `extended` feature) —
-// used above to force mimalloc to return freed pages to the OS after RAG
-// shutdown. See Cargo.toml for the linkage rationale.
+// used inside `mv::release` to force mimalloc to return freed pages to the OS
+// after the last consumer releases. See Cargo.toml for the linkage rationale.
 
 pub fn status() -> RagStatus {
     RagStatus {
-        enabled: ENABLED.load(std::sync::atomic::Ordering::SeqCst),
+        enabled: RAG_ACTIVE.load(std::sync::atomic::Ordering::SeqCst),
         initializing: INITIALIZING.load(std::sync::atomic::Ordering::SeqCst),
         needs_reindex: NEEDS_REINDEX.load(std::sync::atomic::Ordering::SeqCst),
+        embed_dim: crate::mv::embed_dim().map(|d| d as u32),
+        mv_running: crate::mv::is_running(),
     }
 }
 
-/// Whether RAG is enabled (runtime loaded). Used by the MCP layer to decide
-/// whether to advertise `rag_search` / `rag_get`.
+/// Whether RAG's own feature surface is active (consumer registered with the
+/// shared runtime). Used by the MCP layer to decide whether to advertise
+/// `rag_search` / `rag_get`. NOTE: the shared model may be running (for
+/// Smart Routing) while this is false — use `crate::mv::is_running()` for
+/// "model loaded" semantics.
 pub fn is_enabled() -> bool {
-    ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+    RAG_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The model the current vector index was built with (`rag.indexedModel`),
+/// persisted at start (no reindex needed) and after `reindex_all`. Used to
+/// detect a same-dim model swap, which the table's dim check cannot see.
+async fn get_indexed_model() -> Option<String> {
+    crate::services::config_service::get()
+        .await
+        .ok()
+        .and_then(|c| {
+            c.get("rag")
+                .and_then(|r| r.get("indexedModel"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+}
+
+async fn set_indexed_model(model: &str) {
+    let patch = json!({ "rag": { "indexedModel": model } });
+    if let Err(e) = crate::services::config_service::update(&patch).await {
+        rag_log("warn", format!("failed to persist rag.indexedModel: {}", e));
+    }
+}
+
+// ── model management (thin delegates to mv — command contract unchanged) ────
+
+pub fn list_models(app: &AppHandle) -> Result<Vec<crate::mv::RagModelInfo>> {
+    mv::list_models(app)
+}
+
+pub async fn download_model(app: &AppHandle, size: &str) -> Result<()> {
+    mv::download_model(app, size).await
+}
+
+pub async fn current_model() -> Option<String> {
+    mv::current_model().await
+}
+
+pub async fn model_max_context(app: &AppHandle) -> u32 {
+    mv::model_max_context(app).await
+}
+
+pub async fn model_chunk_recommendation(app: &AppHandle) -> (u32, Option<u32>, Option<u32>) {
+    mv::model_chunk_recommendation(app).await
+}
+
+/// Select a model size: persist it (mv.model), then auto-restart RAG if
+/// currently enabled (stop + start reloads the new model — mv's
+/// ensure_started sees the changed selection and reloads). If RAG is off, the
+/// next enable loads it. Returns the post-restart status (with
+/// `needs_reindex` if the dim changed OR a same-dim model swap was detected).
+pub async fn select_model(app: &AppHandle, size: &str) -> Result<RagStatus> {
+    mv::ensure_model_ready(app, size)?;
+    mv::persist_selection(size).await;
+    if is_enabled() {
+        stop().await;
+        start(app).await?;
+    } else if crate::mv::is_running() {
+        // Smart-Routing-only (RAG off) with the shared model up: reload the
+        // model so the new selection takes effect immediately. release("smart")
+        // drops the last consumer → model freed; ensure_started re-registers
+        // and loads the newly-selected model (needs_reload sees the change).
+        crate::mv::release("smart").await;
+        mv::ensure_started("smart", app).await?;
+    }
+    Ok(status())
 }
 
 /// The app-level RAG tool definitions (name / description / inputSchema) that
 /// the MCP `tools/list` advertises while RAG is enabled. Single source of
-/// truth - consumed both by the HTTP MCP layer (`dispatch_mcp`) and by the
+/// truth - consumed both by the rmcp bridge (`rmcp_bridge.rs`) and by the
 /// `rag_tools` command that powers the "view tools" dialog in the UI.
 pub fn tool_definitions() -> Vec<serde_json::Value> {
     vec![
@@ -1158,7 +2062,7 @@ pub fn tool_definitions() -> Vec<serde_json::Value> {
         }),
         json!({
             "name": "rag_file_create",
-            "description": "Create a new RAG document from UTF-8 text content and index it for semantic search. The file is stored as {docName}.{docType} (e.g. readme.md). Returns the created docId. Overwrites any existing document with the same filename.",
+            "description": "Create a new RAG document from UTF-8 text content and index it for semantic search. The file is stored as {docName}.{docType} (e.g. readme.md). Returns the created docId. Documents with duplicate names coexist (a new docId is created); use rag_file_update to modify an existing document.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1231,6 +2135,11 @@ pub fn builtin_tools() -> Vec<crate::models::server::Tool> {
             enabled: true,
             annotations: None,
             output_schema: None,
+            title: None,
+            execution: None,
+            icons: None,
+            meta: None,
+            description_overridden: false,
         })
         .collect()
 }
@@ -1255,6 +2164,7 @@ pub async fn call_builtin_tool(
     }
     let text_content = |s: String| vec![serde_json::json!({ "type": "text", "text": s })];
     let ok = |s: String| ToolCallResult {
+        raw_meta: None,
         content: text_content(s),
         is_error: false,
         structured_content: None,
@@ -1360,15 +2270,21 @@ pub async fn call_builtin_tool(
 ///   - resources: all builtin resources (resource_service)
 /// The frontend renders it like any server (with management actions disabled);
 /// groups select its tools/prompts/resources per-server like any server.
+/// ALL tools the builtin "mcphub-desktop" server exposes — the single source
+/// of truth used by BOTH the server listing (UI / tools/list / cost) AND the
+/// Smart Routing index (which filters out the meta tools itself). New builtin
+/// capabilities append here once and propagate everywhere; nothing downstream
+/// hardcodes tool names.
+pub async fn builtin_server_tools() -> Vec<crate::models::server::Tool> {
+    let mut tools = if is_enabled() { builtin_tools() } else { Vec::new() };
+    // Smart Routing meta tools on the builtin server (UI + test invocation).
+    tools.extend(crate::smart_routing::meta::builtin_meta_tools().await);
+    tools
+}
+
 pub async fn builtin_server_info() -> Option<crate::models::server::ServerInfo> {
     use crate::models::server::{ServerConfig, ServerInfo, ServerStatus, ServerType};
-    // Tools: RAG tools only while RAG is enabled. Always-empty when off so the
-    // server still shows (with its prompts/resources).
-    let tools = if is_enabled() {
-        builtin_tools()
-    } else {
-        Vec::new()
-    };
+    let tools = builtin_server_tools().await;
     let tool_count = tools.len();
     // Prompts/resources: the builtin library (always available, independent of RAG).
     let prompts = crate::services::prompt_service::list_all()
@@ -1394,6 +2310,9 @@ pub async fn builtin_server_info() -> Option<crate::models::server::ServerInfo> 
             start_on_demand: None,
             idle_timeout_ms: None,
             proxy: None,
+            enable_keep_alive: None,
+            keep_alive_interval: None,
+            passthrough_headers: None,
             enabled: true,
         },
         status: ServerStatus {
@@ -1414,7 +2333,7 @@ pub async fn builtin_server_info() -> Option<crate::models::server::ServerInfo> 
 
 // ── documents ───────────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct DocMeta {
     id: String,
     name: String,
@@ -1454,6 +2373,11 @@ struct DocMeta {
     /// -> treated as "has update" by `check_rag_update`.
     #[serde(default)]
     md5: Option<String>,
+    /// Where the doc came from ("data source"): file / folder / git / tool.
+    /// `None` for legacy docs (pre-feature) — classified as kind "file" at
+    /// read time so the tree view groups them under the "file pick" node.
+    #[serde(default)]
+    source: Option<crate::models::rag::DocSource>,
 }
 
 /// Default content version for a freshly-uploaded doc + back-compat fallback
@@ -1474,7 +2398,7 @@ pub async fn list_tags(search_keys: Vec<String>) -> Result<Vec<RagTagStat>> {
         "SELECT tag, file_count FROM rag_tags ORDER BY file_count DESC, created_at DESC, tag",
     )
     .fetch_all(pool)
-    .await?;
+        .await?;
     let keys: Vec<String> = search_keys
         .into_iter()
         .map(|k| k.trim().to_lowercase())
@@ -1501,7 +2425,11 @@ pub async fn list_tags(search_keys: Vec<String>) -> Result<Vec<RagTagStat>> {
 /// `page` is 0-based; `page_size` is clamped to a sane range. Returns the
 /// page's items + the total matching count (so the UI can show "load more"
 /// / stop fetching).
-pub async fn list_tags_paged(search_key: String, page: u32, page_size: u32) -> Result<RagTagPage> {
+pub async fn list_tags_paged(
+    search_key: String,
+    page: u32,
+    page_size: u32,
+) -> Result<RagTagPage> {
     let pool = crate::db::pool();
     let page = page.min(10_000);
     // Clamp page_size: at least 1, at most 200 — defends against accidental
@@ -1662,6 +2590,15 @@ async fn upsert_doc_sql(meta: &DocMeta) -> Result<()> {
     .execute(&mut *tx)
     .await?;
 
+    // FTS 同步（§4.3 铁律：与 rag_docs 镜像同事务；ref_id=id，文本=name）
+    crate::services::fts_service::sync_upsert_tx(
+        &mut tx,
+        crate::services::fts_service::FtsTable::RagDocs,
+        &meta.id,
+        &meta.name,
+    )
+    .await?;
+
     tx.commit().await?;
     Ok(())
 }
@@ -1690,8 +2627,63 @@ async fn remove_doc_sql(doc_id: &str) -> Result<()> {
         .bind(doc_id)
         .execute(&mut *tx)
         .await?;
+    // FTS 同步（§4.3 铁律：同事务删 fts_rag_docs）
+    crate::services::fts_service::sync_delete_tx(
+        &mut tx,
+        crate::services::fts_service::FtsTable::RagDocs,
+        doc_id,
+    )
+    .await?;
 
     tx.commit().await?;
+    Ok(())
+}
+
+/// 定向对账：清除 `.meta` 文件已丢失的 SQL 镜像孤儿行（rag_docs /
+/// rag_doc_tags / rag_tags 计数 / fts_rag_docs，经 remove_doc_sql），并顺带
+/// 清掉 lancedb 里的孤儿向量。meta 是唯一事实源——list_docs /
+/// search_docs_paged 从 meta 富化条目并静默跳过丢失者，若只清文件不清 SQL，
+/// 前端就会看到「计数 N 但列表空」的幽灵条目。开销极低：一次 SELECT + 每行
+/// 一次 fs stat，仅在发现孤儿时才做删除。list_docs / search_docs_paged 入口
+/// 各调一次（此时 RAG 必然处于开启态，runtime 可用）。
+async fn prune_stale_sql_docs(app: &AppHandle, dir: &Path) -> Result<()> {
+    let pool = crate::db::pool();
+    let sql_ids: Vec<String> = sqlx::query("SELECT id FROM rag_docs")
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .filter_map(|r| sqlx::Row::try_get(r, "id").ok())
+        .collect();
+    let stale: Vec<String> = sql_ids
+        .into_iter()
+        .filter(|id| !dir.join(format!("{}.meta", id)).exists())
+        .collect();
+    if stale.is_empty() {
+        return Ok(());
+    }
+    // 孤儿向量清理（lancedb）——runtime 缺失时跳过（RAG 关闭态不会走到这里，
+    // 这里只是防御）；prune 去重调度一次即可。
+    {
+        let guard = runtime().lock().await;
+        if let Some(rt) = guard.as_ref() {
+            for id in &stale {
+                let _ = rt.db.delete_by_doc(id).await;
+            }
+            drop(guard);
+            schedule_deferred_prune(app);
+        }
+    }
+    for id in &stale {
+        remove_doc_sql(id).await?;
+    }
+    rag_log(
+        "warn",
+        &format!(
+            "[rag] pruned {} stale SQL doc rows whose .meta vanished: {}",
+            stale.len(),
+            stale.join(", ")
+        ),
+    );
     Ok(())
 }
 
@@ -1699,7 +2691,6 @@ async fn remove_doc_sql(doc_id: &str) -> Result<()> {
 /// `rag_tags`（单一事务 DELETE + 批量 INSERT）。用于 RAG 启动时兜底漂移，以及
 /// reindex_all / batch_update 结束后的安全网。计数为 0 的标签自然不落表。
 pub async fn rebuild_rag_sql_index(app: &AppHandle) -> Result<()> {
-    let _meta_guard = meta_lock().await.lock().await;
     let dir = files_dir(app)?;
     let mut docs: Vec<DocMeta> = Vec::new();
     if dir.exists() {
@@ -1708,12 +2699,8 @@ pub async fn rebuild_rag_sql_index(app: &AppHandle) -> Result<()> {
             if path.extension().and_then(|e| e.to_str()) != Some("meta") {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            let Ok(meta) = serde_json::from_slice::<DocMeta>(&bytes) else {
-                continue;
-            };
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Ok(meta) = serde_json::from_slice::<DocMeta>(&bytes) else { continue };
             docs.push(meta);
         }
     }
@@ -1735,28 +2722,23 @@ pub async fn rebuild_rag_sql_index(app: &AppHandle) -> Result<()> {
     let mut tx = pool.begin().await?;
     // 保留现有标签的 created_at（对账重建不应重置排序依据）；新标签用当前
     // 时间，与增量 upsert_doc_sql 的语义一致。
-    let old_created: std::collections::HashMap<String, String> =
-        sqlx::query("SELECT tag, created_at FROM rag_tags")
-            .fetch_all(&mut *tx)
-            .await?
-            .into_iter()
-            .filter_map(|r| {
-                let tag: String = sqlx::Row::try_get(&r, "tag").ok()?;
-                let created: String = sqlx::Row::try_get(&r, "created_at").unwrap_or_default();
-                Some((tag, created))
-            })
-            .collect();
+    let old_created: std::collections::HashMap<String, String> = sqlx::query(
+        "SELECT tag, created_at FROM rag_tags",
+    )
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .filter_map(|r| {
+        let tag: String = sqlx::Row::try_get(&r, "tag").ok()?;
+        let created: String = sqlx::Row::try_get(&r, "created_at").unwrap_or_default();
+        Some((tag, created))
+    })
+    .collect();
     let now_ms = chrono::Utc::now().timestamp_millis().to_string();
 
-    sqlx::query("DELETE FROM rag_docs")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM rag_doc_tags")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("DELETE FROM rag_tags")
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query("DELETE FROM rag_docs").execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM rag_doc_tags").execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM rag_tags").execute(&mut *tx).await?;
     for meta in &docs {
         sqlx::query(
             "INSERT INTO rag_docs (id, name, size, uploaded_at, file_type, method, original_path, md5, version, chunk_count) \
@@ -1783,16 +2765,25 @@ pub async fn rebuild_rag_sql_index(app: &AppHandle) -> Result<()> {
             .await?;
     }
     for (tag, count) in &counts {
-        let created = old_created
-            .get(tag)
-            .cloned()
-            .unwrap_or_else(|| now_ms.clone());
+        let created = old_created.get(tag).cloned().unwrap_or_else(|| now_ms.clone());
         sqlx::query("INSERT INTO rag_tags (tag, file_count, created_at) VALUES (?, ?, ?)")
             .bind(tag)
             .bind(*count as i64)
             .bind(&created)
             .execute(&mut *tx)
             .await?;
+    }
+
+    // FTS 同步（§4.3 铁律：对账重建含 fts_rag_docs，同一事务）
+    crate::services::fts_service::clear_table_tx(&mut tx, crate::services::fts_service::FtsTable::RagDocs).await?;
+    for meta in &docs {
+        crate::services::fts_service::sync_upsert_tx(
+            &mut tx,
+            crate::services::fts_service::FtsTable::RagDocs,
+            &meta.id,
+            &meta.name,
+        )
+        .await?;
     }
     tx.commit().await?;
     Ok(())
@@ -1803,13 +2794,22 @@ pub async fn rebuild_rag_sql_index(app: &AppHandle) -> Result<()> {
 pub async fn list_docs(app: &AppHandle) -> Result<Vec<RagDocInfo>> {
     let dir = files_dir(app)?;
     if !dir.exists() {
+        // SQL 镜像可能有 meta 已丢失的孤儿行（见 prune_stale_sql_docs）——
+        // 目录不存在时 meta 全部缺失，孤儿行必然陈旧，顺带清掉。
+        let _ = prune_stale_sql_docs(app, &dir).await;
         return Ok(Vec::new());
     }
+    // meta 是事实源：先把 SQL 镜像里 meta 已丢失的孤儿行清掉，否则计数
+    // （来自 SQL）与列表条目（来自 meta）不一致 →「计数 N 但列表空」。
+    let _ = prune_stale_sql_docs(app, &dir).await;
     let mut out = Vec::new();
     // Clone the dir into the read_dir closure so `dir` stays borrowable below
     // (used to resolve the on-disk file name per doc).
     let dir_clone = dir.clone();
     let mut entries = tokio::task::spawn_blocking(move || std::fs::read_dir(&dir_clone)).await??;
+    // One registry read for the whole list (see doc_info_from_meta).
+    let excluded_paths = list_excluded_paths().await;
+    let aliases = list_source_aliases().await;
     while let Some(entry) = entries.next() {
         let entry = entry?;
         let path = entry.path();
@@ -1821,13 +2821,9 @@ pub async fn list_docs(app: &AppHandle) -> Result<Vec<RagDocInfo>> {
         // run_batch_update / preview_batch_update / reindex_all /
         // find_doc_ids_by_name). A single bad meta (partial write, crash,
         // manual edit) must not blank the entire doc list.
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let Ok(meta): Result<DocMeta, _> = serde_json::from_slice(&bytes) else {
-            continue;
-        };
-        out.push(doc_info_from_meta(&dir, meta));
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(meta): Result<DocMeta, _> = serde_json::from_slice(&bytes) else { continue };
+        out.push(doc_info_from_meta(&dir, meta, &excluded_paths, &aliases));
     }
     out.sort_by(|a, b| b.uploaded_at.cmp(&a.uploaded_at));
     Ok(out)
@@ -1837,7 +2833,16 @@ pub async fn list_docs(app: &AppHandle) -> Result<Vec<RagDocInfo>> {
 /// on-disk file name (uuid for uploads, meta.name for rag_file_create) and the
 /// filesystem-derived flags (lost_original / content_available). Shared by
 /// `list_docs` (full scan) and `search_docs_paged` (page enrichment only).
-fn doc_info_from_meta(dir: &Path, meta: DocMeta) -> RagDocInfo {
+/// `excluded_paths` is the caller's pre-read exclusion registry (one config
+/// read per list/page, not per doc). `aliases` is the caller's pre-read
+/// source-alias registry (same one-read-per-page pattern): a folder/git
+/// source with an alias shows the alias as its display label.
+fn doc_info_from_meta(
+    dir: &Path,
+    meta: DocMeta,
+    excluded_paths: &[String],
+    aliases: &std::collections::HashMap<String, String>,
+) -> RagDocInfo {
     // The actual on-disk file name - content_path_for resolves which exists.
     // Surfaced so the user can match the file when its folder is opened.
     // Empty for "symlink" docs (no copied file - content lives at original_path).
@@ -1876,10 +2881,22 @@ fn doc_info_from_meta(dir: &Path, meta: DocMeta) -> RagDocInfo {
         content_path_for(dir, &meta.id, &meta.name).exists()
     };
     // Compute the display file_type label BEFORE the struct moves `name`.
-    let file_type = meta
-        .file_type
-        .clone()
-        .unwrap_or_else(|| file_type_label(&meta.name));
+    let file_type = meta.file_type.clone().unwrap_or_else(|| file_type_label(&meta.name));
+    let (source_kind, source_label, source_root, rel_path, git_url, git_branch) =
+        classify_source(&meta);
+    // Alias override: folder identity = root path, git identity = URL. A user
+    // alias replaces the derived label (tree source node + tooltips).
+    let source_label = if source_kind == "folder" {
+        aliases.get(source_root.as_str()).cloned().unwrap_or(source_label)
+    } else if source_kind == "git" {
+        aliases.get(git_url.as_str()).cloned().unwrap_or(source_label)
+    } else {
+        source_label
+    };
+    // Exclusion flag: the registry is read by the CALLER (one read per page /
+    // list, not per doc) and passed in — a per-doc config read would multiply
+    // DB hits by the doc count.
+    let excluded = is_excluded_sync(meta.original_path.as_deref().unwrap_or(""), excluded_paths);
     RagDocInfo {
         id: meta.id,
         name: meta.name,
@@ -1895,6 +2912,13 @@ fn doc_info_from_meta(dir: &Path, meta: DocMeta) -> RagDocInfo {
         md5: meta.md5.clone().unwrap_or_default(),
         lost_original,
         content_available,
+        excluded,
+        source_kind,
+        source_label,
+        source_root,
+        rel_path,
+        git_url,
+        git_branch,
     }
 }
 
@@ -1913,6 +2937,8 @@ pub async fn search_docs_paged(
     page_size: u32,
 ) -> Result<RagDocPage> {
     let dir = files_dir(app)?;
+    // 同 list_docs：先清 SQL 镜像孤儿行，保证 total（SQL）与 items（meta）一致。
+    let _ = prune_stale_sql_docs(app, &dir).await;
     let page = page.min(10_000);
     let page_size = page_size.clamp(1, 200);
     let key = search_key.trim().to_lowercase();
@@ -1941,6 +2967,93 @@ pub async fn search_docs_paged(
     } else {
         format!("WHERE {}", conds.join(" AND "))
     };
+
+    // FTS5 路径（中/英/拼音分词；§4.4）：key 非空时优先走 FTS，tag 过滤仍走
+    // SQL 镜像（rag_doc_tags），结果按 FTS rank 序排列；空表/Err 降级原 LIKE。
+    if !key.is_empty() {
+        match crate::services::fts_service::search_ref_ids_weighted(
+            crate::services::fts_service::FtsTable::RagDocs,
+            &key,
+            5000,
+        )
+        .await
+        {
+            Ok(weighted) if !weighted.is_empty() => {
+                // 命中词数 map：相关度第一优先（命中越多越靠前），
+                // 同命中数保持原生 uploaded_at DESC, id 序（稳定排序）
+                let counts: std::collections::HashMap<String, i64> =
+                    weighted.into_iter().collect();
+                // tag 条件 → doc_id 白名单（SQL 镜像查询）
+                let allowed: Option<std::collections::HashSet<String>> =
+                    if want_tags.is_empty() {
+                        None
+                    } else {
+                        let mut qb = sqlx::QueryBuilder::new(
+                            "SELECT DISTINCT doc_id FROM rag_doc_tags WHERE tag IN (",
+                        );
+                        let mut sep = qb.separated(", ");
+                        for t in &want_tags {
+                            sep.push_bind(t);
+                        }
+                        qb.push(")");
+                        let rows = qb.build().fetch_all(crate::db::pool()).await?;
+                        Some(
+                            rows.iter()
+                                .filter_map(|r| sqlx::Row::try_get(r, "doc_id").ok())
+                                .collect(),
+                        )
+                    };
+                // 原生序（uploaded_at DESC, id）过滤命中集与 tag 白名单，
+                // 再稳定排序按命中词数降序——同相关度保持原生序
+                let nat_rows = sqlx::query("SELECT id FROM rag_docs ORDER BY uploaded_at DESC, id")
+                    .fetch_all(crate::db::pool())
+                    .await?;
+                let mut ordered: Vec<(String, i64)> = Vec::new();
+                for r in &nat_rows {
+                    let id: String = sqlx::Row::try_get(r, "id")?;
+                    if let Some(c) = counts.get(&id) {
+                        ordered.push((id, *c));
+                    }
+                }
+                ordered.retain(|(id, _)| allowed.as_ref().map_or(true, |s| s.contains(id)));
+                // 相关度第一优先（稳定排序：同命中数保持 uploaded_at DESC, id 序）
+                ordered.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+                let total = ordered.len() as u64;
+                let window: Vec<String> = ordered
+                    .iter()
+                    .skip(offset.max(0) as usize)
+                    .take(page_size as usize)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                let mut items = Vec::with_capacity(window.len());
+                // One registry read for the whole page (see doc_info_from_meta).
+                let excluded_paths = list_excluded_paths().await;
+                let aliases = list_source_aliases().await;
+                for id in window {
+                    let meta_path = dir.join(format!("{}.meta", id));
+                    let Ok(bytes) = std::fs::read(&meta_path) else { continue };
+                    let Ok(meta): Result<DocMeta, _> = serde_json::from_slice(&bytes) else { continue };
+                    items.push(doc_info_from_meta(&dir, meta, &excluded_paths, &aliases));
+                }
+                return Ok(RagDocPage { items, total, page, page_size });
+            }
+            Ok(_)
+                if crate::services::fts_service::table_is_empty(
+                    crate::services::fts_service::FtsTable::RagDocs,
+                )
+                .await
+                .unwrap_or(false) =>
+            {
+                // 空表兜底：继续走下方原 LIKE
+            }
+            Ok(_) => {
+                // 零结果/空表均不返回：落到下方原 LIKE（子串语义补 FTS 词前缀盲区）
+            }
+            Err(e) => {
+                log::warn!("[fts] search rag_docs failed, fallback to LIKE: {e}");
+            }
+        }
+    }
 
     let pool = crate::db::pool();
     // Count query (total across all pages, not just this one).
@@ -1976,16 +3089,15 @@ pub async fn search_docs_paged(
     // Enrich just this page from the .meta files (source of truth). Skip
     // unreadable/corrupt metas - same policy as list_docs.
     let mut items = Vec::with_capacity(rows.len());
+    // One registry read for the whole page (see doc_info_from_meta).
+    let excluded_paths = list_excluded_paths().await;
+    let aliases = list_source_aliases().await;
     for row in rows {
         let id: String = sqlx::Row::try_get(&row, "id")?;
         let meta_path = dir.join(format!("{}.meta", id));
-        let Ok(bytes) = std::fs::read(&meta_path) else {
-            continue;
-        };
-        let Ok(meta): Result<DocMeta, _> = serde_json::from_slice(&bytes) else {
-            continue;
-        };
-        items.push(doc_info_from_meta(&dir, meta));
+        let Ok(bytes) = std::fs::read(&meta_path) else { continue };
+        let Ok(meta): Result<DocMeta, _> = serde_json::from_slice(&bytes) else { continue };
+        items.push(doc_info_from_meta(&dir, meta, &excluded_paths, &aliases));
     }
     Ok(RagDocPage {
         items,
@@ -1995,16 +3107,22 @@ pub async fn search_docs_paged(
     })
 }
 
-/// Get the full content of a document for MCP and legacy callers.
+/// Get the full content of a document (for the View dialog).
 pub async fn get_doc(app: &AppHandle, id: &str) -> Result<Option<RagDoc>> {
+    // Unpaged read: the whole content in one go (rag_get MCP tool + internal
+    // callers). The UI uses `get_doc_paged` instead.
     match get_doc_inner(app, id, None).await? {
-        Some((doc, _)) => Ok(Some(doc)),
+        Some((doc, _full)) => Ok(Some(doc)),
         None => Ok(None),
     }
 }
 
-/// Read a document in a UTF-8 byte window. A zero limit uses the configured
-/// detail page size. The returned metadata reports whether more content exists.
+/// Read a document's content as a page: `offset` UTF-8 bytes are skipped, then
+/// up to `limit_bytes` are returned (the limit is char-boundary-aligned so the
+/// slice is always valid UTF-8). Returns the RagDoc with `truncated` /
+/// `next_offset` / `content_total_bytes` set, plus the FULL decoded content
+/// (the caller — the command layer — drops it; kept internal so unpaged and
+/// paged reads share one code path).
 pub async fn get_doc_paged(
     app: &AppHandle,
     id: &str,
@@ -2012,27 +3130,36 @@ pub async fn get_doc_paged(
     limit_bytes: u64,
 ) -> Result<Option<RagDoc>> {
     let limit = if limit_bytes == 0 {
+        // 0 → fall back to the user's configured page size.
         (get_settings().await.unwrap_or_default().doc_load_chunk_kb as u64) * 1024
     } else {
         limit_bytes
     };
     match get_doc_inner(app, id, Some((offset_bytes, limit))).await? {
-        Some((doc, _)) => Ok(Some(doc)),
+        Some((doc, _full)) => Ok(Some(doc)),
         None => Ok(None),
     }
 }
 
+/// Shared core of `get_doc` (whole content) and `get_doc_paged` (a window).
+/// `range = Some((offset, limit))` slices the decoded UTF-8 content by byte
+/// window, backing off to the nearest char boundary so the prefix/suffix is
+/// never a broken multi-byte sequence. The second tuple element is the full
+/// content length in bytes (already reflected in `content_total_bytes`; the
+/// tuple keeps callers from re-reading).
 async fn get_doc_inner(
     app: &AppHandle,
     id: &str,
     range: Option<(u64, u64)>,
 ) -> Result<Option<(RagDoc, u64)>> {
+    validate_doc_id(id)?;
     let dir = files_dir(app)?;
     let meta_path = dir.join(format!("{}.meta", id));
     let Ok(meta_bytes) = std::fs::read(&meta_path) else {
         return Ok(None);
     };
     let meta: DocMeta = serde_json::from_slice(&meta_bytes)?;
+    let is_symlink = meta.method.as_deref() == Some("symlink");
     // lost_original: original_path missing on disk, regardless of method (so
     // copy docs whose source vanished also show as lost in the UI + are skipped
     // by batch update). See `classify_original` for the shared definition.
@@ -2047,31 +3174,50 @@ async fn get_doc_inner(
         .map(|p| !p.is_empty())
         .unwrap_or(false);
     let lost_original = has_original_path && !original_exists;
-    // Content is decoded from bytes for both methods. In particular, symlink
-    // imports may point to GBK/Shift-JIS/etc. files accepted by upload; a later
-    // view must not assume the source is UTF-8.
-    let (content, content_available) = match read_doc_content(&dir, &meta) {
-        Ok(content) => (content, true),
-        Err(_) => (String::new(), false),
+    // Content: for symlink docs read from original_path (if it exists); for
+    // copy docs read from the rag/files copy via content_path_for. Symlink +
+    // lost -> empty content (the UI greys "view" via content_available).
+    let (content, content_available) = if is_symlink {
+        if let Some(op) = meta.original_path.as_deref() {
+            if !op.is_empty() && Path::new(op).exists() {
+                // Same cap as every write path: a symlink doc can point at an
+                // arbitrarily large file — never buffer it whole.
+                match std::fs::metadata(op) {
+                    Ok(m) if m.len() <= MAX_UPLOAD_BYTES as u64 => {
+                        (std::fs::read_to_string(op).unwrap_or_default(), true)
+                    }
+                    Ok(_) => (String::new(), false),
+                    Err(_) => (String::new(), false),
+                }
+            } else {
+                (String::new(), false)
+            }
+        } else {
+            (String::new(), false)
+        }
+    } else {
+        let content_path = content_path_for(&dir, id, &meta.name);
+        let avail = content_path.exists();
+        (std::fs::read_to_string(&content_path).unwrap_or_default(), avail)
     };
     let total_bytes = content.len() as u64;
-    let (content, truncated, next_offset) = match range {
+    let (source_kind, source_label, source_root, rel_path, git_url, git_branch) =
+        classify_source(&meta);
+    // Keep arbitrary page offsets UTF-8 safe while preserving byte-window semantics.
+    let (paged, truncated, next_offset) = match range {
         Some((offset, limit)) => slice_utf8_window(&content, offset, limit),
-        None => (content, false, total_bytes),
+        None => (content.clone(), false, total_bytes),
     };
     Ok(Some((
         RagDoc {
             id: meta.id,
             name: meta.name.clone(),
             size: meta.size,
-            content,
+            content: paged,
             uploaded_at: meta.uploaded_at,
             tags: meta.tags,
             chunk_count: meta.chunk_count,
-            file_type: meta
-                .file_type
-                .clone()
-                .unwrap_or_else(|| file_type_label(&meta.name)),
+            file_type: meta.file_type.clone().unwrap_or_else(|| file_type_label(&meta.name)),
             method: meta.method.clone().unwrap_or_default(),
             original_path: meta.original_path.clone().unwrap_or_default(),
             lost_original,
@@ -2079,6 +3225,13 @@ async fn get_doc_inner(
             truncated,
             next_offset,
             content_total_bytes: total_bytes,
+            excluded: path_excluded(meta.original_path.as_deref().unwrap_or("")).await,
+            source_kind,
+            source_label,
+            source_root,
+            rel_path,
+            git_url,
+            git_branch,
         },
         total_bytes,
     )))
@@ -2086,15 +3239,24 @@ async fn get_doc_inner(
 
 /// Read all chunks for MCP and legacy callers.
 pub async fn get_doc_chunks(id: &str) -> Result<Vec<crate::models::rag::RagChunk>> {
-    let (items, _) = get_doc_chunks_inner(id, 0, u32::MAX).await?;
-    Ok(items)
+    validate_doc_id(id)?;
+    // Unpaged: all chunks (kept for any internal caller).
+    let (chunks, _total) = get_doc_chunks_inner(id, 0, u32::MAX).await?;
+    Ok(chunks)
 }
 
-/// Read a page of chunks for the RAG detail dialog.
-pub async fn get_doc_chunks_paged(id: &str, offset: u32, page_size: u32) -> Result<RagChunkPage> {
+/// Paginated chunks for the "view chunks" dialog: `offset` chunks are skipped,
+/// then up to `page_size` returned (clamped to [1, 200]), plus the total chunk
+/// count so the UI can stop loading when all pages are in. Ordering matches
+/// `get_doc_chunks` (chunk_index ASC).
+pub async fn get_doc_chunks_paged(
+    id: &str,
+    offset: u32,
+    page_size: u32,
+) -> Result<crate::models::rag::RagChunkPage> {
     let page_size = page_size.clamp(1, 200);
     let (items, total) = get_doc_chunks_inner(id, offset, page_size).await?;
-    Ok(RagChunkPage {
+    Ok(crate::models::rag::RagChunkPage {
         items,
         total,
         offset,
@@ -2102,6 +3264,12 @@ pub async fn get_doc_chunks_paged(id: &str, offset: u32, page_size: u32) -> Resu
     })
 }
 
+/// Shared core: read the doc's chunk records, sort by index, slice to the
+/// [offset, offset+limit) window, and return (page items, total count).
+/// Reading all records then slicing in memory is intentional: the records are
+/// already in lancedb's scan order and the per-doc chunk counts are small
+/// (hundreds at most — chunked text, one row per chunk), while a SQL-style
+/// LIMIT pushdown isn't available on the vector store query API.
 async fn get_doc_chunks_inner(
     id: &str,
     offset: u32,
@@ -2129,9 +3297,10 @@ async fn get_doc_chunks_inner(
 }
 
 /// Open the OS multi-file picker. No extension filter — validation is
-/// content-based (`is_likely_text`), so the user may pick any file (including
-/// PDF/Word/Excel) and get a clear rejection if it isn't plain text. Returns
-/// the picked paths + display names; no bytes cross IPC (backend reads disk).
+/// content-based (extract strategies for PDF/Office/images, `is_likely_text`
+/// sniff otherwise), so the user may pick any file and get a clear rejection
+/// or a parse failure if it can't be processed. Returns the picked paths +
+/// display names; no bytes cross IPC (backend reads disk).
 pub fn pick_files(app: &AppHandle) -> Vec<RagPickedFile> {
     use tauri_plugin_dialog::DialogExt;
     let b = app.dialog().file().set_title("Select documents");
@@ -2151,9 +3320,16 @@ pub fn pick_files(app: &AppHandle) -> Vec<RagPickedFile> {
         .collect()
 }
 
-/// Open the OS folder picker, then scan its immediate children (no recursion)
-/// for files. Sub-directories + hidden files (leading dot, any platform) are
-/// skipped. Each candidate must pass BOTH filters:
+/// Open the OS folder picker, then scan the folder's children for import
+/// candidates. Flat mode (`recursive=false`, the pre-existing behavior) scans
+/// only immediate file children. Recursive mode (`recursive=true`) walks all
+/// descendant directories, skipping:
+///   - directories named in `folder_ignore.json` (dev/build dirs like
+///     node_modules, dist, target — see `folder_ignore_set()`);
+///   - hidden entries (leading dot, any platform) — macOS `.DS_Store` and
+///     `.git`-style dirs never become candidates;
+///   - symlinked directories (loop safety).
+/// Each file candidate must pass BOTH filters (same as flat mode):
 ///   1. extension catalog — its lowercased dot-prefixed extension (".md",
 ///      ".py"…) must be present in `file_type_map()` (built from
 ///      `runtimes/rag/file_support.json`), so unknown/unsupported file kinds
@@ -2162,75 +3338,243 @@ pub fn pick_files(app: &AppHandle) -> Vec<RagPickedFile> {
 ///      `is_likely_text` (same rule as upload validation), so a misnamed
 ///      binary file still gets filtered out.
 /// This way the dialog only lists files the upload pipeline would actually
-/// accept. Returns an empty vec if the user cancels or no supported file
-/// remains.
-pub fn pick_folder(app: &AppHandle) -> Vec<RagPickedFile> {
+/// accept. Recursive scans stop at `SCAN_FOLDER_FILE_CAP` candidates and set
+/// `truncated` (+ `skipped_files`) so the UI can warn. Returns an empty
+/// groups list if the user cancels or no supported file remains.
+pub fn pick_folder(app: &AppHandle, recursive: bool) -> RagFolderScan {
     use tauri_plugin_dialog::DialogExt;
     let b = app.dialog().file().set_title("Select a folder to import");
     let Some(fp) = b.blocking_pick_folder() else {
-        return Vec::new();
+        return RagFolderScan::empty();
     };
     let Ok(folder) = fp.into_path() else {
-        return Vec::new();
+        return RagFolderScan::empty();
     };
-    let Ok(entries) = std::fs::read_dir(&folder) else {
-        return Vec::new();
+    scan_folder(&folder, recursive)
+}
+
+/// Hard cap on candidate files per recursive folder scan. Guards against
+/// accidentally importing a home directory (which can hold hundreds of
+/// thousands of files under node_modules etc.) — the scan stops early and the
+/// UI tells the user to pick a smaller folder.
+const SCAN_FOLDER_FILE_CAP: usize = 500;
+
+/// Lazily-compiled ignore-list from `runtimes/rag/folder_ignore.json`
+/// (directory names, exact match, any depth). Entries starting with `*` are
+/// suffix patterns (e.g. `*.egg-info`) and go to `folder_ignore_suffixes()`
+/// instead. Same include_str! pattern as `file_type_map()`.
+static FOLDER_IGNORE_SET: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+
+fn folder_ignore_set() -> &'static std::collections::HashSet<String> {
+    FOLDER_IGNORE_SET.get_or_init(|| {
+        let raw = include_str!("../../runtimes/rag/folder_ignore.json");
+        let mut set = std::collections::HashSet::new();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+            if let Some(arr) = v.get("folders").and_then(|f| f.as_array()) {
+                for name in arr.iter().filter_map(|x| x.as_str()) {
+                    let name = name.to_lowercase();
+                    if name.starts_with('*') {
+                        continue;
+                    }
+                    set.insert(name);
+                }
+            }
+        }
+        set
+    })
+}
+
+/// Suffix patterns from `folder_ignore.json` (entries like `*.egg-info`),
+/// lowercased with the leading `*` stripped; matched via `ends_with`.
+static FOLDER_IGNORE_SUFFIXES: OnceLock<Vec<String>> = OnceLock::new();
+
+fn folder_ignore_suffixes() -> &'static Vec<String> {
+    FOLDER_IGNORE_SUFFIXES.get_or_init(|| {
+        let raw = include_str!("../../runtimes/rag/folder_ignore.json");
+        let mut out = Vec::new();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+            if let Some(arr) = v.get("folders").and_then(|f| f.as_array()) {
+                for name in arr.iter().filter_map(|x| x.as_str()) {
+                    let name = name.to_lowercase();
+                    if let Some(suffix) = name.strip_prefix('*') {
+                        out.push(suffix.to_string());
+                    }
+                }
+            }
+        }
+        out
+    })
+}
+
+/// True when a directory is pruned by `folder_ignore.json`: exact
+/// (case-insensitive) name match, or a suffix pattern like `*.egg-info`.
+fn is_ignored_dir(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    folder_ignore_set().contains(&lower)
+        || folder_ignore_suffixes().iter().any(|s| lower.ends_with(s))
+}
+
+/// Scan `folder` for import candidates, grouped per sub-directory (recursive
+/// mode) or as one flat group (the root, flat mode). Shared filtering rules
+/// with `pick_files`' validation pipeline; see `pick_folder` for the list.
+/// Group/file order is stable (path-sorted), so rescans look identical.
+fn scan_folder(folder: &std::path::Path, recursive: bool) -> RagFolderScan {
+    // rel-path -> group index in `out.groups`.
+    let mut group_idx: std::collections::HashMap<std::path::PathBuf, usize> =
+        std::collections::HashMap::new();
+    let mut out = RagFolderScan {
+        root: folder.to_string_lossy().to_string(),
+        commit: None,
+        skipped_dirs: 0,
+        skipped_files: 0,
+        groups: Vec::new(),
+        truncated: false,
     };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        // Skip directories (non-recursive scan) and symlinks that don't resolve
-        // to a regular file — only importable files pass through.
-        let ft = match std::fs::metadata(&path) {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if !ft.is_file() {
-            continue;
+    let mut total = 0usize;
+
+    // Depth-first walk of the directory tree. Directory read errors are
+    // silently skipped — a folder we can't read contributes nothing to the
+    // import list. The walk stops as soon as the candidate cap is reached;
+    // remaining files are counted into `skipped_files` afterwards.
+    fn walk(
+        dir: &Path,
+        rel: &Path,
+        recursive: bool,
+        out: &mut RagFolderScan,
+        group_idx: &mut std::collections::HashMap<PathBuf, usize>,
+        total: &mut usize,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            if *total >= SCAN_FOLDER_FILE_CAP {
+                out.truncated = true;
+                return;
+            }
+            let path = entry.path();
+            // Skip symlinks entirely (files AND dirs) — an import candidate
+            // must be a real file we can re-read later; a symlinked dir could
+            // also loop the walk.
+            let Ok(lm) = std::fs::symlink_metadata(&path) else { continue };
+            if lm.is_symlink() {
+                continue;
+            }
+            let Ok(md) = std::fs::metadata(&path) else { continue };
+            if md.is_dir() {
+                if !recursive {
+                    continue;
+                }
+                let Some(name) = path.file_name() else { continue };
+                let name = name.to_string_lossy().to_string();
+                // Hidden dirs (any platform) + folder_ignore.json names are
+                // pruned from the walk — nothing beneath them is scanned.
+                if name.starts_with('.') || is_ignored_dir(&name) {
+                    out.skipped_dirs += 1;
+                    continue;
+                }
+                let child_rel = rel.join(&name);
+                walk(&path, &child_rel, recursive, out, group_idx, total);
+            } else if md.is_file() {
+                let Some(name) = path.file_name() else { continue };
+                let name = name.to_string_lossy().to_string();
+                // Skip dotfiles (hidden on Unix; conventionally hidden on
+                // Windows too) so macOS `.DS_Store` and similar noise never
+                // become import candidates.
+                if name.starts_with('.') {
+                    continue;
+                }
+                // Extension-catalog filter: only files whose lowercased
+                // dot-prefixed extension is listed in file_support.json are
+                // import candidates — dropped by name before reading bytes.
+                let lower = name.to_lowercase();
+                let ext_ok = lower
+                    .rfind('.')
+                    .map(|dot| file_type_map().contains_key(&lower[dot..]))
+                    .unwrap_or(false);
+                if !ext_ok {
+                    out.skipped_files += 1;
+                    continue;
+                }
+                // Content sniff (first 8 KiB): a misnamed binary file (e.g. a
+                // .txt that's actually a PDF) is still dropped here, so the
+                // dialog only lists what the upload pipeline would accept.
+                // Extractable formats (PDF/Office/image) skip the sniff —
+                // their bytes are inherently binary (PDF headers carry NULs)
+                // yet the extract pipeline parses them to Markdown.
+                if !crate::rag::extract::can_extract(&name) {
+                    let mut head = vec![0u8; 8192];
+                    let n = std::fs::File::open(&path)
+                        .and_then(|mut f| {
+                            use std::io::Read;
+                            f.read(&mut head)
+                        })
+                        .unwrap_or(0);
+                    head.truncate(n);
+                    if !is_likely_text(&head) {
+                        out.skipped_files += 1;
+                        continue;
+                    }
+                }
+                // First file seen in this folder -> create its group.
+                let idx = *group_idx.entry(rel.to_path_buf()).or_insert_with(|| {
+                    out.groups.push(RagScanGroup {
+                        rel_path: rel.to_string_lossy().replace('\\', "/"),
+                        files: Vec::new(),
+                    });
+                    out.groups.len() - 1
+                });
+                out.groups[idx].files.push(RagScanFile {
+                    path: path.to_string_lossy().to_string(),
+                    name,
+                    size: md.len(),
+                    rel_path: rel.to_string_lossy().replace('\\', "/"),
+                    // Registry match path = the absolute file path. For folder
+                    // scans this IS `path` (docs record original_path = the
+                    // same absolute path). Git scans get re-stamped by
+                    // `git_pick_inner` after the temp->persistent mapping.
+                    match_path: path.to_string_lossy().to_string(),
+                });
+                *total += 1;
+            }
         }
-        let Some(name) = path.file_name() else {
-            continue;
-        };
-        let name = name.to_string_lossy().to_string();
-        // Skip dotfiles (hidden on Unix; conventionally hidden on Windows too)
-        // so macOS `.DS_Store` and similar noise never become import candidates.
-        if name.starts_with('.') {
-            continue;
-        }
-        // Extension-catalog filter: only files whose lowercased dot-prefixed
-        // extension is listed in `file_support.json` are import candidates.
-        // Files with no extension or an unsupported one are dropped here by
-        // name, before we read any bytes.
-        let lower = name.to_lowercase();
-        let ext_ok = lower
-            .rfind('.')
-            .map(|dot| file_type_map().contains_key(&lower[dot..]))
-            .unwrap_or(false);
-        if !ext_ok {
-            continue;
-        }
-        // Content sniff (first 8 KiB): a misnamed binary file (e.g. a .txt
-        // that's actually a PDF) is still dropped here, so the dialog only
-        // lists what the upload pipeline would actually accept.
-        let mut head = vec![0u8; 8192];
-        let n = std::fs::File::open(&path)
-            .and_then(|mut f| {
-                use std::io::Read;
-                f.read(&mut head)
-            })
-            .unwrap_or(0);
-        head.truncate(n);
-        if !is_likely_text(&head) {
-            continue;
-        }
-        out.push(RagPickedFile {
-            path: path.to_string_lossy().to_string(),
-            name,
-        });
     }
-    // Stable, readable order (not the OS's arbitrary readdir order).
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    walk(
+        folder,
+        Path::new(""),
+        recursive,
+        &mut out,
+        &mut group_idx,
+        &mut total,
+    );
+
+    // Stable, readable order: groups by path (root "" first), files by name.
+    out.groups.sort_by(|a, b| {
+        let a_root = a.rel_path.is_empty();
+        let b_root = b.rel_path.is_empty();
+        b_root.cmp(&a_root).then_with(|| a.rel_path.cmp(&b.rel_path))
+    });
+    for g in &mut out.groups {
+        g.files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    }
     out
+}
+
+/// Public wrapper around the private `scan_folder` for the git picker (same
+/// filtering/cap rules; recursive walk of the clone dir).
+pub fn scan_folder_public(folder: &std::path::Path, recursive: bool) -> RagFolderScan {
+    scan_folder(folder, recursive)
+}
+
+impl RagFolderScan {
+    fn empty() -> Self {
+        Self {
+            root: String::new(),
+            commit: None,
+            skipped_dirs: 0,
+            skipped_files: 0,
+            groups: Vec::new(),
+            truncated: false,
+        }
+    }
 }
 
 /// Upload (read + decode + embed + index) a single file given by disk path.
@@ -2253,35 +3597,6 @@ pub fn pick_folder(app: &AppHandle) -> Vec<RagPickedFile> {
 /// "symlink" docs `write_content` should be false (don't copy bytes into
 /// rag/files — the source is read live from original_path); for "copy" +
 /// legacy (None) it's true.
-async fn reindex_doc_with_rollback(
-    app: &AppHandle,
-    doc_id: &str,
-    doc_name: &str,
-    content: &str,
-    tags: Vec<String>,
-    rollback: Option<(String, String, Vec<String>)>,
-) -> Result<usize> {
-    match reindex_doc(app, doc_id, doc_name, content, tags).await {
-        Ok(count) => Ok(count),
-        Err(error) => {
-            if let Some((old_doc_name, old_content, old_tags)) = rollback {
-                if let Err(restore_error) =
-                    reindex_doc(app, doc_id, &old_doc_name, &old_content, old_tags).await
-                {
-                    rag_log(
-                        "error",
-                        format!(
-                            "restore vectors for '{}' after failed update failed: {}",
-                            doc_name, restore_error
-                        ),
-                    );
-                }
-            }
-            Err(error)
-        }
-    }
-}
-
 async fn write_doc_and_index(
     app: &AppHandle,
     dir: &Path,
@@ -2296,51 +3611,88 @@ async fn write_doc_and_index(
     method: Option<String>,
     original_path: Option<String>,
     md5: Option<String>,
+    // Data-source provenance (file/folder/git/tool). `None` on legacy paths —
+    // `classify_source` falls back to kind "file" at read time.
+    source: Option<crate::models::rag::DocSource>,
     rollback: Option<(String, String, Vec<String>)>,
+    cancellation: DocMutationCancellation,
 ) -> Result<u32> {
+    if !cancellation.begin_transaction() {
+        return Err(anyhow!("document mutation cancelled before transaction start"));
+    }
     let meta_path = dir.join(format!("{}.meta", doc_id));
     let uploaded_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
     // "symlink": don't write a content copy — the source is read live. "copy"
     // /legacy (None): write the copy as before.
-    let write_content = method.as_deref() != Some("symlink");
-    let content_path = dir.join(file_stem);
-    let content_backup = if write_content {
-        Some(FileBackup::new(&content_path)?)
-    } else {
-        None
+    let content_path = doc_content_path_for_write(dir, file_stem, method.as_deref());
+    let content_write = content_path.as_deref().map(|path| (path, content));
+    let index_tags = tags.clone();
+    let index_rollback = rollback.clone();
+    let transaction = commit_doc_files(
+        content_write,
+        &meta_path,
+        || async move {
+            reindex_doc_with_rollback(
+                app,
+                doc_id,
+                display_name,
+                content,
+                index_tags,
+                index_rollback,
+            )
+            .await
+            .map(|count| count as u32)
+        },
+        |chunk_count| {
+            let meta = DocMeta {
+                id: doc_id.to_string(),
+                name: display_name.to_string(),
+                title: Some(extract_title(content, display_name)),
+                tags,
+                size,
+                uploaded_at,
+                chunk_count: *chunk_count,
+                version,
+                file_type,
+                method,
+                original_path,
+                md5,
+                source,
+            };
+            write_meta_atomic(&meta_path, &meta)?;
+            Ok(meta)
+        },
+    )
+    .await;
+    let (chunk_count, meta) = match transaction {
+        Ok(result) => result,
+        Err(DocTransactionFailure::Content(error)) => return Err(error),
+        Err(DocTransactionFailure::Index(error)) => {
+            if rollback.is_none() {
+                cleanup_new_doc_vectors(doc_id, display_name, "after failed indexing").await;
+            }
+            return Err(error);
+        }
+        Err(DocTransactionFailure::Metadata(error)) => {
+            if rollback.is_some() {
+                restore_doc_vectors(
+                    app,
+                    doc_id,
+                    rollback,
+                    display_name,
+                    "after metadata failure",
+                )
+                .await;
+            } else {
+                cleanup_new_doc_vectors(doc_id, display_name, "after metadata failure").await;
+            }
+            return Err(error);
+        }
     };
-    let meta_backup = FileBackup::new(&meta_path)?;
-    if write_content {
-        std::fs::write(&content_path, content)?;
-    }
-    let chunk_count =
-        reindex_doc_with_rollback(app, doc_id, display_name, content, tags.clone(), rollback)
-            .await? as u32;
-    let title = extract_title(content, display_name);
-    let meta = DocMeta {
-        id: doc_id.to_string(),
-        name: display_name.to_string(),
-        title: Some(title),
-        tags,
-        size,
-        uploaded_at,
-        chunk_count,
-        version,
-        file_type,
-        method,
-        original_path,
-        md5,
-    };
-    write_meta_atomic(&meta_path, &meta)?;
-    content_backup.map(FileBackup::commit);
-    meta_backup.commit();
     // 增量同步 SQL 镜像（rag_docs / rag_doc_tags / rag_tags）。镜像失败不阻断
     // 导入主流程（.meta 已落盘，事实源完整；启动对账会修复漂移），但记日志。
     if let Err(e) = upsert_doc_sql(&meta).await {
-        rag_log(
-            "warn",
-            format!("upsert_doc_sql for '{}' failed: {}", meta.name, e),
-        );
+        rag_log("warn", format!("upsert_doc_sql for '{}' failed: {}", meta.name, e));
     }
     Ok(chunk_count)
 }
@@ -2350,21 +3702,25 @@ pub async fn upload_one_path(
     file_path: &str,
     tags: Vec<String>,
     method: Option<String>,
+    source: Option<crate::models::rag::DocSource>,
 ) -> Result<()> {
-    // Derive the display name first so we can attribute any failure to it in
-    // the log (the body below returns early on many `?`, and without this
-    // wrapper those failures would never reach rag_log - the user would see
-    // an error toast with no matching log entry).
-    let name = Path::new(file_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| file_path.to_string());
-
-    let result = upload_one_path_inner(app, file_path, tags, method).await;
-    if let Err(ref e) = result {
-        rag_log("error", format!("upload failed for '{}': {:#}", name, e));
-    }
-    result
+    let app = app.clone();
+    let file_path = file_path.to_string();
+    run_doc_mutation(move |cancellation| async move {
+        // Derive the display name first so early validation failures still
+        // have a matching log entry.
+        let name = Path::new(&file_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| file_path.clone());
+        let result =
+            upload_one_path_inner(&app, &file_path, tags, method, source, cancellation).await;
+        if let Err(ref error) = result {
+            rag_log("error", format!("upload failed for '{}': {:#}", name, error));
+        }
+        result
+    })
+    .await
 }
 
 /// Update an existing document in place: replace its on-disk content, meta
@@ -2376,7 +3732,22 @@ pub async fn upload_one_path(
 ///
 /// Holds META_LOCK across the read-modify-write (lock order: meta -> runtime).
 pub async fn update_doc_from_file(app: &AppHandle, id: &str, file_path: &str) -> Result<u32> {
-    let _meta_guard = meta_lock().await.lock().await;
+    let app = app.clone();
+    let id = id.to_string();
+    let file_path = file_path.to_string();
+    run_doc_mutation(move |cancellation| async move {
+        update_doc_from_file_locked(&app, &id, &file_path, cancellation).await
+    })
+    .await
+}
+
+async fn update_doc_from_file_locked(
+    app: &AppHandle,
+    id: &str,
+    file_path: &str,
+    cancellation: DocMutationCancellation,
+) -> Result<u32> {
+    validate_doc_id(id)?;
     let dir = files_dir(app)?;
     let path = Path::new(file_path);
     let name = path
@@ -2384,7 +3755,8 @@ pub async fn update_doc_from_file(app: &AppHandle, id: &str, file_path: &str) ->
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| file_path.to_string());
 
-    // Read + validate the new file (same rules as upload).
+    // Read + validate the new file (same rules as upload — extractable
+    // formats go through the extract strategies, text via sniff+decode).
     let raw = std::fs::read(path).map_err(|e| anyhow!("read failed for {}: {}", name, e))?;
     if raw.len() > MAX_UPLOAD_BYTES {
         return Err(anyhow!(
@@ -2394,10 +3766,7 @@ pub async fn update_doc_from_file(app: &AppHandle, id: &str, file_path: &str) ->
             MAX_UPLOAD_BYTES
         ));
     }
-    if !is_likely_text(&raw) {
-        return Err(anyhow!("UNSUPPORTED_FORMAT: {}", name));
-    }
-    let (content, _encoding) = decode_text(&raw, &name);
+    let (content, _encoding) = content_from_source(&name, &raw).await?;
     let size = raw.len() as u64;
 
     // Read the existing meta (for tags + to clean up the OLD on-disk file,
@@ -2407,16 +3776,42 @@ pub async fn update_doc_from_file(app: &AppHandle, id: &str, file_path: &str) ->
         std::fs::read(&meta_path).map_err(|e| anyhow!("update: read meta {} failed: {}", id, e))?;
     let old_meta: DocMeta = serde_json::from_slice(&old_meta_bytes)?;
     let tags = old_meta.tags.clone();
-    let old_content = content_path_for(&dir, id, &old_meta.name);
-    let old_content_text = read_doc_content(&dir, &old_meta).ok();
+    // For symlink docs this reads the live source now, not a snapshot of the
+    // text used for the existing vectors; vector compensation is best-effort.
+    let old_content_text = read_doc_content_for_update(&dir, &old_meta).await?;
+    if old_meta.chunk_count > 0 && old_content_text.is_none() {
+        return Err(anyhow!(
+            "existing document content is unavailable; refusing an update that cannot restore its vectors on failure"
+        ));
+    }
+    let vector_rollback = Some((
+        old_meta.name.clone(),
+        old_content_text.unwrap_or_default(),
+        tags.clone(),
+    ));
 
-    // New on-disk filename = `{id}{ext}` with the NEW file's extension.
+    // The OLD on-disk content file is removed AFTER the new file is written
+    // and indexed successfully (delete-after-write): removing it up front and
+    // failing mid-write/reindex would leave the doc listable with no content
+    // file on disk and stale vectors — a silently corrupted doc. The exists()
+    // + path-difference check handles same-name same-ext updates and symlink
+    // docs (no copy on disk).
+    let old_content = content_path_for(&dir, id, &old_meta.name);
+
+    // New on-disk filename: `{id}{ext}` with the NEW file's extension for
+    // text sources; `{id}.md` for extractable sources (content is derived
+    // Markdown — see upload_one_path_inner).
+    let extractable = crate::rag::extract::can_extract(&name);
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| format!(".{}", e.to_ascii_lowercase()))
         .unwrap_or_default();
-    let file_stem = format!("{id}{ext}");
+    let file_stem = if extractable {
+        format!("{id}.md")
+    } else {
+        format!("{id}{ext}")
+    };
 
     rag_log(
         "info",
@@ -2428,12 +3823,24 @@ pub async fn update_doc_from_file(app: &AppHandle, id: &str, file_path: &str) ->
     // Manual-upload update path records the NEW file as the original source
     // (this is the legacy-compat path: old docs without original_path get one
     // now, so future update detection works). MD5 of the new source is stored
-    // as the baseline. Method: keep the doc's existing method; if it was a
-    // legacy doc (method None), manual upload means we now have a copy + a
-    // recorded source -> treat as "copy".
-    let new_method = old_meta.method.clone().or_else(|| Some("copy".to_string()));
+    // as the baseline. Method: extractable sources are always "copy" (the
+    // content file is derived Markdown); otherwise keep the doc's existing
+    // method — a legacy doc (method None) becomes "copy" since manual upload
+    // now has a copy + a recorded source.
+    let new_method = if extractable {
+        Some("copy".to_string())
+    } else {
+        old_meta.method.clone().or_else(|| Some("copy".to_string()))
+    };
     let new_original_path = Some(file_path.to_string());
     let new_md5 = Some(compute_md5(&raw));
+    // Manual file update REPLACES the provenance: the doc's content no longer
+    // comes from its recorded source (e.g. a git repo). Dropping `source`
+    // re-classifies at read time from the NEW original_path's parent dir
+    // (folder semantics) — keeping the old source would mis-group the doc in
+    // the tree (under a git repo it no longer belongs to) and miscount the
+    // repo's delete-time refcount.
+    let new_source: Option<crate::models::rag::DocSource> = None;
     // write_doc_and_index writes the new disk file, reindexes (reindex_doc
     // deletes the old vectors by id then adds the new ones), and overwrites
     // the meta with the new name/size/uploaded_at/title/version — id preserved.
@@ -2451,23 +3858,18 @@ pub async fn update_doc_from_file(app: &AppHandle, id: &str, file_path: &str) ->
         new_method,
         new_original_path,
         new_md5,
-        old_content_text.map(|content| (old_meta.name.clone(), content, old_meta.tags.clone())),
+        // Manual file update replaces provenance (see comment above).
+        new_source,
+        vector_rollback,
+        cancellation,
     )
     .await?;
 
-    // Remove an old copy only after the new content, metadata, and vectors have
-    // been committed. A changed extension otherwise leaves an orphan, while a
-    // failed update must keep the old file available for rollback.
-    let new_content_path = dir.join(&file_stem);
-    if old_meta.method.as_deref() != Some("symlink")
-        && old_content != new_content_path
-        && old_content.exists()
-    {
+    // New content is durable + indexed; now drop the old content file if it
+    // has a different path (different extension/name case).
+    if old_content.exists() && old_content != dir.join(&file_stem) {
         if let Err(e) = std::fs::remove_file(&old_content) {
-            rag_log(
-                "warn",
-                format!("update: remove old {} failed: {}", old_content.display(), e),
-            );
+            rag_log("warn", format!("update: remove old {} failed: {}", old_content.display(), e));
         }
     }
 
@@ -2483,12 +3885,88 @@ pub async fn update_doc_from_file(app: &AppHandle, id: &str, file_path: &str) ->
 /// Holds META_LOCK across the whole read-modify-write so a concurrent
 /// delete/update of the same doc can't interleave (lock order: meta -> runtime).
 pub async fn update_doc_from_original(app: &AppHandle, id: &str) -> Result<u32> {
-    let _meta_guard = meta_lock().await.lock().await;
+    let app = app.clone();
+    let id = id.to_string();
+    run_doc_mutation(move |cancellation| async move {
+        update_doc_from_original_locked(&app, &id, cancellation).await
+    })
+    .await
+}
+
+async fn update_doc_from_original_locked(
+    app: &AppHandle,
+    id: &str,
+    cancellation: DocMutationCancellation,
+) -> Result<u32> {
+    validate_doc_id(id)?;
     let dir = files_dir(app)?;
     let meta_path = dir.join(format!("{}.meta", id));
     let old_meta_bytes = std::fs::read(&meta_path)
         .map_err(|e| anyhow!("update-from-original: read meta {} failed: {}", id, e))?;
     let old_meta: DocMeta = serde_json::from_slice(&old_meta_bytes)?;
+
+    if old_meta.source.as_ref().is_some_and(|source| source.kind == "git") {
+        let git_url = old_meta
+            .source
+            .as_ref()
+            .and_then(|source| source.git.as_ref())
+            .map(|git| git.url.as_str())
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| anyhow!("refusing Git original update: document has no Git source URL"))?;
+        let original_path = old_meta
+            .original_path
+            .as_deref()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| anyhow!("refusing Git original update: document has no recorded original path"))?;
+
+        let mut docs = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.path().extension().and_then(|extension| extension.to_str()) != Some("meta") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(entry.path()) else { continue };
+            let Ok(meta) = serde_json::from_slice::<DocMeta>(&bytes) else { continue };
+            docs.push(meta);
+        }
+        if !docs.iter().any(|meta| meta.id == old_meta.id) {
+            docs.push(old_meta.clone());
+        }
+
+        let recorded_paths = docs.iter().filter_map(|meta| {
+            let source = meta.source.as_ref().filter(|source| source.kind == "git")?;
+            let git = source.git.as_ref()?;
+            let path = meta.original_path.as_deref().filter(|path| !path.is_empty())?;
+            Some((git.url.as_str(), Path::new(path)))
+        });
+        let group = git_source_group_for_recorded_path(
+            recorded_paths,
+            Path::new(original_path),
+            |path| super::git::persistent_repo_dir_for_path(app, path),
+        )
+        .filter(|group| group.urls.iter().any(|url| url == git_url))
+        .ok_or_else(|| {
+            anyhow!(
+                "refusing Git original update: recorded URL and original path do not identify one persistent clone"
+            )
+        })?;
+        let source_branches = docs.iter().filter_map(|meta| {
+            meta.source
+                .as_ref()
+                .filter(|source| source.kind == "git")
+                .and_then(|source| source.git.as_ref())
+                .map(|git| (git.url.as_str(), git.branch.clone()))
+        });
+        if !git_source_group_branch_safe_for_original_update(
+            &group.urls,
+            source_branches,
+            || super::git::persistent_clone_branch(&group.persistent),
+        ) {
+            return Err(anyhow!(
+                "refusing Git original update: source branch is ambiguous or does not match the persistent clone"
+            ));
+        }
+    }
 
     let original_path = old_meta
         .original_path
@@ -2506,7 +3984,8 @@ pub async fn update_doc_from_original(app: &AppHandle, id: &str) -> Result<u32> 
         return Err(anyhow!("original file does not exist: {}", original_path));
     }
 
-    // Read + validate the source (same rules as upload).
+    // Read + validate the source (same rules as upload — extractable formats
+    // are re-extracted to Markdown, text via sniff+decode).
     let raw = std::fs::read(path).map_err(|e| anyhow!("read failed for {}: {}", name, e))?;
     if raw.len() > MAX_UPLOAD_BYTES {
         return Err(anyhow!(
@@ -2516,33 +3995,52 @@ pub async fn update_doc_from_original(app: &AppHandle, id: &str) -> Result<u32> 
             MAX_UPLOAD_BYTES
         ));
     }
-    if !is_likely_text(&raw) {
-        return Err(anyhow!("UNSUPPORTED_FORMAT: {}", name));
-    }
-    let (content, _encoding) = decode_text(&raw, &name);
+    // Dispatch by the ORIGINAL PATH (the true source), not the display name:
+    // the display name is user-renameable via MCP rag_file_update and may no
+    // longer carry the source extension — a renamed "report.pdf" must still
+    // re-extract, not fall into the text sniff (which would reject the bytes).
+    let (content, _encoding) = content_from_source(original_path, &raw).await?;
     let size = raw.len() as u64;
     let tags = old_meta.tags.clone();
-    let old_content = content_path_for(&dir, id, &old_meta.name);
-    let old_content_text = read_doc_content(&dir, &old_meta).ok();
+    let old_content_text = read_doc_content_for_update(&dir, &old_meta).await?;
+    if old_meta.chunk_count > 0 && old_content_text.is_none() {
+        return Err(anyhow!(
+            "existing document content is unavailable; refusing an update that cannot restore its vectors on failure"
+        ));
+    }
+    let vector_rollback = Some((
+        old_meta.name.clone(),
+        old_content_text.unwrap_or_default(),
+        tags.clone(),
+    ));
 
+    // Remove the OLD copied file for "copy" docs if its name/extension changed
+    // (symlink docs have no copy). For "copy" docs the on-disk name is
+    // `{id}{ext}`; recompute it from the OLD meta name.
     let is_symlink = old_meta.method.as_deref() == Some("symlink");
+    // Old content file removal happens AFTER the write+index below
+    // (delete-after-write): failing mid-write with the old copy already gone
+    // would leave a listable doc with no content file. Symlink docs have no
+    // copy to remove.
+    let old_content = if is_symlink { None } else { Some(content_path_for(&dir, id, &old_meta.name)) };
 
+    // On-disk filename: `{id}{ext}` for text sources, `{id}.md` for
+    // extractable sources (derived Markdown — see upload_one_path_inner).
+    // Extractable decision follows the source file (original_path), not the
+    // renameable display name.
+    let extractable = crate::rag::extract::can_extract(original_path);
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| format!(".{}", e.to_ascii_lowercase()))
         .unwrap_or_default();
-    let file_stem = format!("{id}{ext}");
+    let file_stem = if extractable {
+        format!("{id}.md")
+    } else {
+        format!("{id}{ext}")
+    };
 
-    rag_log(
-        "info",
-        format!(
-            "updating '{}' from original ({} bytes) -> id {}",
-            name,
-            raw.len(),
-            id
-        ),
-    );
+    rag_log("info", format!("updating '{}' from original ({} bytes) -> id {}", name, raw.len(), id));
     let version = old_meta.version.saturating_add(1);
     let new_md5 = Some(compute_md5(&raw));
     let chunk_count = write_doc_and_index(
@@ -2556,28 +4054,47 @@ pub async fn update_doc_from_original(app: &AppHandle, id: &str) -> Result<u32> 
         size,
         old_meta.file_type.clone(),
         version,
-        old_meta.method.clone(),
+        // Extractable sources are always "copy" (derived content file).
+        if extractable { Some("copy".to_string()) } else { old_meta.method.clone() },
         Some(original_path.to_string()),
         new_md5,
-        old_content_text.map(|content| (old_meta.name.clone(), content, old_meta.tags.clone())),
+        // "From original" update: refresh content but keep the source record.
+        old_meta.source.clone(),
+        vector_rollback,
+        cancellation,
     )
     .await?;
 
-    let new_content_path = dir.join(&file_stem);
-    if !is_symlink && old_content != new_content_path && old_content.exists() {
-        if let Err(e) = std::fs::remove_file(&old_content) {
-            rag_log(
-                "warn",
-                format!(
-                    "update-from-original: remove old {} failed: {}",
-                    old_content.display(),
-                    e
-                ),
-            );
+    // Content durable + indexed; drop the old copy if it has a different path.
+    if let Some(old_content) = old_content {
+        if old_content.exists() && old_content != dir.join(&file_stem) {
+            if let Err(e) = std::fs::remove_file(&old_content) {
+                rag_log("warn", format!("update-from-original: remove old {} failed: {}", old_content.display(), e));
+            }
         }
     }
 
     Ok(chunk_count)
+}
+
+/// Extract text content from raw file bytes via the strategy registry
+/// (`rag::extract`): PDF/Office/image sources are parsed to Markdown, plain
+/// text keeps the historical sniff + decode path (which also preserves the
+/// detected-encoding label for the per-file import summary).
+///
+/// Sentinel semantics unchanged — `UNSUPPORTED_FORMAT` (unknown binary via
+/// the text path) / `EXTRACT_FAILED` (supported kind, useless result) /
+/// `OCR_MISSING` (no OCR engine on this platform) propagate verbatim.
+async fn content_from_source(name: &str, raw: &[u8]) -> Result<(String, &'static str)> {
+    if crate::rag::extract::can_extract(name) {
+        let content = crate::rag::extract::run(name, raw.to_vec()).await?;
+        return Ok((content, "extracted-md"));
+    }
+    if !is_likely_text(raw) {
+        return Err(anyhow!("UNSUPPORTED_FORMAT: {}", name));
+    }
+    let (content, encoding) = decode_text(raw, name);
+    Ok((content, encoding))
 }
 
 async fn upload_one_path_inner(
@@ -2585,8 +4102,9 @@ async fn upload_one_path_inner(
     file_path: &str,
     tags: Vec<String>,
     method: Option<String>,
+    source: Option<crate::models::rag::DocSource>,
+    cancellation: DocMutationCancellation,
 ) -> Result<()> {
-    let _meta_guard = meta_lock().await.lock().await;
     let started = std::time::Instant::now();
     let dir = files_dir(app)?;
     std::fs::create_dir_all(&dir)?;
@@ -2609,15 +4127,11 @@ async fn upload_one_path_inner(
             MAX_UPLOAD_BYTES
         ));
     }
-    // Reject non-text files by CONTENT (PDF/Word/Excel etc. are binary — they
-    // contain NUL bytes / a high ratio of non-text control bytes). We can't
-    // enumerate every text extension, so we don't trust the extension; we sniff
-    // the bytes. Returns a sentinel the frontend maps to a localized message.
-    if !is_likely_text(&raw) {
-        return Err(anyhow!("UNSUPPORTED_FORMAT: {}", name));
-    }
-
-    let (content, encoding) = decode_text(&raw, &name);
+    // Reject unknown binaries by CONTENT. Extractable formats (PDF/Office/
+    // images) bypass the NUL sniff — their bytes are inherently binary and
+    // are parsed to Markdown by the extract strategies instead. Returns a
+    // sentinel the frontend maps to a localized message.
+    let (content, encoding) = content_from_source(&name, &raw).await?;
     let size = raw.len() as u64;
     let char_count = content.chars().count() as u64;
 
@@ -2643,16 +4157,27 @@ async fn upload_one_path_inner(
             encoding
         ),
     );
-    // On-disk filename = `{id}{ext}` (uuid + original extension). The uuid
-    // keeps it unique across same-named uploads; the extension lets the file
-    // show its type in the OS file manager + lets the UI display a recognizable
-    // name. Files with no extension fall back to the bare uuid.
+    // On-disk filename: `{id}{ext}` for text sources (uuid + original
+    // extension — unique across same-named uploads, shows its type in the OS
+    // file manager); `{id}.md` for extractable sources (PDF/Office/image),
+    // because the stored content is the DERIVED Markdown, not the raw bytes.
+    let extractable = crate::rag::extract::can_extract(&name);
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| format!(".{}", e.to_ascii_lowercase()))
         .unwrap_or_default();
-    let file_stem = format!("{id}{ext}");
+    // Reject `.meta` uploads: `{id}.meta` is the meta JSON path itself —
+    // writing content there would clobber the meta (or vice versa) and
+    // content_path_for candidate 1 would resolve to the meta file.
+    if ext == ".meta" {
+        return Err(anyhow!("UNSUPPORTED_FORMAT: '.meta' is a reserved internal extension"));
+    }
+    let file_stem = if extractable {
+        format!("{id}.md")
+    } else {
+        format!("{id}{ext}")
+    };
     // MD5 of the source bytes — captured at import for update detection
     // (symlink: live source; copy: the original that was copied). For symlink
     // docs the content is read fresh from original_path at view/index time, so
@@ -2672,14 +4197,21 @@ async fn upload_one_path_inner(
         size,
         None,
         1,
-        method.clone(),
+        // Extractable sources ALWAYS import as "copy": the content file is
+        // derived Markdown, so the symlink/copy distinction (about the raw
+        // source bytes) doesn't apply — all read paths then treat it as a
+        // plain copy document with zero special-casing.
+        if extractable { Some("copy".to_string()) } else { method.clone() },
         original_path_str,
         md5_hex,
+        // Data source provenance: caller-supplied (folder scan root + rel dir
+        // chain for folder/git imports; parent dir for single-file picks;
+        // None on legacy callers -> classify as "file" at read time).
+        source,
         None,
+        cancellation,
     )
     .await?;
-
-    // Re-sync tag stats after this file's tags are written.
 
     // Per-file import summary — one structured line per file so the Logs page
     // (filter server=rag) gives an at-a-glance read of import cost for tuning
@@ -2701,33 +4233,6 @@ async fn upload_one_path_inner(
     Ok(())
 }
 
-/// Find the ids of all docs whose stored display `name` equals `name` (for
-/// overwrite-on-re-upload). Reads `.meta` files; returns an empty vec if none.
-/// (meta files are named `{id}.meta`, so the id is the filename stem - but we
-/// return the id from inside the meta to be robust.)
-fn find_doc_ids_by_name(dir: &Path, name: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("meta") {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let Ok(meta) = serde_json::from_slice::<DocMeta>(&bytes) else {
-            continue;
-        };
-        if meta.name == name {
-            out.push(meta.id);
-        }
-    }
-    out
-}
-
 /// Resolve the content file path for a doc. Uploads name the content file by
 /// the doc id (uuid); `rag_file_create` names it by `{docName}.{docType}`
 /// (which equals `meta.name`). Try `dir/{id}` first, then `dir/{meta_name}` so
@@ -2737,9 +4242,12 @@ fn find_doc_ids_by_name(dir: &Path, name: &str) -> Vec<String> {
 ///    so the file shows its type in the OS file manager). `ext` is taken from
 ///    `meta_name` (the display name, which carries the original extension for
 ///    uploads and is `{name}.{docType}` for rag_file_create).
-/// 2. `dir/{id}` — the legacy upload scheme (uuid, no extension) for docs
+/// 2. `dir/{id}.md` — extractable imports (PDF/Office/image): their stored
+///    content is the DERIVED Markdown, named `{id}.md` regardless of the
+///    source extension.
+/// 3. `dir/{id}` — the legacy upload scheme (uuid, no extension) for docs
 ///    uploaded before the extension-preserving change. Kept for back-compat.
-/// 3. `dir/{meta_name}` — rag_file_create docs (human-readable name).
+/// 4. `dir/{meta_name}` — rag_file_create docs (human-readable name).
 /// Returns the first candidate that exists; if none exist, the last candidate
 /// (`meta_name`) so callers get a sensible path to create/remove/error on.
 fn content_path_for(dir: &Path, id: &str, meta_name: &str) -> std::path::PathBuf {
@@ -2750,103 +4258,28 @@ fn content_path_for(dir: &Path, id: &str, meta_name: &str) -> std::path::PathBuf
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| format!(".{}", e.to_ascii_lowercase()));
-    // Candidate 1: {id}{ext} (current scheme). Only when there IS an ext.
+    // Candidate 1: {id}{ext} (current scheme). Only when there IS an ext,
+    // and never the meta file itself ({id}.meta is always a meta JSON —
+    // a collision here means legacy corruption, not content).
     if let Some(ref ext) = ext {
         let by_id_ext = dir.join(format!("{id}{ext}"));
-        if by_id_ext.exists() {
+        if by_id_ext.exists() && by_id_ext != dir.join(format!("{id}.meta")) {
             return by_id_ext;
         }
     }
-    // Candidate 2: {id} (legacy upload, no extension).
+    // Candidate 2: {id}.md (extracted-Markdown content of PDF/Office/image
+    // imports).
+    let by_id_md = dir.join(format!("{id}.md"));
+    if by_id_md.exists() {
+        return by_id_md;
+    }
+    // Candidate 3: {id} (legacy upload, no extension).
     let by_id = dir.join(id);
     if by_id.exists() {
         return by_id;
     }
-    // Candidate 3: {meta_name} (rag_file_create).
+    // Candidate 4: {meta_name} (rag_file_create).
     dir.join(meta_name)
-}
-
-/// Read a document using the same byte-level encoding detection as import.
-/// Symlink documents keep only `original_path`, so every later read must decode
-/// the source bytes again instead of assuming UTF-8.
-fn read_file_content(path: &Path, source_name: &str) -> Result<String> {
-    let bytes = std::fs::read(&path)
-        .map_err(|e| anyhow!("read document content {} failed: {}", path.display(), e))?;
-    if !is_likely_text(&bytes) {
-        return Err(anyhow!("document content is not text: {}", path.display()));
-    }
-    Ok(decode_text(&bytes, source_name).0)
-}
-
-fn read_doc_content(dir: &Path, meta: &DocMeta) -> Result<String> {
-    let path = if meta.method.as_deref() == Some("symlink") {
-        meta.original_path
-            .as_deref()
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow!("document has no original path: {}", meta.id))?
-    } else {
-        content_path_for(dir, &meta.id, &meta.name)
-    };
-    read_file_content(&path, &meta.name)
-}
-
-/// Temporarily moves an existing file out of the way while an update is
-/// prepared. If the operation fails, Drop restores the original file.
-struct FileBackup {
-    original: PathBuf,
-    backup: Option<PathBuf>,
-    committed: bool,
-}
-
-impl FileBackup {
-    fn new(path: &Path) -> Result<Self> {
-        let backup = if path.is_file() {
-            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-            let backup =
-                path.with_file_name(format!(".{}.mcphub-backup-{}", file_name, Uuid::new_v4()));
-            std::fs::rename(path, &backup)?;
-            Some(backup)
-        } else {
-            None
-        };
-        Ok(Self {
-            original: path.to_path_buf(),
-            backup,
-            committed: false,
-        })
-    }
-
-    fn commit(mut self) {
-        self.committed = true;
-        if let Some(backup) = self.backup.take() {
-            if let Err(e) = std::fs::remove_file(&backup) {
-                rag_log(
-                    "warn",
-                    format!("remove temporary backup {} failed: {}", backup.display(), e),
-                );
-            }
-        }
-    }
-}
-
-impl Drop for FileBackup {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        if self.original.exists() {
-            let _ = std::fs::remove_file(&self.original);
-        }
-        if let Some(backup) = self.backup.take() {
-            if let Err(e) = std::fs::rename(&backup, &self.original) {
-                rag_log(
-                    "error",
-                    format!("restore file backup {} failed: {}", backup.display(), e),
-                );
-            }
-        }
-    }
 }
 
 /// Compute the MD5 hex digest of `bytes`. Used to fingerprint imported file
@@ -2876,7 +4309,83 @@ fn md5_of_file(path: &Path) -> Result<String> {
 ///   - no `original_path` -> has_original_path=false (legacy, manual-upload only)
 ///   - no `md5`           -> has_md5=false (legacy -> original_changed=true if exists)
 /// `lost_original` is symlink-method + original_path missing.
-fn classify_original(meta: &DocMeta) -> RagUpdateCheck {
+/// Classify a doc's data source for display (tree view grouping). Reads
+/// `meta.source`; legacy metas without the field (pre-feature) classify as
+/// kind "file" so all pre-existing docs group under the "file pick" source
+/// node. For file-kind docs without an explicit label, the label is derived
+/// from `original_path`'s parent dir (or a generic fallback). Returns the
+/// flat display tuple consumed by `RagDocInfo`/`RagDoc` — nothing is written
+/// back to disk (lazy classification, no meta rewrites).
+fn classify_source(meta: &DocMeta) -> (String, String, String, String, String, String) {
+    const FALLBACK_LABEL: &str = "文件";
+    if let Some(src) = &meta.source {
+        let kind = if src.kind.is_empty() { "file".to_string() } else { src.kind.clone() };
+        let mut label = src.label.clone();
+        if label.is_empty() {
+            label = match kind.as_str() {
+                "folder" => src.root.clone().unwrap_or_else(|| FALLBACK_LABEL.to_string()),
+                "git" => {
+                    let g = src.git.clone().unwrap_or_default();
+                    match (&g.branch, !g.url.is_empty()) {
+                        (Some(b), true) => format!("{} @ {}", g.url, b),
+                        (None, true) => g.url.clone(),
+                        _ => "Git".to_string(),
+                    }
+                }
+                "tool" => "MCP 工具".to_string(),
+                _ => FALLBACK_LABEL.to_string(),
+            };
+        }
+        let g = src.git.clone().unwrap_or_default();
+        return (
+            kind,
+            label,
+            src.root.clone().unwrap_or_default(),
+            src.rel_path.clone().unwrap_or_default(),
+            g.url,
+            g.branch.unwrap_or_default(),
+        );
+    }
+    // Legacy doc: no source recorded. When original_path is known, the doc's
+    // origin IS a directory (its parent) -> classify as kind "folder" so the
+    // tree shows it as a folder source (with the 文件夹 type tag, matching the
+    // user's expectation that a directory-labeled node displays as folder).
+    // No original_path at all -> kind "file" with the generic fallback label.
+    if let Some(op) = meta.original_path.as_deref().filter(|p| !p.is_empty()) {
+        if let Some(parent) = Path::new(op).parent().map(|d| d.to_string_lossy().into_owned())
+            .filter(|d| !d.is_empty())
+        {
+            return (
+                "folder".to_string(),
+                parent.clone(),
+                parent,
+                String::new(),
+                String::new(),
+                String::new(),
+            );
+        }
+    }
+    (
+        "file".to_string(),
+        FALLBACK_LABEL.to_string(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+    )
+}
+
+/// Is `path` (or any of its ancestors) in the exclusion registry? Sync
+/// counterpart of `is_path_excluded` for contexts that already hold the
+/// registry (classification loops over many docs).
+fn is_excluded_sync(path: &str, excluded: &[String]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    excluded.iter().any(|e| path_under_root(path, e))
+}
+
+fn classify_original(meta: &DocMeta, excluded: &[String]) -> RagUpdateCheck {
     let method = meta.method.clone().unwrap_or_else(|| "copy".to_string());
     let is_symlink = method == "symlink";
     let original_path = meta.original_path.as_deref();
@@ -2903,6 +4412,7 @@ fn classify_original(meta: &DocMeta) -> RagUpdateCheck {
     // in the batch preview — inconsistent with the list's lostOriginal badge.)
     let lost_original = has_original_path && !original_exists;
     let _ = is_symlink; // kept for clarity; not gating lost_original anymore.
+    let excluded = is_excluded_sync(original_path.unwrap_or(""), excluded);
     RagUpdateCheck {
         method,
         has_original_path,
@@ -2910,6 +4420,8 @@ fn classify_original(meta: &DocMeta) -> RagUpdateCheck {
         has_md5,
         original_changed,
         lost_original,
+        excluded,
+        git_error: None,
     }
 }
 
@@ -2963,7 +4475,25 @@ pub async fn create_doc_from_content(
     content: &str,
     tags: Vec<String>,
 ) -> Result<String> {
-    let _meta_guard = meta_lock().await.lock().await;
+    let app = app.clone();
+    let doc_name = doc_name.to_string();
+    let doc_type = doc_type.to_string();
+    let content = content.to_string();
+    run_doc_mutation(move |cancellation| async move {
+        create_doc_from_content_locked(&app, &doc_name, &doc_type, &content, tags, cancellation)
+            .await
+    })
+    .await
+}
+
+async fn create_doc_from_content_locked(
+    app: &AppHandle,
+    doc_name: &str,
+    doc_type: &str,
+    content: &str,
+    tags: Vec<String>,
+    cancellation: DocMutationCancellation,
+) -> Result<String> {
     let dir = files_dir(app)?;
     std::fs::create_dir_all(&dir)?;
 
@@ -2974,6 +4504,14 @@ pub async fn create_doc_from_content(
     let dt = doc_type.trim().trim_start_matches('.');
     if dt.is_empty() {
         return Err(anyhow!("docType must not be empty"));
+    }
+    // docType becomes part of the on-disk filename — restrict to a bare
+    // extension charset so a hostile MCP client cannot traverse out of files/
+    // via `md/../../evil` (docName is sanitized separately; docType was not).
+    if !dt.chars().all(|c| c.is_ascii_alphanumeric()) || dt.eq_ignore_ascii_case("meta") {
+        return Err(anyhow!(
+            "docType must be a bare extension (letters/digits only, not 'meta')"
+        ));
     }
     // If docName already ends with .{docType}, keep it; else append.
     let file_name = if name_base
@@ -3003,20 +4541,17 @@ pub async fn create_doc_from_content(
         .filter(|t| !t.is_empty() && seen_lower.insert(t.to_lowercase()))
         .collect();
 
-    // Overwrite same-named doc (same as upload path).
-    let stale_ids = find_doc_ids_by_name(&dir, &file_name);
-    if !stale_ids.is_empty() {
-        rag_log(
-            "info",
-            format!(
-                "rag_file_create overwriting '{}' ({} doc(s))",
-                file_name,
-                stale_ids.len()
-            ),
-        );
-    }
+    // Overwrite semantics REMOVED (P2b): same-named docs coexist. Explicit
+    // updates go through rag_file_update / the update dialog; creation is
+    // always a fresh document (fresh uuid), matching the upload path.
 
     let id = Uuid::new_v4().to_string();
+    // On-disk name is `{id}.{docType}` (uuid-prefixed, like uploads) so two
+    // same-named creates coexist with independent content files; the
+    // human-readable name lives in meta.name only. content_path_for
+    // candidate 1 ({id}{ext}) resolves it; candidate 4 ({meta.name}) keeps
+    // legacy create docs working.
+    let disk_name = format!("{id}.{dt}");
     rag_log(
         "info",
         format!(
@@ -3031,7 +4566,7 @@ pub async fn create_doc_from_content(
         app,
         &dir,
         &id,
-        &file_name,
+        &disk_name,
         &file_name,
         content,
         tags,
@@ -3041,38 +4576,68 @@ pub async fn create_doc_from_content(
         Some("copy".to_string()),
         None,
         Some(compute_md5(content.as_bytes())),
+        // MCP tool creation: kind "tool" so new tool docs get their own tree
+        // node. Legacy tool docs (pre-feature) classify as "file" per spec.
+        Some(crate::models::rag::DocSource {
+            kind: "tool".to_string(),
+            label: "MCP 工具".to_string(),
+            root: None,
+            rel_path: None,
+            git: None,
+        }),
         None,
+        cancellation,
     )
     .await?;
 
-    // Remove overwritten docs' vector chunks + reclaim space.
-    if !stale_ids.is_empty() {
-        let guard = runtime().lock().await;
-        if let Some(rt) = guard.as_ref() {
-            for sid in &stale_ids {
-                let _ = rt.db.delete_by_doc(sid).await;
-            }
-        }
-        drop(guard);
-        schedule_deferred_prune();
-    }
-    // The new document is fully indexed before stale metadata/files are
-    // removed. Never delete the shared `{file_name}` path now owned by the new
-    // document; `write_doc_and_index` already replaced it atomically.
-    for sid in &stale_ids {
-        let stale_content = content_path_for(&dir, sid, &file_name);
-        if stale_content != dir.join(&file_name) {
-            let _ = std::fs::remove_file(stale_content);
-        }
-        let _ = std::fs::remove_file(dir.join(format!("{}.meta", sid)));
-        if let Err(e) = remove_doc_sql(sid).await {
-            rag_log(
-                "warn",
-                format!("remove_doc_sql for stale {} failed: {}", sid, e),
-            );
-        }
-    }
     Ok(id)
+}
+
+async fn read_doc_content_for_update(dir: &Path, meta: &DocMeta) -> Result<Option<String>> {
+    if meta.method.as_deref() == Some("symlink") {
+        let Some(path) = meta
+            .original_path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(Path::new)
+        else {
+            return Ok(None);
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = std::fs::read(path)
+            .map_err(|e| anyhow!("read document content {} failed: {}", path.display(), e))?;
+        if raw.len() > MAX_UPLOAD_BYTES {
+            return Err(anyhow!(
+                "document content too large: {} bytes, max {} bytes",
+                raw.len(),
+                MAX_UPLOAD_BYTES
+            ));
+        }
+        let source_name = path.to_string_lossy().into_owned();
+        return content_from_source(&source_name, &raw)
+            .await
+            .map(|(content, _)| Some(content));
+    }
+
+    let path = content_path_for(dir, &meta.id, &meta.name);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read(&path)
+        .map_err(|e| anyhow!("read document content {} failed: {}", path.display(), e))?;
+    if raw.len() > MAX_UPLOAD_BYTES {
+        return Err(anyhow!(
+            "document content too large: {} bytes, max {} bytes",
+            raw.len(),
+            MAX_UPLOAD_BYTES
+        ));
+    }
+    if !is_likely_text(&raw) {
+        return Err(anyhow!("stored document content is not text: {}", path.display()));
+    }
+    Ok(Some(decode_text(&raw, &meta.name).0))
 }
 
 /// `rag_file_update` MCP tool: update a document's name/type/content. docId is
@@ -3091,26 +4656,65 @@ pub async fn update_doc(
     add_tags: Vec<String>,
     remove_tags: Vec<String>,
 ) -> Result<()> {
-    let _meta_guard = meta_lock().await.lock().await;
+    let app = app.clone();
+    let doc_id = doc_id.to_string();
+    let name = name.map(str::to_string);
+    let doc_type = doc_type.map(str::to_string);
+    let content = content.map(str::to_string);
+    run_doc_mutation(move |cancellation| async move {
+        update_doc_locked(
+            &app,
+            &doc_id,
+            name.as_deref(),
+            doc_type.as_deref(),
+            content.as_deref(),
+            append,
+            add_tags,
+            remove_tags,
+            cancellation,
+        )
+        .await
+    })
+    .await
+}
+
+async fn update_doc_locked(
+    app: &AppHandle,
+    doc_id: &str,
+    name: Option<&str>,
+    doc_type: Option<&str>,
+    content: Option<&str>,
+    append: bool,
+    add_tags: Vec<String>,
+    remove_tags: Vec<String>,
+    cancellation: DocMutationCancellation,
+) -> Result<()> {
+    validate_doc_id(doc_id)?;
     let dir = files_dir(app)?;
     let meta_path = dir.join(format!("{}.meta", doc_id));
     let Ok(meta_bytes) = std::fs::read(&meta_path) else {
         return Err(anyhow!("document not found: {}", doc_id));
     };
     let mut meta: DocMeta = serde_json::from_slice(&meta_bytes)?;
+    let old_meta = meta.clone();
     let old_name = meta.name.clone();
     let content_path = content_path_for(&dir, doc_id, &old_name);
     let old_tags = meta.tags.clone();
-    let old_content_text = if meta.method.as_deref() == Some("symlink") {
-        meta.original_path
-            .as_deref()
-            .filter(|p| !p.is_empty())
-            .and_then(|p| read_file_content(Path::new(p), &old_name).ok())
+    let is_symlink = meta.method.as_deref() == Some("symlink");
+    if is_symlink && content.is_some() {
+        return Err(anyhow!(
+            "symlink documents are read-only via rag_file_update (writing would overwrite the original file); use the UI update dialog or re-import"
+        ));
+    }
+    let old_content_text = if content.is_some() || !add_tags.is_empty() || !remove_tags.is_empty() {
+        read_doc_content_for_update(&dir, &meta).await?
     } else {
-        read_file_content(&content_path, &old_name).ok()
+        None
     };
     let mut content_backup: Option<FileBackup> = None;
     let mut vector_rollback: Option<(String, String, Vec<String>)> = None;
+    let mut content_rename: Option<(PathBuf, PathBuf)> = None;
+    let mut transaction_started = false;
 
     // Update display name.
     if let Some(n) = name {
@@ -3153,15 +4757,6 @@ pub async fn update_doc(
     // the rag/files copy — read/write there instead.
     let mut content_text_for_md5: Option<String> = None;
     if content.is_some() || tags_changed {
-        let is_symlink = meta.method.as_deref() == Some("symlink");
-        // Symlink docs are read-only through the MCP rag_file_update tool:
-        // writing content would overwrite the user's ORIGINAL file (there is
-        // no copy). Reject with a clear message instead.
-        if is_symlink && content.is_some() {
-            return Err(anyhow!(
-                "symlink documents are read-only via rag_file_update (writing would overwrite the original file); use the UI update dialog or re-import"
-            ));
-        }
         // Tag-only update on a symlink doc whose original is missing: the
         // content read below yields "" and reindex_doc would DELETE the old
         // vectors and insert 0 chunks (irreversible data loss). In that case
@@ -3179,64 +4774,90 @@ pub async fn update_doc(
                 format!("rag_file_update: '{}' original missing; tags saved without re-index (chunks keep old tags)", meta.name),
             );
         } else {
-            let content_path = if is_symlink {
-                meta.original_path
-                    .as_deref()
-                    .filter(|p| !p.is_empty())
-                    .map(Path::new)
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| content_path.clone())
-            } else {
-                content_path.clone()
-            };
-            let content_text = if let Some(c) = content {
-                let old = if append {
-                    old_content_text
-                        .clone()
-                        .ok_or_else(|| anyhow!("existing document content is unavailable"))?
-                } else {
-                    String::new()
-                };
-                let new_content = if append {
-                    format!("{}\n{}", old, c)
-                } else {
-                    c.to_string()
-                };
-                let byte_len = new_content.len();
-                if byte_len > MAX_UPLOAD_BYTES {
-                    return Err(anyhow!(
-                        "docContent too large: {} bytes, max {} bytes",
-                        byte_len,
-                        MAX_UPLOAD_BYTES
-                    ));
-                }
-                if !is_symlink {
-                    content_backup = Some(FileBackup::new(&content_path)?);
-                    std::fs::write(&content_path, &new_content)?;
-                }
-                meta.size = byte_len as u64;
-                new_content
-            } else {
-                old_content_text
-                    .clone()
-                    .ok_or_else(|| anyhow!("existing document content is unavailable"))?
-            };
-            vector_rollback = old_content_text
-                .clone()
-                .map(|old| (old_name.clone(), old, old_tags.clone()));
-            let chunk_count = reindex_doc_with_rollback(
-                app,
-                doc_id,
-                &meta.name,
-                &content_text,
-                meta.tags.clone(),
-                vector_rollback.clone(),
-            )
-            .await? as u32;
-            meta.chunk_count = chunk_count;
-            if content.is_some() {
-                content_text_for_md5 = Some(content_text);
+        let content_path = if is_symlink {
+            meta.original_path
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .map(Path::new)
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| content_path.clone())
+        } else {
+            content_path.clone()
+        };
+        // Tag-only update on a copy doc whose content file has vanished:
+        // reading yields "" and reindex_doc would delete the old vectors and
+        // insert 0 chunks (same irreversible loss the symlink_lost guard
+        // prevents). Skip the re-index and keep the existing chunks.
+        if content.is_none() && !is_symlink && !content_path.exists() {
+            rag_log(
+                "warn",
+                format!("rag_file_update: '{}' content file missing; tags saved without re-index (chunks keep old data)", meta.name),
+            );
+        } else {
+        let content_text = if let Some(c) = content {
+            if meta.chunk_count > 0 && old_content_text.is_none() {
+                return Err(anyhow!(
+                    "existing document content is unavailable; refusing an update that cannot restore its vectors on failure"
+                ));
             }
+            let new_content = if append {
+                let old = old_content_text
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("existing document content is unavailable"))?;
+                format!("{}\n{}", old, c)
+            } else {
+                c.to_string()
+            };
+            let byte_len = new_content.len();
+            if byte_len > MAX_UPLOAD_BYTES {
+                return Err(anyhow!(
+                    "docContent too large: {} bytes, max {} bytes",
+                    byte_len, MAX_UPLOAD_BYTES
+                ));
+            }
+            if !cancellation.begin_transaction() {
+                return Err(anyhow!("document mutation cancelled before transaction start"));
+            }
+            transaction_started = true;
+            content_backup = Some(FileBackup::new(&content_path)?);
+            let tmp_path = content_path.with_extension(format!(
+                "{}.tmp",
+                content_path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
+            ));
+            if let Err(error) = std::fs::write(&tmp_path, &new_content) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(error.into());
+            }
+            if let Err(error) = std::fs::rename(&tmp_path, &content_path) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(error.into());
+            }
+            meta.size = byte_len as u64;
+            new_content
+        } else {
+            old_content_text
+                .clone()
+                .ok_or_else(|| anyhow!("existing document content is unavailable"))?
+        };
+        vector_rollback = Some((
+            old_name.clone(),
+            old_content_text.clone().unwrap_or_default(),
+            old_tags.clone(),
+        ));
+        let chunk_count = reindex_doc_with_rollback(
+            app,
+            doc_id,
+            &meta.name,
+            &content_text,
+            meta.tags.clone(),
+            vector_rollback.clone(),
+        )
+        .await? as u32;
+        meta.chunk_count = chunk_count;
+        if content.is_some() {
+            content_text_for_md5 = Some(content_text);
+        }
+        } // else (copy tag-only, content file missing): skipped re-index
         } // else (symlink_lost tag-only): skipped re-index above
     }
 
@@ -3246,42 +4867,81 @@ pub async fn update_doc(
     if meta.name != old_name {
         let by_id = dir.join(doc_id);
         if !by_id.exists() {
-            let old_path = dir.join(&old_name);
-            let new_path = dir.join(&meta.name);
+            // Resolve via the full candidate chain: upload docs live at
+            // {id}{ext} (old_name alone never matches them on disk), create
+            // docs at {old_name}. Renaming to the resolved-new target keeps
+            // content_path_for working after the name change.
+            let old_path = content_path_for(&dir, doc_id, &old_name);
+            let new_path = content_path_for(&dir, doc_id, &meta.name);
             if old_path.exists() && old_path != new_path {
-                let _ = std::fs::rename(&old_path, &new_path);
+                content_rename = Some((old_path, new_path));
             }
         }
     }
 
     // If content changed, refresh the stored md5 so future update detection
-    // compares against the new baseline.
+    // compares against the new baseline. For docs with a live original source
+    // (folder/git/copy with original_path), the md5 baseline must describe the
+    // SOURCE bytes — overwriting it with the copy's new content hash would
+    // make every later update check flag "original changed" and let a source
+    // refresh clobber MCP-written content. Keep the source baseline instead.
     if let Some(ct) = content_text_for_md5 {
-        meta.md5 = Some(compute_md5(ct.as_bytes()));
+        let source_md5 = meta
+            .original_path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .and_then(|p| md5_of_file(Path::new(p)).ok());
+        meta.md5 = source_md5.or_else(|| Some(compute_md5(ct.as_bytes())));
     }
 
-    if let Err(e) = write_meta_atomic(&meta_path, &meta) {
-        if let Some((old_doc_name, old_content, old_tags)) = vector_rollback.take() {
-            if let Err(restore_error) =
-                reindex_doc(app, doc_id, &old_doc_name, &old_content, old_tags).await
-            {
+    if !transaction_started && !cancellation.begin_transaction() {
+        return Err(anyhow!("document mutation cancelled before transaction start"));
+    }
+    if let Err(error) = write_meta_atomic(&meta_path, &meta) {
+        restore_doc_vectors(
+            app,
+            doc_id,
+            vector_rollback.take(),
+            &old_name,
+            "after metadata failure",
+        )
+        .await;
+        return Err(error);
+    }
+    if let Some((old_path, new_path)) = content_rename {
+        if let Err(e) = std::fs::rename(&old_path, &new_path) {
+            if let Err(meta_error) = write_meta_atomic(&meta_path, &old_meta) {
                 rag_log(
                     "error",
                     format!(
-                        "restore vectors for '{}' after metadata failure failed: {}",
-                        old_name, restore_error
+                        "restore metadata for '{}' after content rename failure failed: {}",
+                        old_name, meta_error
                     ),
                 );
             }
+            restore_doc_vectors(
+                app,
+                doc_id,
+                vector_rollback.take(),
+                &old_name,
+                "after content rename failure",
+            )
+            .await;
+            rag_log(
+                "error",
+                format!(
+                    "rag_file_update: renaming content file {:?} -> {:?} failed: {}",
+                    old_path, new_path, e
+                ),
+            );
+            return Err(e.into());
         }
-        return Err(e);
     }
-    content_backup.map(FileBackup::commit);
+    if let Some(backup) = content_backup.take() {
+        backup.commit();
+    }
     if let Err(e) = upsert_doc_sql(&meta).await {
-        rag_log(
-            "warn",
-            format!("upsert_doc_sql for '{}' failed: {}", meta.name, e),
-        );
+        rag_log("warn", format!("upsert_doc_sql for '{}' failed: {}", meta.name, e));
     }
     Ok(())
 }
@@ -3361,27 +5021,42 @@ async fn reindex_doc(
 ) -> Result<usize> {
     let settings = get_settings().await?;
     let n_chunks;
-    {
-        let mut guard = runtime().lock().await;
-        let Some(rt) = guard.as_mut() else {
+    // Phase the work so mv's model lock and rag's table lock are never held
+    // together: (1) sync phase under mv::with_model — chunk + embed ALL
+    // batches (progress events are sync emits, safe inside); (2) async phase
+    // under the rag runtime lock — delete old rows + insert.
+    let (chunks, embeddings) = {
+        // Model-derived params first: effective chunk size / overlap. `0` in
+        // the user's global setting means "auto" -> use the model's
+        // deploy.json-recommended value (chunkSize/chunkOverlap); a positive
+        // value is an explicit override. `chunk_size` is capped by the loaded
+        // model's context window so a chunk can never exceed what the embedder
+        // accepts (the GGUF backend silently truncates at max_context, which
+        // would drop the chunk tail). Fallbacks: 1024 / 100 when neither the
+        // user nor deploy.json specify.
+        if !is_enabled() {
             return Err(anyhow!("RAG not enabled"));
+        }
+        let max_ctx = mv::model_max_context_loaded().await?;
+        let deploy = {
+            let guard = runtime().lock().await;
+            let Some(rt) = guard.as_ref() else {
+                return Err(anyhow!("RAG not enabled"));
+            };
+            (
+                rt.deploy_chunk_size,
+                rt.deploy_chunk_overlap,
+                rt.import_doc_prefix.clone(),
+            )
         };
-        // Resolve the effective chunk size / overlap. `0` in the user's global
-        // setting means "auto" -> use the model's deploy.json-recommended value
-        // (chunkSize/chunkOverlap); a positive value is an explicit override.
-        // `chunk_size` is capped by the loaded model's context window so a chunk
-        // can never exceed what the embedder accepts (the GGUF/ONNX backends
-        // silently truncate at max_context, which would drop the chunk tail).
-        // Fallbacks: 1024 / 100 when neither the user nor deploy.json specify.
-        let max_ctx = rt.model.max_context().max(1) as u32;
         let chunk_size = match settings.chunk_size {
-            0 => rt.deploy_chunk_size.unwrap_or(1024),
+            0 => deploy.0.unwrap_or(1024),
             v => v,
         }
         .min(max_ctx)
         .max(1) as usize;
         let chunk_overlap = match settings.chunk_overlap {
-            0 => rt.deploy_chunk_overlap.unwrap_or(100),
+            0 => deploy.1.unwrap_or(100),
             v => v,
         } as usize;
         // Chunk via the strategy pattern (text/markdown/code) — text-splitter
@@ -3389,84 +5064,133 @@ async fn reindex_doc(
         // chunk_size maps directly to the model's context budget. Picked by
         // the file extension (CodeSplitter for source, MarkdownSplitter for
         // .md, TextSplitter otherwise). See `rag/chunker.rs`.
-        let chunks = chunk_document(
-            doc_name,
-            content,
-            &*rt.model,
-            chunk_size as u32,
-            chunk_overlap as u32,
-        );
+        //
         // Total chars (UTF-8 chars, not bytes) drives the per-file progress bar.
+        // Emit the 0% tick BEFORE chunking: chunking a multi-MB code file can
+        // take tens of seconds (AST partitioning + tokenizer size probes);
+        // without this the bar sits in "Preparing…" with no visible total
+        // for that whole phase, which reads as a hung import.
         let total_chars = content.chars().count() as u64;
-
-        // Adaptive batch size: if the doc has few chunks (<=32), process them
-        // ALL in one embed_batch call -> one big GEMM (max BLAS/AMX efficiency).
-        // If many chunks, batch in 32 -> multiple progress ticks (the bar moves)
-        // while keeping each GEMM large enough for efficient tiling. 32 is a
-        // sweet spot: big enough for AMX/BLAS GEMM efficiency, small enough that
-        // a 1000-chunk doc still gets ~30 progress ticks. This replaces the old
-        // hardcoded 8 (too small for f32 BLAS efficiency).
-        let batch_size = chunks.len().min(32);
-        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
-        let mut chars_done: u64 = 0;
-        let t_embed = std::time::Instant::now();
-        // Emit a 0% tick immediately so the UI's per-document bar shows the
-        // real char total (and leaves "Preparing…") before the first - possibly
-        // slow - forward finishes. Without this a large file shows no doc
-        // progress for the duration of its first embedding batch.
         emit_upload_progress(app, doc_name, 0, total_chars);
-        // Empty / whitespace-only docs produce no chunks (`chunk_document`
-        // returns an empty vec after trim). Skip the batch loop in that case:
-        // `Vec::chunks(0)` panics with "chunk size must be non-zero", so without
-        // this guard an empty file (e.g. 0-byte upload or whitespace-only) would
-        // panic during reindex — a latent bug surfaced by reindexing after a
-        // model swap. The doc is still stored, just with zero searchable chunks.
-        // Prepend the model's document prefix (deploy.json `importDocPrefix`) to
-        // each chunk before embedding - asymmetric models (Qwen3, BGE) require a
-        // distinct prefix on the document side. Cloned once (a few bytes) so the
-        // mutable `rt.model.embed_batch` borrow below is unencumbered. The
-        // stored chunk_text + the char-progress count use the ORIGINAL chunk
-        // (no prefix) so retrieved snippets + the progress bar reflect the real
-        // content, and the prefix doesn't inflate the char total.
-        let import_doc_prefix = rt.import_doc_prefix.clone();
-        // For an empty doc the loop below doesn't run (no chunks to embed), so
-        // emit the 100% tick here to finish its progress bar.
-        if chunks.is_empty() {
-            emit_upload_progress(app, doc_name, total_chars, total_chars);
-        }
-        for sub in chunks.chunks(batch_size.max(1)) {
-            let prefixed: Vec<String> = sub
-                .iter()
-                .map(|c| format!("{}{}", import_doc_prefix, c))
-                .collect();
-            let sub_refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
-            let embs = if sub_refs.is_empty() {
-                Vec::new()
-            } else {
-                rt.model
-                    .embed_batch(&sub_refs)
-                    .map_err(|e| anyhow!("embed_batch failed for '{}': {}", doc_name, e))?
-            };
-            let sub_chars: u64 = sub.iter().map(|c| c.chars().count() as u64).sum();
-            chars_done = chars_done.saturating_add(sub_chars);
-            embeddings.extend(embs);
-            emit_upload_progress(app, doc_name, chars_done, total_chars);
-        }
-        let embed_ms = t_embed.elapsed().as_millis();
-
-        rag_log(
-            "info",
-            format!(
-                "indexed '{}' -> {} chunks (chunk_size={} overlap={}, embedMs={})",
+        let import_doc_prefix = deploy.2;
+        mv::with_model(|model| {
+            // Route the chunker's per-partition progress to the frontend: for
+            // a multi-MB code file the chunking pass itself takes minutes, and
+            // without these ticks the "分片中…" row is static for that whole
+            // phase.
+            let chunks = chunk_document_with_progress(
                 doc_name,
-                chunks.len(),
-                chunk_size,
-                chunk_overlap,
-                embed_ms
-            ),
-        );
+                content,
+                model,
+                chunk_size as u32,
+                chunk_overlap as u32,
+                &|done, total| emit_chunking_progress(app, doc_name, done, total),
+            );
+            // Progress denominator for the embed loop: the SUM of chunk char
+            // counts, not the document char count. Consecutive chunks share
+            // `chunk_overlap` tokens of tail text, and the loop below
+            // accumulates per-chunk chars — against the document total that
+            // double-counts the overlap and saturates the bar EARLY (capped at
+            // 100%) while chunks still remain (observed: "char bar 100%, chunk
+            // bar still going"). The chunk sum is exactly what the loop
+            // accumulates, so the bar hits 100% precisely when the last chunk
+            // embeds (sum ≈ doc chars + total overlap, typically ~10% larger
+            // with chunk_size=1024/overlap=100).
+            let progress_total_chars: u64 = if chunks.is_empty() {
+                total_chars
+            } else {
+                chunks.iter().map(|c| c.chars().count() as u64).sum()
+            };
+
+            // Adaptive batch size: if the doc has few chunks (<=32), process
+            // them ALL in one embed_batch call -> one big GEMM (max BLAS/AMX
+            // efficiency). If many chunks, batch in 32 -> multiple progress
+            // ticks (the bar moves) while keeping each GEMM large enough for
+            // efficient tiling. 32 is a sweet spot: big enough for AMX/BLAS
+            // GEMM efficiency, small enough that a 1000-chunk doc still gets
+            // ~30 progress ticks. This replaces the old hardcoded 8 (too small
+            // for f32 BLAS efficiency).
+            let batch_size = chunks.len().min(32);
+            let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+            let mut chars_done: u64 = 0;
+            let t_embed = std::time::Instant::now();
+            // (The 0% tick was already emitted BEFORE chunking — see above —
+            // so the bar shows the real char total through the whole phase.)
+            // Empty / whitespace-only docs produce no chunks
+            // (`chunk_document` returns an empty vec after trim). Skip the
+            // batch loop in that case: `Vec::chunks(0)` panics with "chunk
+            // size must be non-zero", so without this guard an empty file
+            // (e.g. 0-byte upload or whitespace-only) would panic during
+            // reindex — a latent bug surfaced by reindexing after a model
+            // swap. The doc is still stored, just with zero searchable chunks.
+            // Prepend the model's document prefix (deploy.json
+            // `importDocPrefix`) to each chunk before embedding - asymmetric
+            // models (Qwen3, BGE) require a distinct prefix on the document
+            // side. Cloned once (a few bytes) so the mutable
+            // `model.embed_batch` borrow below is unencumbered. The stored
+            // chunk_text + the char-progress count use the ORIGINAL chunk
+            // (no prefix) so retrieved snippets + the progress bar reflect
+            // the real content, and the prefix doesn't inflate the char total.
+            // For an empty doc the loop below doesn't run (no chunks to
+            // embed), so emit the 100% tick here to finish its progress bar.
+            if chunks.is_empty() {
+                emit_upload_progress(app, doc_name, progress_total_chars, progress_total_chars);
+            }
+            let total_chunks = chunks.len() as u32;
+            let mut chunks_done: u32 = 0;
+            for sub in chunks.chunks(batch_size.max(1)) {
+                let prefixed: Vec<String> = sub
+                    .iter()
+                    .map(|c| format!("{}{}", import_doc_prefix, c))
+                    .collect();
+                let sub_refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
+                let embs = if sub_refs.is_empty() {
+                    Vec::new()
+                } else {
+                    model
+                        .embed_batch(&sub_refs)
+                        .map_err(|e| anyhow!("embed_batch failed for '{}': {}", doc_name, e))?
+                };
+                let sub_chars: u64 = sub.iter().map(|c| c.chars().count() as u64).sum();
+                chars_done = chars_done.saturating_add(sub_chars);
+                chunks_done = chunks_done.saturating_add(sub.len() as u32);
+                embeddings.extend(embs);
+                emit_upload_progress_chunks(
+                    app,
+                    doc_name,
+                    chars_done,
+                    progress_total_chars,
+                    chunks_done,
+                    total_chunks,
+                );
+            }
+            let embed_ms = t_embed.elapsed().as_millis() as u64;
+
+            rag_log(
+                "info",
+                format!(
+                    "indexed '{}' -> {} chunks (chunk_size={} overlap={}, embedMs={})",
+                    doc_name,
+                    chunks.len(),
+                    chunk_size,
+                    chunk_overlap,
+                    embed_ms
+                ),
+            );
+            Ok((chunks, embeddings))
+        })
+        .await?
+    };
+    {
+        let guard = runtime().lock().await;
+        let Some(rt) = guard.as_ref() else {
+            return Err(anyhow!("RAG not enabled"));
+        };
         // Remove any existing chunks for this doc (tag re-edit / re-upload).
-        let _ = rt.db.delete_by_doc(doc_id).await;
+        // A failed delete followed by a successful add leaves BOTH old and
+        // new chunks in the table — stale text stays searchable (review
+        // round 8, 2026-10-04). Fail instead of writing on top.
+        rt.db.delete_by_doc(doc_id).await?;
         let inputs: Vec<ChunkInput> = chunks
             .iter()
             .enumerate()
@@ -3490,11 +5214,97 @@ async fn reindex_doc(
     Ok(n_chunks)
 }
 
+async fn reindex_doc_with_rollback(
+    app: &AppHandle,
+    doc_id: &str,
+    doc_name: &str,
+    content: &str,
+    tags: Vec<String>,
+    rollback: Option<(String, String, Vec<String>)>,
+) -> Result<usize> {
+    match reindex_doc(app, doc_id, doc_name, content, tags).await {
+        Ok(count) => Ok(count),
+        Err(error) => {
+            restore_doc_vectors(app, doc_id, rollback, doc_name, "after failed update").await;
+            Err(error)
+        }
+    }
+}
+
+async fn restore_doc_vectors(
+    app: &AppHandle,
+    doc_id: &str,
+    rollback: Option<(String, String, Vec<String>)>,
+    doc_name: &str,
+    context: &str,
+) {
+    if let Some((old_doc_name, old_content, old_tags)) = rollback {
+        if let Err(restore_error) =
+            reindex_doc(app, doc_id, &old_doc_name, &old_content, old_tags).await
+        {
+            rag_log(
+                "error",
+                format!(
+                    "restore vectors for '{}' {} failed: {}",
+                    doc_name, context, restore_error
+                ),
+            );
+        }
+    }
+}
+
+async fn cleanup_new_doc_vectors(doc_id: &str, doc_name: &str, context: &str) {
+    let guard = runtime().lock().await;
+    let Some(rt) = guard.as_ref() else {
+        rag_log(
+            "error",
+            format!(
+                "cleanup vectors for new document '{}' {} failed: RAG runtime unavailable",
+                doc_name, context
+            ),
+        );
+        return;
+    };
+    if let Err(error) = rt.db.delete_by_doc(doc_id).await {
+        rag_log(
+            "error",
+            format!(
+                "cleanup vectors for new document '{}' {} failed: {}",
+                doc_name, context, error
+            ),
+        );
+    }
+}
+
+/// Count docs whose `.meta` claims indexed chunks (chunk_count > 0). The
+/// startup consistency check compares this against the vector store's row
+/// count — indexed metas with an empty vector table means the vectors were
+/// lost and every listed doc would be unsearchable.
+fn count_indexed_metas(app: &AppHandle) -> Result<u32> {
+    let dir = files_dir(app)?;
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut n = 0u32;
+    for entry in std::fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("meta") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(meta) = serde_json::from_slice::<DocMeta>(&bytes) else { continue };
+        if meta.chunk_count > 0 {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 /// Zero the on-disk `chunk_count` of every doc's `.meta` — called right after
 /// the vector table is recreated on a model swap (dim mismatch). Until
 /// `reindex_all` repopulates them, the list view shows 0 (honest: the table is
 /// empty) instead of a stale pre-swap count.
-fn zero_all_chunk_counts(app: &AppHandle) -> Result<()> {
+async fn zero_all_chunk_counts(app: &AppHandle) -> Result<()> {
     let dir = files_dir(app)?;
     if !dir.exists() {
         return Ok(());
@@ -3515,7 +5325,32 @@ fn zero_all_chunk_counts(app: &AppHandle) -> Result<()> {
             continue;
         }
         meta.chunk_count = 0;
-        if std::fs::write(&path, serde_json::to_vec(&meta)?).is_ok() {
+        // write_meta_atomic（tmp + rename）而非裸写：与所有其它 meta 写路径一致，
+        // 防崩溃留下半截 JSON 导致该文档被全部扫描器静默跳过。
+        // META_LOCK read-modify-write parity: every other meta writer holds
+        // it — without the lock a concurrent doc update could be overwritten
+        // by this stale copy (review round 8, 2026-10-04). Re-read inside the
+        // lock and merge only chunk_count=0 so concurrent name/tag changes in
+        // the window between the scan and this write survive (review round 9).
+        let _meta_guard = meta_lock().await.lock().await;
+        let written = match std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<DocMeta>(&b).ok())
+        {
+            Some(mut fresh) => {
+                fresh.chunk_count = 0;
+                write_meta_atomic(&path, &fresh).is_ok()
+            }
+            // Re-read failure (file deleted/corrupted by an external actor)
+            // must NOT write the stale scan snapshot back — that could revive
+            // an orphan meta; skip this doc instead (review round 10).
+            None => {
+                drop(_meta_guard);
+                continue;
+            }
+        };
+        drop(_meta_guard);
+        if written {
             n += 1;
         }
     }
@@ -3570,30 +5405,86 @@ pub async fn reindex_all(app: &AppHandle) -> Result<usize> {
     );
     emit_reindex_progress(app, 0, total, "");
     let mut done = 0usize;
-    for (i, (meta_path, mut meta)) in docs.into_iter().enumerate() {
+    for (i, (meta_path, meta)) in docs.into_iter().enumerate() {
         emit_reindex_progress(app, i as u32, total, &meta.name);
-        // Read and decode the same way as import. This preserves non-UTF-8
-        // symlink sources and avoids silently reindexing an unreadable file as
-        // an empty document.
-        let content = match read_doc_content(&dir, &meta) {
-            Ok(content) => content,
-            Err(e) => {
-                rag_log(
-                    "warn",
-                    format!("reindex: content read failed for '{}': {}", meta.name, e),
-                );
-                continue;
+        // Read the doc content. MUST use `content_path_for` (not `dir.join(id)`)
+        // — uploads are stored as `{id}.{ext}` (ext from the original filename),
+        // so a bare `{id}` path doesn't exist and `read_to_string` would fail ->
+        // empty content -> 0 chunks (looked like a silent reindex "success").
+        // For "symlink" docs there's no copy — read live from original_path.
+        let is_symlink = meta.method.as_deref() == Some("symlink");
+        let content = if is_symlink {
+            match meta
+                .original_path
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .map(Path::new)
+            {
+                Some(p) if p.exists() => std::fs::read_to_string(p).unwrap_or_default(),
+                _ => {
+                    rag_log(
+                        "warn",
+                        format!(
+                            "reindex: symlink '{}' original missing ({}), skipped",
+                            meta.name,
+                            meta.original_path.as_deref().unwrap_or("")
+                        ),
+                    );
+                    continue;
+                }
+            }
+        } else {
+            let content_path = content_path_for(&dir, &meta.id, &meta.name);
+            match std::fs::read_to_string(&content_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    rag_log(
+                        "warn",
+                        format!(
+                            "reindex: content read failed for '{}' ({}): {}",
+                            meta.name,
+                            content_path.display(),
+                            e
+                        ),
+                    );
+                    continue;
+                }
             }
         };
         let tags = meta.tags.clone();
         match reindex_doc(app, &meta.id, &meta.name, &content, tags).await {
             Ok(cc) => {
-                meta.chunk_count = cc as u32;
-                if let Err(e) = write_meta_atomic(&meta_path, &meta) {
-                    rag_log(
-                        "warn",
-                        format!("reindex: rewrite meta for '{}' failed: {}", meta.name, e),
-                    );
+                // META_LOCK read-modify-write parity with every other meta
+                // writer: without it a concurrent update_doc could be
+                // clobbered by this stale copy (review round 8, 2026-10-04).
+                // RE-READ inside the lock and merge only chunk_count: the
+                // snapshot above was taken before a long reindex, so writing
+                // it back wholesale would revert concurrent name/tag changes
+                // (review round 9). Re-read failure falls back to the stale
+                // snapshot (conservative fallback).
+                let _meta_guard = meta_lock().await.lock().await;
+                let merged: DocMeta = match std::fs::read(&meta_path)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<DocMeta>(&b).ok())
+                {
+                    Some(mut fresh) => {
+                        fresh.chunk_count = cc as u32;
+                        fresh
+                    }
+                    None => {
+                        // Re-read failed (meta removed/corrupted mid-reindex):
+                        // do not resurrect the stale snapshot; skip the meta
+                        // rewrite (vectors are already re-embedded) (review
+                        // round 10).
+                        drop(_meta_guard);
+                        done += 1;
+                        continue;
+                    }
+                };
+                let res = write_meta_atomic(&meta_path, &merged);
+                drop(_meta_guard);
+                if let Err(e) = res {
+                    rag_log("warn", format!("reindex: rewrite meta for '{}' failed: {}", merged.name, e));
                 }
                 done += 1;
             }
@@ -3606,15 +5497,23 @@ pub async fn reindex_all(app: &AppHandle) -> Result<usize> {
         }
     }
     NEEDS_REINDEX.store(false, std::sync::atomic::Ordering::SeqCst);
+    // Record the model the index was just rebuilt with, so the same-dim swap
+    // detection at start() doesn't force another reindex next time.
+    let built_with = match crate::mv::active_model().await {
+        Some(m) => Some(m),
+        None => crate::mv::current_model().await,
+    };
+    match built_with.as_deref() {
+        Some(m) => set_indexed_model(m).await,
+        None => {
+            rag_log("warn", "reindex: could not resolve active model to persist rag.indexedModel");
+        }
+    }
     emit_reindex_progress(app, total, total, "");
-    drop(_meta_guard);
     // Tags are unchanged by reindex (carried over), but a full mirror rebuild is
     // cheap and keeps the SQL tables consistent if any meta was skipped/corrupt.
     if let Err(e) = rebuild_rag_sql_index(app).await {
-        rag_log(
-            "warn",
-            format!("rebuild_rag_sql_index after reindex failed: {}", e),
-        );
+        rag_log("warn", format!("rebuild_rag_sql_index after reindex failed: {}", e));
     }
     rag_log(
         "info",
@@ -3633,7 +5532,21 @@ pub async fn reindex_all(app: &AppHandle) -> Result<usize> {
 /// other call paths. The runtime check happens before `.meta` is written, so a
 /// failure leaves the document unchanged.
 pub async fn set_doc_tags(app: &AppHandle, id: &str, tags: Vec<String>) -> Result<()> {
-    let _meta_guard = meta_lock().await.lock().await;
+    let app = app.clone();
+    let id = id.to_string();
+    run_doc_mutation(move |cancellation| async move {
+        set_doc_tags_locked(&app, &id, tags, cancellation).await
+    })
+    .await
+}
+
+async fn set_doc_tags_locked(
+    app: &AppHandle,
+    id: &str,
+    tags: Vec<String>,
+    cancellation: DocMutationCancellation,
+) -> Result<()> {
+    validate_doc_id(id)?;
     let dir = files_dir(app)?;
     let meta_path = dir.join(format!("{}.meta", id));
     let Ok(meta_bytes) = std::fs::read(&meta_path) else {
@@ -3652,22 +5565,47 @@ pub async fn set_doc_tags(app: &AppHandle, id: &str, tags: Vec<String>) -> Resul
     // Rewrite the chunks' tags in place (reusing existing embeddings, no
     // re-embed) and prune the replaced chunks. Requires RAG enabled - refuse
     // (rather than silently leaving stale-tag chunks) when the runtime is off.
-    // Hold the runtime lock across the meta write + chunk rewrite so RAG can't
-    // be toggled mid-op and leave meta/lancedb out of sync. META_LOCK (held
-    // above) serializes against concurrent update/delete of the same doc.
-    {
-        let guard = runtime().lock().await;
-        let rt = guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("RAG is not enabled - turn on RAG before editing tags"))?;
-        meta.tags = tags.clone();
-        write_meta_atomic(&meta_path, &meta)?;
-        rewrite_chunks_with_tags(&rt.db, id, &tags).await?;
+    // Snapshot chunks before mutation so a failed replacement can restore the
+    // exact old embeddings and metadata tags without invoking the model.
+    let runtime_guard = runtime().lock().await;
+    let rt = runtime_guard
+        .as_ref()
+        .ok_or_else(|| anyhow!("RAG is not enabled - turn on RAG before editing tags"))?;
+    let old_chunks = rt.db.read_chunks_by_doc(id).await?;
+    if !cancellation.begin_transaction() {
+        return Err(anyhow!("document mutation cancelled before transaction start"));
     }
-    rag_log(
-        "info",
-        format!("updated tags for '{}' ({} tags)", meta.name, tags.len()),
-    );
+    let meta_backup = MetaFileBackup::new(&meta_path)?;
+    meta.tags = tags.clone();
+    if let Err(error) = write_meta_atomic(&meta_path, &meta) {
+        drop(meta_backup);
+        return Err(error);
+    }
+    if let Err(error) = replace_chunks_with_tags(&rt.db, id, &old_chunks, &tags).await {
+        if let Err(restore_error) = restore_doc_chunks(&rt.db, id, &old_chunks).await {
+            rag_log(
+                "error",
+                format!(
+                    "restore old chunks for '{}' after tag update failure failed: {}",
+                    meta.name, restore_error
+                ),
+            );
+        }
+        drop(meta_backup);
+        return Err(error);
+    }
+    meta_backup.commit();
+    if !old_chunks.is_empty() {
+        if let Err(error) = rt.db.optimize().await {
+            rag_log(
+                "warn",
+                format!("optimize chunks after tag update for '{}' failed: {}", meta.name, error),
+            );
+        }
+    }
+    drop(runtime_guard);
+
+    rag_log("info", format!("updated tags for '{}' ({} tags)", meta.name, tags.len()));
     // The SQL mirror update (rag_tags / rag_doc_tags / rag_docs) is best-effort
     // relative to the .meta + chunk rewrites above, which already succeeded.
     // Retry on a busy lock: the pool is configured with a 5s busy_timeout, but
@@ -3688,50 +5626,157 @@ pub async fn set_doc_tags(app: &AppHandle, id: &str, tags: Vec<String>) -> Resul
                     last_err = Some(e);
                     break;
                 }
-                rag_log(
-                    "warn",
-                    format!(
-                        "upsert_doc_sql for '{}' busy (attempt {}/4), retrying: {}",
-                        meta.name, attempt, msg
-                    ),
-                );
+                rag_log("warn", format!(
+                    "upsert_doc_sql for '{}' busy (attempt {}/4), retrying: {}",
+                    meta.name, attempt, msg
+                ));
                 tokio::time::sleep(std::time::Duration::from_millis(150 * attempt as u64)).await;
             }
         }
     }
     if let Some(e) = last_err {
-        rag_log(
-            "warn",
-            format!("upsert_doc_sql for '{}' failed: {}", meta.name, e),
-        );
+        rag_log("warn", format!("upsert_doc_sql for '{}' failed: {}", meta.name, e));
     }
     Ok(())
 }
 
-/// Rewrite a document's chunks with `tags`, reusing the existing embeddings
-/// (no re-embed). Deletes the old chunks first so the new ones replace them,
-/// then prunes the freed space.
-async fn rewrite_chunks_with_tags(db: &VectorDb, id: &str, tags: &[String]) -> Result<()> {
-    let records = db.read_chunks_by_doc(id).await?;
+/// Replace a document's chunks with the supplied tags, reusing embeddings.
+/// Optimization is deliberately left to the caller after the metadata and
+/// vector changes have committed.
+async fn replace_chunks_with_tags(
+    db: &VectorDb,
+    id: &str,
+    records: &[crate::rag::vectordb::ChunkRecord],
+    tags: &[String],
+) -> Result<()> {
     if records.is_empty() {
         return Ok(());
     }
     db.delete_by_doc(id).await?;
-    let inputs: Vec<ChunkInput> = records
-        .iter()
-        .map(|r| ChunkInput {
-            chunk_id: r.chunk_id.clone(),
-            doc_id: r.doc_id.clone(),
-            doc_name: r.doc_name.clone(),
-            chunk_index: r.chunk_index,
-            chunk_text: r.chunk_text.clone(),
-            embedding: r.embedding.as_slice(),
-            tags: tags.to_vec(),
-        })
-        .collect();
-    db.add_chunks(&inputs).await?;
-    db.optimize().await?;
+    let inputs = chunk_inputs(records, Some(tags));
+    db.add_chunks(&inputs).await
+}
+
+fn delete_content_paths(dir: &Path, id: &str, meta: Option<&DocMeta>) -> Vec<PathBuf> {
+    if meta.is_some_and(|meta| meta.method.as_deref() == Some("symlink")) {
+        return Vec::new();
+    }
+    let mut candidates = Vec::new();
+    if let Some(ext) = meta
+        .and_then(|meta| Path::new(&meta.name).extension().and_then(|ext| ext.to_str()))
+        .map(|ext| format!(".{}", ext.to_ascii_lowercase()))
+    {
+        candidates.push(dir.join(format!("{id}{ext}")));
+    }
+    candidates.push(dir.join(format!("{id}.md")));
+    candidates.push(dir.join(id));
+    if let Some(meta_name) = meta.map(|meta| meta.name.as_str()) {
+        let legacy_path = dir.join(meta_name);
+        if content_path_for(dir, id, meta_name) == legacy_path {
+            candidates.push(legacy_path);
+        }
+    }
+
+    let meta_path = dir.join(format!("{id}.meta"));
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|path| path != &meta_path && seen.insert(path.clone()));
+    candidates
+}
+
+fn stage_delete_content(paths: &[PathBuf]) -> Result<Vec<FileBackup>> {
+    let mut backups = Vec::new();
+    for path in paths {
+        if let Some(backup) = FileBackup::stage_regular_file(path)? {
+            backups.push(backup);
+        }
+    }
+    Ok(backups)
+}
+
+async fn commit_doc_delete<D, DFut, R, RFut, M>(
+    content_paths: &[PathBuf],
+    meta_path: &Path,
+    delete_vectors: D,
+    restore_vectors: R,
+    remove_meta: M,
+) -> Result<()>
+where
+    D: FnOnce() -> DFut,
+    DFut: Future<Output = Result<()>>,
+    R: FnOnce() -> RFut,
+    RFut: Future<Output = Result<()>>,
+    M: FnOnce() -> Result<()>,
+{
+    let content_backups = stage_delete_content(content_paths)?;
+    let meta_backup = MetaFileBackup::new(meta_path)?;
+
+    if let Err(error) = delete_vectors().await {
+        if let Err(restore_error) = restore_vectors().await {
+            rag_log(
+                "error",
+                format!("restore vectors after document delete failure failed: {}", restore_error),
+            );
+        }
+        drop(meta_backup);
+        return Err(error);
+    }
+    if let Err(error) = remove_meta() {
+        if let Err(restore_error) = restore_vectors().await {
+            rag_log(
+                "error",
+                format!("restore vectors after metadata delete failure failed: {}", restore_error),
+            );
+        }
+        drop(meta_backup);
+        return Err(error);
+    }
+
+    for backup in content_backups {
+        backup.commit();
+    }
+    meta_backup.commit();
     Ok(())
+}
+
+fn remove_meta_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn restore_doc_chunks(
+    db: &VectorDb,
+    id: &str,
+    records: &[crate::rag::vectordb::ChunkRecord],
+) -> Result<()> {
+    db.delete_by_doc(id).await?;
+    if records.is_empty() {
+        return Ok(());
+    }
+    let inputs = chunk_inputs(records, None);
+    db.add_chunks(&inputs).await
+}
+
+fn chunk_inputs<'a>(
+    records: &'a [crate::rag::vectordb::ChunkRecord],
+    replacement_tags: Option<&[String]>,
+) -> Vec<ChunkInput<'a>> {
+    records
+        .iter()
+        .map(|record| ChunkInput {
+            chunk_id: record.chunk_id.clone(),
+            doc_id: record.doc_id.clone(),
+            doc_name: record.doc_name.clone(),
+            chunk_index: record.chunk_index,
+            chunk_text: record.chunk_text.clone(),
+            embedding: record.embedding.as_slice(),
+            tags: replacement_tags
+                .map(|tags| tags.to_vec())
+                .unwrap_or_else(|| record.tags.clone()),
+        })
+        .collect()
 }
 
 /// Delete a document: remove its files + all its chunks from the vector DB,
@@ -3743,93 +5788,156 @@ async fn rewrite_chunks_with_tags(db: &VectorDb, id: &str, tags: &[String]) -> R
 /// for other call paths (MCP, batch). lancedb cleanup runs before the files
 /// are removed, so a failure leaves the document intact.
 ///
-/// Holds META_LOCK for the whole delete (acquired BEFORE the runtime lock -
-/// consistent ordering meta -> runtime with the update paths) so a concurrent
-/// update of the same doc can't re-write the meta after we remove it (the
-/// "deleted doc resurrected" race).
+/// The owned worker holds META_LOCK through vector, file, and SQL cleanup
+/// (acquired BEFORE the runtime lock, consistent with update paths) so a
+/// concurrent update cannot resurrect the deleted document. Network-based Git
+/// refcount cleanup runs after that lock is released.
 pub async fn delete_doc(app: &AppHandle, id: &str) -> Result<()> {
-    let _meta_guard = meta_lock().await.lock().await;
+    let app = app.clone();
+    let id = id.to_string();
+    let cleanup_app = app.clone();
+    let deleted_meta = run_doc_mutation(move |cancellation| async move {
+        delete_doc_locked(&app, &id, cancellation).await
+    })
+    .await?;
+    cleanup_deleted_git_source(&cleanup_app, deleted_meta).await;
+    Ok(())
+}
+
+async fn delete_doc_locked(
+    app: &AppHandle,
+    id: &str,
+    cancellation: DocMutationCancellation,
+) -> Result<Option<DocMeta>> {
+    validate_doc_id(id)?;
     let dir = files_dir(app)?;
-
-    // Remove the doc's chunks from lancedb. Pruning is deferred so this IPC
-    // returns promptly after the document is no longer queryable.
-    {
-        let guard = runtime().lock().await;
-        let rt = guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("RAG is not enabled - turn on RAG before deleting documents"))?;
-        rt.db.delete_by_doc(id).await?;
-    }
-    schedule_deferred_prune();
-
-    // Content file is `dir/{id}` for uploads, `dir/{meta.name}` for
-    // rag_file_create docs - read the meta to resolve the human-readable name.
-    // Remove BOTH candidate paths (id + meta.name) so a content file is never
-    // orphaned regardless of which naming scheme wrote it. Log any removal
-    // failure (rather than `let _ =`) so a permissions/path bug surfaces in the
-    // Logs page instead of silently leaving the file on disk.
-    //
-    // For "symlink" docs there is NO copied content file (the source lives at
-    // original_path and is never owned by RAG) — only the `.meta` + vectors are
-    // removed; the original file is left untouched.
-    let meta_opt = std::fs::read(dir.join(format!("{}.meta", id)))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<DocMeta>(&b).ok());
-    let meta_name = meta_opt.as_ref().map(|m| m.name.clone());
-    let is_symlink = meta_opt
-        .as_ref()
-        .map(|m| m.method.as_deref() == Some("symlink"))
-        .unwrap_or(false);
-    if !is_symlink {
-        // Remove every candidate on-disk path (current `{id}{ext}` upload scheme,
-        // legacy bare-`{id}` upload, and `{meta_name}` for rag_file_create) so no
-        // content file is orphaned regardless of which scheme wrote it.
-        let ext = meta_name
-            .as_deref()
-            .and_then(|n| std::path::Path::new(n).extension().and_then(|e| e.to_str()))
-            .map(|e| format!(".{}", e.to_ascii_lowercase()));
-        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(ref ext) = ext {
-            candidates.push(dir.join(format!("{id}{ext}")));
-        }
-        candidates.push(dir.join(id));
-        if let Some(ref name) = meta_name {
-            let p = dir.join(name);
-            if !candidates.contains(&p) {
-                candidates.push(p);
-            }
-        }
-        for p in &candidates {
-            if p.exists() {
-                if let Err(e) = std::fs::remove_file(p) {
-                    rag_log(
-                        "warn",
-                        format!("delete_doc: remove {} failed: {}", p.display(), e),
-                    );
-                }
-            }
-        }
-    } else {
-        rag_log(
-            "info",
-            format!("delete_doc: symlink doc {} — original left untouched", id),
-        );
-    }
     let meta_path = dir.join(format!("{}.meta", id));
-    if meta_path.exists() {
-        if let Err(e) = std::fs::remove_file(&meta_path) {
-            rag_log(
-                "warn",
-                format!("delete_doc: remove {} failed: {}", meta_path.display(), e),
-            );
-        }
+    let meta_opt = match std::fs::read(&meta_path) {
+        Ok(bytes) => Some(serde_json::from_slice::<DocMeta>(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let content_paths = delete_content_paths(&dir, id, meta_opt.as_ref());
+
+    // Snapshot exact rows before deleting them. Restores reuse stored
+    // embeddings and each row's tags; no embedding model is involved.
+    let runtime_guard = runtime().lock().await;
+    let rt = runtime_guard
+        .as_ref()
+        .ok_or_else(|| anyhow!("RAG is not enabled - turn on RAG before deleting documents"))?;
+    let old_chunks = rt.db.read_chunks_by_doc(id).await?;
+    if !cancellation.begin_transaction() {
+        return Err(anyhow!("document mutation cancelled before transaction start"));
     }
+    commit_doc_delete(
+        &content_paths,
+        &meta_path,
+        || async { rt.db.delete_by_doc(id).await },
+        || async { restore_doc_chunks(&rt.db, id, &old_chunks).await },
+        || remove_meta_if_present(&meta_path),
+    )
+    .await?;
+    drop(runtime_guard);
+
+    // Pruning is deferred so this IPC returns promptly after the document is
+    // no longer queryable. Schedule only after the core delete commits.
+    schedule_deferred_prune(app);
 
     rag_log("info", format!("deleted document {}", id));
     if let Err(e) = remove_doc_sql(id).await {
         rag_log("warn", format!("remove_doc_sql for {} failed: {}", id, e));
     }
-    Ok(())
+
+    Ok(meta_opt)
+}
+
+/// Git refcount cleanup performs network probes and must run after the
+/// lock-owning document worker has released META_LOCK.
+async fn cleanup_deleted_git_source(app: &AppHandle, meta_opt: Option<DocMeta>) {
+    // Git data source refcount: if the deleted doc came from a git repo and
+    // no remaining doc references that repo, remove the persistent clone +
+    // local credential file (the temp dir self-heals via the OS).
+    if let Some(meta) = meta_opt.as_ref() {
+        if let Some(git_url) = meta
+            .source
+            .as_ref()
+            .filter(|s| s.kind == "git")
+            .and_then(|s| s.git.as_ref())
+            .map(|g| g.url.clone())
+            .filter(|u| !u.is_empty())
+        {
+            // Canonicalize before counting — artifacts are keyed by the
+            // canonical hash; docs under other spellings of the same repo
+            // must keep the refcount above zero.
+            let canonical_git_url = super::git::canonicalize_url(&git_url).await;
+            if count_git_docs_for_repo(app, &canonical_git_url).await == 0 {
+                // Guard the refcount-vs-in-flight-import race: an import of a
+                // new doc from this same repo may be mid-flight (its meta not
+                // yet on disk, so the count above legitimately reads 0 even
+                // though the clone is about to be referenced again). While an
+                // import session is active, defer the clone/credential
+                // cleanup — an unreferenced clone is harmless and will be
+                // collected by the next refcount-zero delete.
+                if import_session_active() || BATCH_UPDATE_RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
+                    rag_log(
+                        "info",
+                        format!("git: import session/batch update active — deferring clone/credential cleanup for {git_url}"),
+                    );
+                } else {
+                    // Clone + credential are stored under the CANONICAL url's
+                    // hash (clone_to_temp / store_credential_for canonicalize
+                    // first) — hash the canonical form or the cleanup no-ops
+                    // against a dir/key that doesn't exist while the real
+                    // artifacts leak (the sync path already routes through
+                    // persistent_repo_dir_for_url for exactly this reason).
+                    // Reuse the canonicalize from the count above (a cache
+                    // miss costs a network probe; review round 10).
+                    let hash = super::git::repo_hash(&canonical_git_url);
+                    if let Err(e) = super::git::remove_persistent(app, &hash) {
+                        rag_log("warn", format!("delete_doc: remove git clone {hash} failed: {e}"));
+                    }
+                    if let Err(e) = super::git::delete_credential(app, &hash) {
+                        rag_log("warn", format!("delete_doc: remove git credential {hash} failed: {e}"));
+                    }
+                    rag_log("info", format!("git: repo {git_url} has no docs left — clone + credential cleaned up"));
+                }
+            }
+        }
+    }
+}
+
+/// Count remaining docs whose source came from `repo_url` (kind == "git").
+/// Each doc's stored url is canonicalized before comparison: meta keeps the
+/// RAW url the user imported with, which can differ from `repo_url`'s
+/// spelling (http→https, trailing slash) — an exact comparison would
+/// undercount and let delete_doc remove a clone/credential other docs still
+/// reference (review round 8, 2026-10-04).
+async fn count_git_docs_for_repo(app: &AppHandle, repo_url: &str) -> usize {
+    let Ok(dir) = files_dir(app) else { return 0 };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return 0 };
+    let mut count = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("meta") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(meta) = serde_json::from_slice::<DocMeta>(&bytes) else { continue };
+        let u = meta
+            .source
+            .as_ref()
+            .filter(|s| s.kind == "git")
+            .and_then(|s| s.git.as_ref())
+            .map(|g| g.url.clone())
+            .filter(|u| !u.is_empty());
+        if let Some(u) = u {
+            let c = super::git::canonicalize_url(&u).await;
+            if c == repo_url {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 /// Reveal a document's file location in the OS file manager.
@@ -3838,31 +5946,82 @@ pub async fn delete_doc(app: &AppHandle, id: &str) -> Result<()> {
 /// rag/files copy (there is none). For "copy"/legacy docs it reveals the copied
 /// file under rag/files as before. Returns an error if the resolved target no
 /// longer exists on disk (e.g. a symlink whose source was moved/deleted).
-pub async fn open_file_location(app: &AppHandle, id: &str) -> Result<()> {
+pub async fn open_file_location(app: &AppHandle, id: &str, target: Option<String>) -> Result<()> {
+    validate_doc_id(id)?;
     let dir = files_dir(app)?;
     let meta = std::fs::read(dir.join(format!("{}.meta", id)))
         .ok()
         .and_then(|b| serde_json::from_slice::<DocMeta>(&b).ok())
         .ok_or_else(|| anyhow!("document not found: {}", id))?;
     let is_symlink = meta.method.as_deref() == Some("symlink");
-    let target = if is_symlink {
+    // target="source": explicitly reveal the ORIGINAL file (second-opinion
+    // view for extractable imports). Default: symlink docs -> original,
+    // copy docs -> the rag/files copy / extracted Markdown.
+    let want_source = target.as_deref() == Some("source");
+    let (resolved, is_source) = if want_source || is_symlink {
         let op = meta
             .original_path
             .as_deref()
             .filter(|p| !p.is_empty())
             .ok_or_else(|| anyhow!("no original path recorded for this document"))?;
-        PathBuf::from(op)
+        (PathBuf::from(op), true)
     } else {
-        content_path_for(&dir, id, &meta.name)
+        (content_path_for(&dir, id, &meta.name), false)
     };
-    if !target.exists() {
-        return Err(if is_symlink {
-            anyhow!("original file does not exist: {}", target.display())
+    if !resolved.exists() {
+        return Err(if is_source {
+            anyhow!("original file does not exist: {}", resolved.display())
         } else {
-            anyhow!("file not found: {}", target.display())
+            anyhow!("file not found: {}", resolved.display())
         });
     }
-    reveal_in_file_manager(&target)?;
+    reveal_in_file_manager(&resolved)?;
+    Ok(())
+}
+
+/// Open a doc's ORIGINAL source file with the OS default application
+/// ("view source file" button in the View dialog — PDF/Office/image sources
+/// are stored as extracted Markdown, this re-opens the real file).
+pub async fn open_doc_source(app: &AppHandle, id: &str) -> Result<()> {
+    validate_doc_id(id)?;
+    let dir = files_dir(app)?;
+    let meta = std::fs::read(dir.join(format!("{}.meta", id)))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<DocMeta>(&b).ok())
+        .ok_or_else(|| anyhow!("document not found: {}", id))?;
+    let op = meta
+        .original_path
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| anyhow!("no original path recorded for this document"))?;
+    let file = PathBuf::from(op);
+    if !file.exists() {
+        return Err(anyhow!("original file does not exist: {}", file.display()));
+    }
+    open_file_with_default_app(&file)?;
+    Ok(())
+}
+
+/// Open `file` with the OS default application (view the file itself, not
+/// its parent folder).
+fn open_file_with_default_app(file: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(file).spawn()?.wait()?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // explorer <file> opens it with the default associated application.
+        let mut c = std::process::Command::new("explorer");
+        c.arg(file.as_os_str());
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        c.spawn()?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(file).spawn()?.wait()?;
+    }
     Ok(())
 }
 
@@ -3873,17 +6032,44 @@ pub async fn open_file_location(app: &AppHandle, id: &str) -> Result<()> {
 /// change / legacy-no-path). Reads `.meta` + stats the source file. Cheap
 /// (one md5 of the source, no embedding).
 pub async fn check_rag_update(app: &AppHandle, id: &str) -> Result<RagUpdateCheck> {
+    validate_doc_id(id)?;
     let dir = files_dir(app)?;
     let meta_bytes = std::fs::read(dir.join(format!("{}.meta", id)))
         .map_err(|e| anyhow!("check: read meta {} failed: {}", id, e))?;
     let meta: DocMeta = serde_json::from_slice(&meta_bytes)?;
-    Ok(classify_original(&meta))
+    // Git data source: refresh the repo's persistent clone first so the md5
+    // classification reflects the remote's current content. Best-effort — a
+    // failed refresh (offline / auth required) still classifies against the
+    // existing clone, but the failure is REPORTED in the result (gitError)
+    // so the UpdateDialog can tell the user why the check may be stale
+    // (credentials revoked / address moved).
+    let mut git_error: Option<GitSourceError> = None;
+    if let Some(src) = meta.source.as_ref() {
+        if src.kind == "git" {
+            if let Some(git) = src.git.as_ref() {
+                if !git.url.is_empty() {
+                    if let Err(err) = refresh_git_repo(app, &git.url).await {
+                        git_error = Some(err);
+                    }
+                }
+            }
+        }
+    }
+    let mut result = classify_original(&meta, &list_excluded_paths().await);
+    result.git_error = git_error;
+    Ok(result)
 }
 
 /// Batch-update preview: classify every doc and return the aggregate counts
 /// the confirm dialog shows before the expensive re-index pass runs. No
-/// embedding, no progress events — just a fast filesystem scan.
+/// embedding, no progress events — just a fast filesystem scan. When
+/// `refresh_git` is true (manual batch button + auto tick), git repos are
+/// refreshed first so git docs' md5 classification sees the remote state.
 pub async fn preview_batch_update(app: &AppHandle) -> Result<BatchPreview> {
+    preview_batch_update_inner(app, true).await
+}
+
+async fn preview_batch_update_inner(app: &AppHandle, refresh_git: bool) -> Result<BatchPreview> {
     let dir = files_dir(app)?;
     if !dir.exists() {
         return Ok(BatchPreview {
@@ -3891,25 +6077,116 @@ pub async fn preview_batch_update(app: &AppHandle) -> Result<BatchPreview> {
             to_update: 0,
             skipped: 0,
             lost: 0,
+            added: 0,
+            removed: 0,
+            excluded: 0,
+            git_errors: Vec::new(),
         });
     }
     let mut total = 0u32;
     let mut to_update = 0u32;
     let mut skipped = 0u32;
     let mut lost = 0u32;
+    let mut excluded_count = 0u32;
+    // Exclusion registry: docs whose original_path matches are counted as
+    // `excluded` and skipped by every branch below (never re-indexed, never
+    // source-sync-removed, their file never re-imported).
+    let excluded_paths = list_excluded_paths().await;
+    // First pass: collect metas (needed both for the git-repo refresh pass
+    // and the classification loop).
+    let mut docs: Vec<DocMeta> = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
         let path = entry?.path();
         if path.extension().and_then(|e| e.to_str()) != Some("meta") {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let Ok(meta) = serde_json::from_slice::<DocMeta>(&bytes) else {
-            continue;
-        };
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(meta) = serde_json::from_slice::<DocMeta>(&bytes) else { continue };
+        docs.push(meta);
+    }
+    emit_preview_progress(app, 0, docs.len() as u32, "", "metas");
+    // Git repos: refresh each distinct repo once before classification so the
+    // md5 check sees the remote content. Refreshes run CONCURRENTLY (N offline
+    // repos cost one timeout, not N); failures are collected and reported to
+    // the confirm dialog (gitErrors) instead of being silently swallowed.
+    let mut git_errors: Vec<GitSourceError> = Vec::new();
+    if refresh_git {
+        let urls = collect_git_repo_urls(&docs);
+        if !urls.is_empty() {
+            emit_preview_progress(app, 0, urls.len() as u32, "", "git");
+            let app2 = app.clone();
+            let futs: Vec<_> = urls
+                .iter()
+                .map(|u| {
+                    let app = app2.clone();
+                    let u = u.clone();
+                    async move { refresh_git_repo(&app, &u).await }
+                })
+                .collect();
+            for res in futures_util::future::join_all(futs).await {
+                if let Err(err) = res {
+                    git_errors.push(err);
+                }
+            }
+            emit_preview_progress(app, urls.len() as u32, urls.len() as u32, "", "git");
+        }
+    }
+    // Source-level sync plan (dry run): files added/removed in folder/git
+    // sources. Docs that the sync will REMOVE are counted as `removed`, not
+    // `lost` (they'd otherwise double-report as lost originals).
+    emit_preview_progress(app, 0, 0, "", "scan");
+    let (mut sync_added, mut sync_removed) = plan_source_sync(app, &docs).await.unwrap_or_default();
+    // Apply the SAME "自动同步新增文件" gate as run_batch_update — otherwise the
+    // confirm dialog would advertise adds that never happen, and the auto-tick
+    // idle check (added==0) would never idle while a new file sits in a source.
+    // Removal sync always runs (its file vanished), regardless of this gate.
+    if !get_settings()
+        .await
+        .map(|s| s.source_sync_add_enabled)
+        .unwrap_or(false)
+    {
+        sync_added.clear();
+    }
+    // Gate removal sync too: with "自动同步删除文件" off, vanished originals are
+    // kept (the list rows show the "原始丢失" lost-original badge instead).
+    if !get_settings()
+        .await
+        .map(|s| s.source_sync_remove_enabled)
+        .unwrap_or(true)
+    {
+        sync_removed.clear();
+    }
+    // Import in progress: defer source-add imports — the import loop may be
+    // uploading the very files the sync would import (double-import race).
+    // Removal sync is doc-side only and can stay.
+    if import_session_active() && !sync_added.is_empty() {
+        rag_log(
+            "info",
+            format!(
+                "batch preview: deferring {} source file import(s) (import in progress)",
+                sync_added.len()
+            ),
+        );
+        sync_added.clear();
+    }
+    let removed_ids: std::collections::HashSet<&str> =
+        sync_removed.iter().map(|(id, _)| id.as_str()).collect();
+    let added_count = sync_added.len() as u32;
+    let removed_count = sync_removed.len() as u32;
+    let classify_total = docs.len() as u32;
+    for (ci, meta) in docs.iter().enumerate() {
+        emit_preview_progress(app, ci as u32 + 1, classify_total, &meta.name, "checking");
         total += 1;
-        let c = classify_original(&meta);
+        if removed_ids.contains(meta.id.as_str()) {
+            // The sync will delete this doc — counted via `removed` below
+            // (= sync plan size), not as a lost original.
+            continue;
+        }
+        if is_excluded_sync(meta.original_path.as_deref().unwrap_or(""), &excluded_paths) {
+            excluded_count += 1;
+            continue;
+        }
+        let c = classify_original(meta, &excluded_paths);
         if c.lost_original {
             lost += 1;
         } else if !c.has_original_path {
@@ -3927,6 +6204,10 @@ pub async fn preview_batch_update(app: &AppHandle) -> Result<BatchPreview> {
         to_update,
         skipped,
         lost,
+        added: added_count,
+        removed: removed_count,
+        excluded: excluded_count,
+        git_errors,
     })
 }
 
@@ -3994,21 +6275,100 @@ async fn run_batch_update(app: &AppHandle) -> Result<()> {
         if path.extension().and_then(|e| e.to_str()) != Some("meta") {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let Ok(meta) = serde_json::from_slice::<DocMeta>(&bytes) else {
-            continue;
-        };
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(meta) = serde_json::from_slice::<DocMeta>(&bytes) else { continue };
         docs.push(meta);
     }
     let total = docs.len() as u32;
     rag_log("info", format!("batch_update: scanning {} docs", total));
+    // Git repos: refresh each distinct repo once before the doc loop (the TTL
+    // dedup makes this a no-op if preview already refreshed seconds ago).
+    // Concurrent — same rationale as the preview pass.
+    {
+        let urls = collect_git_repo_urls(&docs);
+        if !urls.is_empty() {
+            emit_batch_update_progress(app, 0, total, &urls[0], "checking");
+            let app2 = app.clone();
+            let futs: Vec<_> = urls
+                .iter()
+                .map(|u| {
+                    let app = app2.clone();
+                    let u = u.clone();
+                    async move { refresh_git_repo_best_effort(&app, &u).await }
+                })
+                .collect();
+            futures_util::future::join_all(futs).await;
+        }
+    }
+    // Source-level sync: import files added to folder/git sources and delete
+    // docs whose file vanished. Runs BEFORE the md5 pass so the re-collected
+    // doc set below reflects the sync result. Emits a "sync" phase so the
+    // progress dialog shows what's happening (the adds themselves re-emit
+    // rag://upload-progress for the char sub-bar).
+    let (mut sync_added, mut sync_removed) = plan_source_sync(app, &docs).await.unwrap_or_default();
+    // Config gate: auto-import of NEW files is opt-in ("自动同步新增文件");
+    // removal sync always runs (its file vanished). With the gate off only the
+    // docs selected at import time ever update — the sync pass then just
+    // prunes vanished originals.
+    if !get_settings().await.map(|s| s.source_sync_add_enabled).unwrap_or(false) {
+        sync_added.clear();
+    }
+    // Gate removal sync ("自动同步删除文件", default on): off = keep vanished
+    // docs, only flagged lost-original in the UI.
+    if !get_settings()
+        .await
+        .map(|s| s.source_sync_remove_enabled)
+        .unwrap_or(true)
+    {
+        sync_removed.clear();
+    }
+    // Import in progress: defer source-add imports — the import loop may be
+    // uploading the very files the sync would import (double-import race).
+    // Removal sync is doc-side only and can stay.
+    if import_session_active() && !sync_added.is_empty() {
+        rag_log(
+            "info",
+            format!(
+                "batch_update: deferring {} source file import(s) (import in progress)",
+                sync_added.len()
+            ),
+        );
+        sync_added.clear();
+    }
+    if !sync_added.is_empty() || !sync_removed.is_empty() {
+        rag_log(
+            "info",
+            format!(
+                "batch_update: source sync -> {} file(s) to import, {} doc(s) to remove",
+                sync_added.len(),
+                sync_removed.len()
+            ),
+        );
+        emit_batch_update_progress(app, 0, total, "", "sync");
+        let (a, r) = run_source_sync(app, sync_added, sync_removed).await;
+        // Re-collect: the doc set changed (adds/removes affect both the loop
+        // range and the total shown in the progress dialog).
+        docs.clear();
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("meta") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Ok(meta) = serde_json::from_slice::<DocMeta>(&bytes) else { continue };
+            docs.push(meta);
+        }
+        rag_log("info", format!("batch_update: source sync applied (added {a}, removed {r})"));
+    }
+    let total = docs.len() as u32;
+    // Exclusion registry: excluded docs are skipped entirely (no re-index).
+    // plan_source_sync already gates add/remove on the same registry.
+    let excluded_paths = list_excluded_paths().await;
     for (i, meta) in docs.iter().enumerate() {
-        let c = classify_original(meta);
+        let c = classify_original(meta, &excluded_paths);
         emit_batch_update_progress(app, i as u32, total, &meta.name, "checking");
-        // Lost original or legacy-no-path -> skip (manual-upload-only).
-        if c.lost_original || !c.has_original_path {
+        // Excluded (user-pinned) or lost original or legacy-no-path -> skip.
+        if c.excluded || c.lost_original || !c.has_original_path {
             continue;
         }
         if !c.original_changed {
@@ -4016,59 +6376,590 @@ async fn run_batch_update(app: &AppHandle) -> Result<()> {
         }
         emit_batch_update_progress(app, i as u32, total, &meta.name, "reindexing");
         if let Err(e) = update_doc_from_original(app, &meta.id).await {
-            rag_log(
-                "warn",
-                format!("batch_update: '{}' failed: {:#}", meta.name, e),
-            );
+            rag_log("warn", format!("batch_update: '{}' failed: {:#}", meta.name, e));
         }
     }
     emit_batch_update_progress(app, total, total, "", "done");
     if let Err(e) = rebuild_rag_sql_index(app).await {
-        rag_log(
-            "warn",
-            format!("batch_update: rebuild_rag_sql_index failed: {}", e),
-        );
+        rag_log("warn", format!("batch_update: rebuild_rag_sql_index failed: {}", e));
     }
     rag_log("info", format!("batch_update: done ({} docs)", total));
     Ok(())
 }
 
-// ── scheduled source update ────────────────────────────────────────────────
+/// One data source's identity for the source-level manual update (the tree
+/// view's per-source refresh button): kind "git" (url selects the repo),
+/// "folder" (root selects the directory), or "file" (the logical 文件 group —
+/// single-file imports + legacy no-source docs; re-index only, no sync).
+/// File/tool sources have nothing to fetch remotely.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceUpdateTarget {
+    /// "git" | "folder"
+    pub kind: String,
+    /// Git repo URL (kind == "git").
+    #[serde(default)]
+    pub url: String,
+    /// Folder root absolute path (kind == "folder").
+    #[serde(default)]
+    pub root: String,
+}
 
-/// Start one optional source-file update loop. A generation lets settings
-/// changes and RAG shutdown retire the previous loop without aborting a task
-/// while it holds the runtime or metadata lock.
+/// Source-level manual update (the tree view's per-source refresh button):
+/// 1. git — force-refresh the repo's persistent clone (TTL bypassed: the user
+///    clicked the button explicitly), reporting refresh failures through the
+///    same GitSourceError channel as the batch flow.
+/// 2. plan + run the source-level sync SCOPED to this source only (import
+///    files added under it, remove docs whose file vanished from it) — the
+///    same add/remove gates as the batch flow apply (exclusion registry,
+///    "自动同步新增/删除文件" switches, import-session deferral).
+/// 3. re-index the docs OF THIS SOURCE whose md5 changed (git refresh may
+///    have brought new content).
+///
+/// Guarded by the same `BATCH_UPDATE_RUNNING` CAS as the batch flow so a
+/// source update can't overlap a batch/auto run (and vice versa) — the
+/// frontend's batchUpdateRunning state + progress dialog therefore work for
+/// both (the same `rag://batch-update-progress` events drive the dialog).
+/// Runs INLINE (awaited) — the frontend shows the shared progress dialog
+/// while this command is in flight.
+pub async fn refresh_source_update(
+    app: &AppHandle,
+    target: SourceUpdateTarget,
+) -> Result<(u32, u32, u32)> {
+    // CAS guard: overlap with batch/auto would double-import / race the
+    // persistent clone swap. A second trigger while one runs is a no-op
+    // error (the frontend disables the button while running anyway).
+    if BATCH_UPDATE_RUNNING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return Err(anyhow!("another update is already running"));
+    }
+    struct RunningGuard;
+    impl Drop for RunningGuard {
+        fn drop(&mut self) {
+            BATCH_UPDATE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _guard = RunningGuard;
+
+    if import_session_active() {
+        return Err(anyhow!("import in progress, try again later"));
+    }
+
+    let dir = files_dir(app)?;
+    // Collect metas (best-effort, same policy as the batch flow).
+    let mut docs: Vec<DocMeta> = Vec::new();
+    if dir.exists() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("meta") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Ok(meta) = serde_json::from_slice::<DocMeta>(&bytes) else { continue };
+            docs.push(meta);
+        }
+    }
+
+    // 1. Git: force refresh (TTL bypassed — explicit user action). The
+    //    refresh re-clones into the persistent dir; failures abort with Err
+    //    (the frontend shows the reason inline) — unlike preview/batch, this
+    //    single-source path does NOT continue against the stale clone.
+    if target.kind == "git" {
+        if target.url.is_empty() {
+            return Err(anyhow!("git source url is empty"));
+        }
+        // Force: drop the TTL entry so refresh_git_repo actually re-clones.
+        // TTL entries are keyed by the canonical hash — bypass must match.
+        let hash = super::git::repo_hash(&super::git::canonicalize_url(&target.url).await);
+        if let Ok(mut cache) = git_refresh_cache().lock() {
+            cache.remove(&hash);
+        }
+        // GitSourceError doesn't impl std::error::Error -> map manually (the
+        // structured detail is what the frontend shows inline).
+        if let Err(err) = refresh_git_repo(app, &target.url).await {
+            return Err(anyhow!(
+                "{}{}",
+                if err.auth { "认证失败：" } else { "拉取失败：" },
+                err.message
+            ));
+        }
+    } else if target.kind == "folder" {
+        if target.root.is_empty() || !Path::new(&target.root).exists() {
+            return Err(anyhow!("folder source root missing: {}", target.root));
+        }
+    } else if target.kind != "file" {
+        // "file" = the logical 文件 group (single-file imports + legacy
+        // no-source docs): no remote to fetch, no dir to scan — just re-index
+        // the in-scope docs whose md5 changed (step 3 below).
+        return Err(anyhow!("unsupported source kind: {}", target.kind));
+    }
+
+    // 2. Source sync scoped to THIS source (shared helper — also used by the
+    //    source-scoped preview so the confirm dialog's counts match the run).
+    let (mut sync_added, mut sync_removed) =
+        plan_source_sync_scoped(app, &docs, &target).await?;
+    // Same gates as the batch flow (preview + run agree on these).
+    if !get_settings()
+        .await
+        .map(|s| s.source_sync_add_enabled)
+        .unwrap_or(false)
+    {
+        sync_added.clear();
+    }
+    if !get_settings()
+        .await
+        .map(|s| s.source_sync_remove_enabled)
+        .unwrap_or(true)
+    {
+        sync_removed.clear();
+    }
+    let (added, removed) = if sync_added.is_empty() && sync_removed.is_empty() {
+        (0, 0)
+    } else {
+        let total = docs.len() as u32;
+        emit_batch_update_progress(app, 0, total, "", "sync");
+        run_source_sync(app, sync_added, sync_removed).await
+    };
+
+    // 3. Re-index docs of THIS source whose md5 changed. For git the refresh
+    //    may have brought new content; for folder the user may have edited
+    //    files since the last check. Re-collect metas (adds above changed the
+    //    set) and filter by the source identity recorded in each meta.
+    let mut docs2: Vec<DocMeta> = Vec::new();
+    if dir.exists() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("meta") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Ok(meta) = serde_json::from_slice::<DocMeta>(&bytes) else { continue };
+            docs2.push(meta);
+        }
+    }
+    let excluded_paths = list_excluded_paths().await;
+    // Legacy docs (no source): classify by original_path prefix under the
+    // target root (folder scope only). Git targets can't scope legacy docs.
+    // Git with a non-empty root: root is a RELATIVE SUBDIR inside the repo's
+    // persistent clone (the git dir rows' refresh button) — scope = git docs
+    // of that repo whose original file lives under clone/subdir.
+    let git_subdir_prefix = if target.kind == "git" && !target.root.is_empty() {
+        super::git::persistent_repo_dir_for_url(app, &target.url)
+            .await
+            .map(|d| {
+                d.join(&target.root)
+                    .to_string_lossy()
+                    .trim_end_matches('/')
+                    .to_string()
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let root_prefix = if target.kind == "git" {
+        String::new()
+    } else {
+        target.root.clone()
+    };
+    let in_scope = |meta: &DocMeta| -> bool {
+        if target.kind == "git" {
+            let url_hit = meta.source.as_ref().map(|src| {
+                src.kind == "git"
+                    && src.git.as_ref().map(|g| g.url == target.url).unwrap_or(false)
+            }).unwrap_or(false);
+            if !url_hit {
+                return false;
+            }
+            return git_subdir_prefix.is_empty()
+                || path_under_root(meta.original_path.as_deref().unwrap_or(""), &git_subdir_prefix);
+        }
+        if target.kind == "file" {
+            // The logical 文件 group: explicit single-file sources + legacy
+            // no-source docs. Folder/git-sourced docs are NEVER in scope.
+            return meta.source.as_ref().map(|src| src.kind == "file").unwrap_or(true);
+        }
+        // Folder scope is path-prefix based (not exact root match) so a
+        // SUBDIRECTORY target (the dir rows' refresh button) only hits docs
+        // whose original file lives under it, while a source-root target
+        // still covers the whole source.
+        target.kind == "folder"
+            && path_under_root(
+                meta.original_path.as_deref().unwrap_or(""),
+                &root_prefix,
+            )
+    };
+    let scoped: Vec<&DocMeta> = docs2.iter().filter(|m| in_scope(m)).collect();
+    let total = scoped.len() as u32;
+    let mut updated = 0u32;
+    for (i, meta) in scoped.iter().enumerate() {
+        let c = classify_original(meta, &excluded_paths);
+        emit_batch_update_progress(app, i as u32, total, &meta.name, "checking");
+        if c.excluded || c.lost_original || !c.has_original_path || !c.original_changed {
+            continue;
+        }
+        emit_batch_update_progress(app, i as u32, total, &meta.name, "reindexing");
+        if update_doc_from_original(app, &meta.id).await.is_ok() {
+            updated += 1;
+        } else {
+            rag_log("warn", format!("source_update: '{}' failed", meta.name));
+        }
+    }
+    emit_batch_update_progress(app, total, total, "", "done");
+    if updated > 0 || added > 0 || removed > 0 {
+        if let Err(e) = rebuild_rag_sql_index(app).await {
+            rag_log("warn", format!("source_update: rebuild_rag_sql_index failed: {}", e));
+        }
+    }
+    rag_log(
+        "info",
+        format!(
+            "source_update: {} done (added {added}, removed {removed}, updated {updated})",
+            if target.kind == "git" {
+                &target.url
+            } else if target.kind == "file" {
+                "file group"
+            } else {
+                &target.root
+            }
+        ),
+    );
+    Ok((added, removed, updated))
+}
+
+/// Source-scoped sync plan (shared by the source-scoped preview + run so the
+/// confirm dialog's counts always match what the run will do): filters the
+/// full `plan_source_sync` output by the target's root/url prefix, and for a
+/// folder target whose root has NO explicit folder-source doc (legacy docs
+/// classified by parent dir only) scans that root directly — plan_source_sync
+/// never scans such roots, so without this the legacy folder refresh could
+/// never import newly added files. Applies the same add/remove gates as the
+/// batch flow.
+async fn plan_source_sync_scoped(
+    app: &AppHandle,
+    docs: &[DocMeta],
+    target: &SourceUpdateTarget,
+) -> Result<(Vec<SourceSyncAdd>, Vec<(String, String)>)> {
+    let root_prefix = if target.kind == "git" {
+        super::git::persistent_repo_dir_for_url(app, &target.url)
+            .await
+            .map(|d| {
+                // Git with a non-empty root = relative subdir inside the
+                // clone (the git dir rows' refresh button) — adds/removes
+                // narrow to that subdir.
+                if target.root.is_empty() {
+                    d.to_string_lossy().into_owned()
+                } else {
+                    d.join(&target.root)
+                        .to_string_lossy()
+                        .trim_end_matches('/')
+                        .to_string()
+                }
+            })
+            .unwrap_or_default()
+    } else {
+        target.root.clone()
+    };
+    let scope_hit = |p: &str| !root_prefix.is_empty() && path_under_root(p, &root_prefix);
+    let (mut plan_added, plan_removed) = plan_source_sync(app, docs).await.unwrap_or_default();
+    if target.kind == "folder" {
+        // The direct scan below is a fallback for roots with no known folder
+        // source. A subdirectory target INSIDE a known folder source must not
+        // rescan (plan_source_sync already scanned the source root and
+        // scope_hit filters its adds to this dir) — so "known" also includes
+        // any doc folder-source root that is an ancestor of target.root.
+        let root_has_explicit_source = docs.iter().any(|m| {
+            m.source
+                .as_ref()
+                .map(|s| {
+                    s.kind == "folder"
+                        && s.root.as_deref().map(|r| {
+                            r == target.root.as_str() || path_under_root(&target.root, r)
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+        if !root_has_explicit_source && Path::new(&target.root).exists() {
+            let scan = scan_folder_public(Path::new(&target.root), true);
+            if !scan.truncated {
+                let referenced: std::collections::HashSet<&str> = docs
+                    .iter()
+                    .filter_map(|m| m.original_path.as_deref().filter(|p| !p.is_empty()))
+                    .collect();
+                for g in &scan.groups {
+                    for f in &g.files {
+                        if !referenced.contains(f.path.as_str())
+                            && !plan_added.iter().any(|a| a.path == f.path)
+                        {
+                            plan_added.push(SourceSyncAdd {
+                                path: f.path.clone(),
+                                source: crate::models::rag::DocSource {
+                                    kind: "folder".to_string(),
+                                    label: target.root.clone(),
+                                    root: Some(target.root.clone()),
+                                    rel_path: Some(g.rel_path.clone()),
+                                    git: None,
+                                },
+                                method: "symlink",
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut sync_added: Vec<_> = plan_added
+        .into_iter()
+        .filter(|a| scope_hit(&a.path))
+        .collect();
+    let mut sync_removed: Vec<_> = plan_removed
+        .into_iter()
+        .filter(|(_, id)| {
+            docs.iter()
+                .find(|m| m.id == *id)
+                .and_then(|m| m.original_path.as_deref())
+                .map(|op| scope_hit(op))
+                .unwrap_or(false)
+        })
+        .collect();
+    // Same gates as the batch flow (preview + run agree on these).
+    if !get_settings()
+        .await
+        .map(|s| s.source_sync_add_enabled)
+        .unwrap_or(false)
+    {
+        sync_added.clear();
+    }
+    if !get_settings()
+        .await
+        .map(|s| s.source_sync_remove_enabled)
+        .unwrap_or(true)
+    {
+        sync_removed.clear();
+    }
+    Ok((sync_added, sync_removed))
+}
+
+/// Source-scoped batch preview: the confirm dialog for the tree view's
+/// per-source refresh button. Same counts as `preview_batch_update_inner`
+/// but computed over THIS source's docs only (git: also force-refreshes the
+/// repo first so the md5 classification sees the remote state; the refresh
+/// failure surfaces as gitErrors). No CAS guard — preview is read-only and
+/// cheap; the RUN (refresh_source_update) takes the guard.
+pub async fn preview_source_update(
+    app: &AppHandle,
+    target: SourceUpdateTarget,
+) -> Result<BatchPreview> {
+    let dir = files_dir(app)?;
+    let mut docs: Vec<DocMeta> = Vec::new();
+    if dir.exists() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("meta") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Ok(meta) = serde_json::from_slice::<DocMeta>(&bytes) else { continue };
+            docs.push(meta);
+        }
+    }
+    emit_preview_progress(app, 0, docs.len() as u32, "", "metas");
+    // Git: force refresh (TTL bypassed — explicit user action) so the md5
+    // classification reflects the remote. Failure -> gitErrors (the confirm
+    // dialog already renders those) and classification falls back to the
+    // existing clone, same as the batch flow.
+    let mut git_errors: Vec<GitSourceError> = Vec::new();
+    if target.kind == "git" {
+        if target.url.is_empty() {
+            return Err(anyhow!("git source url is empty"));
+        }
+        emit_preview_progress(app, 0, 1, &target.url, "git");
+        let hash = super::git::repo_hash(&super::git::canonicalize_url(&target.url).await);
+        if let Ok(mut cache) = git_refresh_cache().lock() {
+            cache.remove(&hash);
+        }
+        if let Err(err) = refresh_git_repo(app, &target.url).await {
+            git_errors.push(err);
+        }
+        emit_preview_progress(app, 1, 1, &target.url, "git");
+    } else if target.kind == "folder" {
+        if target.root.is_empty() {
+            return Err(anyhow!("folder source root is empty"));
+        }
+    } else if target.kind != "file" {
+        return Err(anyhow!("unsupported source kind: {}", target.kind));
+    }
+    // Scoped sync plan (adds/removes for THIS source, gates applied).
+    emit_preview_progress(app, 0, 0, "", "scan");
+    let (sync_added, sync_removed) = plan_source_sync_scoped(app, &docs, &target).await?;
+    let added_count = sync_added.len() as u32;
+    let removed_count = sync_removed.len() as u32;
+    let removed_ids: std::collections::HashSet<&str> =
+        sync_removed.iter().map(|(id, _)| id.as_str()).collect();
+    // Scope filter for the classification loop: explicit source identity
+    // (git url / folder root) or, for legacy docs, the original_path prefix.
+    // Git with a non-empty root = relative subdir inside the clone (the git
+    // dir rows' refresh button) — the whole scope (adds/removes + md5 loop)
+    // narrows to clone/subdir.
+    let root_prefix = if target.kind == "git" {
+        super::git::persistent_repo_dir_for_url(app, &target.url)
+            .await
+            .map(|d| {
+                if target.root.is_empty() {
+                    d.to_string_lossy().into_owned()
+                } else {
+                    d.join(&target.root)
+                        .to_string_lossy()
+                        .trim_end_matches('/')
+                        .to_string()
+                }
+            })
+            .unwrap_or_default()
+    } else {
+        target.root.clone()
+    };
+    let scope_hit = |p: &str| !root_prefix.is_empty() && path_under_root(p, &root_prefix);
+    let excluded_paths = list_excluded_paths().await;
+    let mut total = 0u32;
+    let mut to_update = 0u32;
+    let mut skipped = 0u32;
+    let mut lost = 0u32;
+    let mut excluded_count = 0u32;
+    let classify_total = docs.len() as u32;
+    for (ci, meta) in docs.iter().enumerate() {
+        emit_preview_progress(app, ci as u32 + 1, classify_total, &meta.name, "checking");
+        let in_scope = if target.kind == "git" {
+            let url_hit = match meta.source.as_ref() {
+                Some(src) => {
+                    src.kind == "git"
+                        && src.git.as_ref().map(|g| g.url == target.url).unwrap_or(false)
+                }
+                None => false,
+            };
+            url_hit
+                && (target.root.is_empty()
+                    || scope_hit(meta.original_path.as_deref().unwrap_or("")))
+        } else if target.kind == "file" {
+            // Logical 文件 group: single-file sources + legacy no-source docs.
+            match meta.source.as_ref() {
+                Some(src) => src.kind == "file",
+                None => true,
+            }
+        } else {
+            // Folder: path-prefix scope (matches the run side).
+            scope_hit(meta.original_path.as_deref().unwrap_or(""))
+        };
+        if !in_scope {
+            continue;
+        }
+        total += 1;
+        if removed_ids.contains(meta.id.as_str()) {
+            continue;
+        }
+        if is_excluded_sync(meta.original_path.as_deref().unwrap_or(""), &excluded_paths) {
+            excluded_count += 1;
+            continue;
+        }
+        let c = classify_original(meta, &excluded_paths);
+        if c.lost_original {
+            lost += 1;
+        } else if !c.has_original_path {
+            skipped += 1;
+        } else if c.original_changed {
+            to_update += 1;
+        } else {
+            skipped += 1;
+        }
+    }
+    Ok(BatchPreview {
+        total,
+        to_update,
+        skipped,
+        lost,
+        added: added_count,
+        removed: removed_count,
+        excluded: excluded_count,
+        git_errors,
+    })
+}
+
+// ── auto (timed) doc update ─────────────────────────────────────────────────
+
+/// Auto-update timer generation. Bumped whenever the settings change (interval
+/// or enable/disable) so a running timer loop wakes, notices the generation
+/// moved, and restarts with the new cadence. This is how interval changes take
+/// effect without an app restart.
+static AUTO_UPDATE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Re-arm the auto-update timer after settings changed: bump the generation so
+/// any running loop exits, then (if enabled + RAG runtime available) spawn a
+/// fresh loop with the new interval. Called from `save_settings` (user edited
+/// the settings dialog) and at app startup / RAG enable.
+///
+/// The timer only fires while RAG is enabled (re-index needs the embedding
+/// runtime); each tick re-checks `is_enabled()` so toggling RAG off mid-wait
+/// simply skips ticks without restarting the loop.
 pub fn restart_auto_update_timer(app: &AppHandle) {
-    let generation = AUTO_UPDATE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let gen = AUTO_UPDATE_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    // Clone the AppHandle (an Arc — cheap) so the spawned loop owns 'static
+    // data.
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         loop {
-            let settings = match get_settings().await {
-                Ok(settings) => settings,
-                Err(e) => {
-                    rag_log("warn", format!("auto-update settings read failed: {}", e));
-                    return;
-                }
-            };
-            if !settings.auto_update_enabled || !is_enabled() {
+            // Read the CURRENT settings every iteration so an interval change
+            // is picked up on the next wake even without a generation bump.
+            let settings = get_settings().await.unwrap_or_default();
+            if !settings.auto_update_enabled {
+                // Disabled: stop this loop. save_settings bumps the generation
+                // + re-calls restart_auto_update_timer on re-enable.
+                rag_log("info", "auto-update: disabled, timer stopped");
                 return;
             }
-
+            // Sleep in short slices and watch for a generation change so a
+            // settings edit (interval change / disable) takes effect promptly
+            // instead of after the full old interval.
             let total = std::time::Duration::from_secs(settings.auto_update_interval_secs);
             let slice = std::time::Duration::from_millis(500);
             let mut waited = std::time::Duration::ZERO;
+            let mut interrupted = false;
             while waited < total {
-                let step = slice.min(total - waited);
-                tokio::time::sleep(step).await;
-                waited += step;
-                if AUTO_UPDATE_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != generation {
-                    return;
+                tokio::time::sleep(slice.min(total - waited)).await;
+                waited += slice.min(total - waited);
+                let cur = AUTO_UPDATE_GEN.load(std::sync::atomic::Ordering::SeqCst);
+                if cur != gen {
+                    // A newer loop was armed (settings changed) — this one is
+                    // obsolete. The new loop re-reads settings itself.
+                    interrupted = true;
+                    break;
                 }
             }
-
-            if !is_enabled() {
+            if interrupted {
                 return;
             }
+            // Tick: only run while RAG is enabled (re-index needs the runtime).
+            // Skip silently otherwise — the doc list is still readable, and
+            // the next enable re-arms the timer (start() calls this fn).
+            if !is_enabled() {
+                continue;
+            }
+            // Never tick while an import loop runs: the git refresh swaps
+            // the persistent clone dirs (must not race per-file imports), and
+            // the md5 / source-sync passes would contend with the loop (e.g.
+            // sync-add importing the very files the loop is still importing).
+            if import_session_active() {
+                rag_log("info", "auto-update: import in progress, skipping this tick");
+                continue;
+            }
+            // Guard against overlap with a manual batch run + a still-running
+            // previous tick (BATCH_UPDATE_RUNNING is the same CAS guard
+            // batch_update_rag_docs uses, so auto/manual mutually exclude).
             if BATCH_UPDATE_RUNNING
                 .compare_exchange(
                     false,
@@ -4078,9 +6969,8 @@ pub fn restart_auto_update_timer(app: &AppHandle) {
                 )
                 .is_err()
             {
-                continue;
+                continue; // a manual (or previous auto) pass is in flight — skip this tick
             }
-
             struct RunningGuard;
             impl Drop for RunningGuard {
                 fn drop(&mut self) {
@@ -4088,29 +6978,44 @@ pub fn restart_auto_update_timer(app: &AppHandle) {
                 }
             }
             let _guard = RunningGuard;
-
-            let preview = match preview_batch_update(&app).await {
-                Ok(preview) => preview,
-                Err(e) => {
-                    rag_log("warn", format!("auto-update preview failed: {}", e));
-                    continue;
+            // Pre-scan (same md5 classification the confirm dialog shows). If
+            // nothing changed, release the guard and DO NOT emit any progress
+            // events — an idle tick must not flash the header button to
+            // "查看进度" or pop anything in the UI.
+            if let Ok(preview) = preview_batch_update(&app).await {
+                // Idle only when NOTHING changed: no md5 updates AND no
+                // source-level additions/removals (folder/git sync).
+                if preview.to_update == 0 && preview.added == 0 && preview.removed == 0 {
+                    // Idle pass, BUT lost originals may have appeared (source
+                    // file deleted elsewhere): the "原始丢失" badge is computed
+                    // at list time, so without a nudge the UI list stays stale
+                    // until a manual refresh. Emit a lightweight invalidation
+                    // event — the frontend refetches the list ONLY (no progress
+                    // dialog / button state, keeping the idle tick unobtrusive).
+                    if preview.lost > 0 {
+                        let _ = app.emit("rag://docs-invalidated", preview.lost);
+                        rag_log(
+                            "info",
+                            format!("auto-update: idle, but {} doc(s) lost their original — notifying UI", preview.lost),
+                        );
+                    }
+                    continue; // _guard drops -> BATCH_UPDATE_RUNNING = false
                 }
-            };
-            if preview.to_update == 0 {
-                continue;
+                rag_log(
+                    "info",
+                    format!(
+                        "auto-update: {} of {} doc(s) changed ({} source file(s) to import, {} to remove), syncing…",
+                        preview.to_update, preview.total, preview.added, preview.removed
+                    ),
+                );
             }
-
-            rag_log(
-                "info",
-                format!(
-                    "auto-update: {} of {} document(s) changed, re-indexing",
-                    preview.to_update, preview.total
-                ),
-            );
-            if let Err(e) = run_batch_update(&app).await {
-                rag_log("error", format!("auto-update failed: {:#}", e));
-                emit_batch_update_progress(&app, 0, 0, "", "error");
+            // Real work: run the same pass as the manual button — same
+            // progress events, same button state, same dialog.
+            let result = run_batch_update(&app).await;
+            if let Err(e) = result {
+                rag_log("error", format!("auto-update pass failed: {:#}", e));
             }
+            // _guard drops here -> BATCH_UPDATE_RUNNING = false.
         }
     });
 }
@@ -4128,11 +7033,6 @@ pub async fn search(query: String, tags: Vec<String>) -> Result<Vec<RagSearchRes
     let vw = settings.vector_weight.max(0.0).min(1.0);
     let kw = settings.keyword_weight.max(0.0).min(1.0);
 
-    let mut guard = runtime().lock().await;
-    let Some(rt) = guard.as_mut() else {
-        return Err(anyhow!("RAG not enabled"));
-    };
-
     // When a tag filter is active, fetch more candidates so Rust-side filtering
     // (intersection with requested tags) still yields enough hits after pruning.
     let want_tags: Vec<String> = tags.into_iter().filter(|t| !t.is_empty()).collect();
@@ -4142,14 +7042,25 @@ pub async fn search(query: String, tags: Vec<String>) -> Result<Vec<RagSearchRes
         (limit * 4).max(limit)
     };
 
-    // Vector channel.
+    // Embed the query on the shared mv model first (mv lock taken and
+    // released BEFORE the rag table lock — no nesting). The query prefix from
+    // the loaded model's deploy.json (`searchQueryPrefix`) is prepended for
+    // asymmetric models (Qwen3, BGE); the keyword channel below uses the RAW
+    // query (no prefix) since it's literal text matching.
+    let query_prefix = {
+        let guard = runtime().lock().await;
+        let Some(rt) = guard.as_ref() else {
+            return Err(anyhow!("RAG not enabled"));
+        };
+        rt.search_query_prefix.clone()
+    };
     let vec_hits = if vw > 0.0 {
-        // Prepend the model's query prefix (deploy.json `searchQueryPrefix`)
-        // before embedding - asymmetric models (Qwen3, BGE) require a distinct
-        // prefix on the query side. The keyword channel below uses the RAW
-        // query (no prefix) since it's literal text matching.
-        let q = format!("{}{}", &rt.search_query_prefix, query);
-        let qvec = rt.model.embed(&q)?;
+        let q = format!("{}{}", query_prefix, query);
+        let qvec = mv::with_model(|m| m.embed(&q)).await?;
+        let guard = runtime().lock().await;
+        let Some(rt) = guard.as_ref() else {
+            return Err(anyhow!("RAG not enabled"));
+        };
         match rt.db.search(&qvec, fetch).await {
             Ok(hits) => hits,
             Err(e) => {
@@ -4163,6 +7074,10 @@ pub async fn search(query: String, tags: Vec<String>) -> Result<Vec<RagSearchRes
 
     // Keyword channel.
     let kw_hits = if kw > 0.0 {
+        let guard = runtime().lock().await;
+        let Some(rt) = guard.as_ref() else {
+            return Err(anyhow!("RAG not enabled"));
+        };
         match rt.db.keyword_search(&query, fetch).await {
             Ok(hits) => hits,
             Err(e) => {
@@ -4215,7 +7130,7 @@ pub async fn search(query: String, tags: Vec<String>) -> Result<Vec<RagSearchRes
 
     // Weighted final score, apply tag filter + score threshold, sort desc, take limit.
     let threshold = settings.score_threshold.max(0.0).min(1.0);
-    let mut scored: Vec<(f32, String, String, String)> = merged
+    let mut scored: Vec<(f32, String, i64, String, String)> = merged
         .into_iter()
         .filter(|(_, (_, _, _, _, doc_tags))| {
             if want_tags.is_empty() {
@@ -4226,12 +7141,21 @@ pub async fn search(query: String, tags: Vec<String>) -> Result<Vec<RagSearchRes
                     .any(|t| want_tags.iter().any(|w| w.eq_ignore_ascii_case(t)))
             }
         })
-        .map(|((doc_id, _ci), (vs, ks, doc_name, chunk_text, _tags))| {
-            (vw * vs + kw * ks, doc_id, doc_name, chunk_text)
+        .map(|((doc_id, ci), (vs, ks, doc_name, chunk_text, _tags))| {
+            (vw * vs + kw * ks, doc_id, ci, doc_name, chunk_text)
         })
-        .filter(|(score, _, _, _)| *score >= threshold)
+        .filter(|(score, _, _, _, _)| *score >= threshold)
         .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Stable order: HashMap iteration is random, so equal scores must get a
+    // deterministic tie-break (doc_id, then chunk_index — two chunks of the
+    // same doc can tie) — mirrors the fts weighted-seq tiebreak convention
+    // (review rounds 8/9).
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
     let top = scored.into_iter().take(limit).collect::<Vec<_>>();
 
     // Resolve a readable title per unique doc_id from the on-disk DocMeta
@@ -4239,7 +7163,7 @@ pub async fn search(query: String, tags: Vec<String>) -> Result<Vec<RagSearchRes
     let mut titles: HashMap<String, String> = HashMap::new();
     if let Some(app) = crate::mcp::progress::get_app_handle() {
         if let Ok(dir) = files_dir(app) {
-            for (_, doc_id, doc_name, _) in &top {
+            for (_, doc_id, _, doc_name, _) in &top {
                 if titles.contains_key(doc_id) {
                     continue;
                 }
@@ -4255,7 +7179,7 @@ pub async fn search(query: String, tags: Vec<String>) -> Result<Vec<RagSearchRes
 
     let results = top
         .into_iter()
-        .map(|(score, doc_id, doc_name, snippet)| RagSearchResult {
+        .map(|(score, doc_id, _ci, doc_name, snippet)| RagSearchResult {
             title: titles.get(&doc_id).cloned().unwrap_or(doc_name.clone()),
             doc_id,
             doc_name,
@@ -4324,11 +7248,23 @@ pub async fn get_settings() -> Result<RagSettings> {
             .get("autoUpdateEnabled")
             .and_then(|v| v.as_bool())
             .unwrap_or(d.auto_update_enabled),
+        // Clamp the interval so a bad persisted value can't busy-loop the
+        // auto-update timer (min 1 minute, max 1 day).
         auto_update_interval_secs: rag
             .get("autoUpdateIntervalSecs")
             .and_then(|v| v.as_u64())
             .unwrap_or(d.auto_update_interval_secs)
             .clamp(60, 86_400),
+        // Clamp the doc-detail page size (min 10 KiB, max 64 MiB = the upload
+        // cap) so a bad value can't crash the View dialog or underflow to 0.
+        source_sync_add_enabled: rag
+            .get("sourceSyncAddEnabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(d.source_sync_add_enabled),
+        source_sync_remove_enabled: rag
+            .get("sourceSyncRemoveEnabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(d.source_sync_remove_enabled),
         doc_load_chunk_kb: rag
             .get("docLoadChunkKb")
             .and_then(|v| v.as_u64())
@@ -4339,8 +7275,9 @@ pub async fn get_settings() -> Result<RagSettings> {
 }
 
 pub async fn save_settings(settings: RagSettings) -> Result<()> {
+    // Same clamps as get_settings so a round-trip normalizes bad values.
     let interval = settings.auto_update_interval_secs.clamp(60, 86_400);
-    let doc_load_chunk_kb = settings.doc_load_chunk_kb.clamp(10, 65_536);
+    let chunk_kb = settings.doc_load_chunk_kb.clamp(10, 65_536);
     let patch = json!({
         "rag": {
             "vectorWeight": settings.vector_weight as f64,
@@ -4351,14 +7288,17 @@ pub async fn save_settings(settings: RagSettings) -> Result<()> {
             "chunkOverlap": settings.chunk_overlap,
             "autoUpdateEnabled": settings.auto_update_enabled,
             "autoUpdateIntervalSecs": interval,
-            "docLoadChunkKb": doc_load_chunk_kb
+            "docLoadChunkKb": chunk_kb,
+            "sourceSyncAddEnabled": settings.source_sync_add_enabled,
+            "sourceSyncRemoveEnabled": settings.source_sync_remove_enabled
         }
     });
     crate::services::config_service::update(&patch).await?;
     Ok(())
 }
 
-/// Persist RAG settings and immediately apply auto-update changes.
+/// Save settings + re-arm the auto-update timer (called by the Tauri command
+/// so an interval change / toggle takes effect immediately without a restart).
 pub async fn save_settings_and_rearm(app: &AppHandle, settings: RagSettings) -> Result<()> {
     save_settings(settings).await?;
     restart_auto_update_timer(app);
@@ -4384,7 +7324,678 @@ fn slice_utf8_window(content: &str, offset_bytes: u64, limit_bytes: u64) -> (Str
         end += 1;
     }
 
-    (content[start..end].to_string(), end < content.len(), end as u64)
+    (
+        content[start..end].to_string(),
+        end < content.len(),
+        end as u64,
+    )
+}
+
+#[cfg(test)]
+mod update_guard_tests {
+    use super::*;
+
+    fn test_doc_paths(dir: &Path) -> (PathBuf, PathBuf) {
+        (dir.join("doc.md"), dir.join("doc.meta"))
+    }
+
+    fn test_meta() -> DocMeta {
+        serde_json::from_str(
+            r#"{"id":"doc","name":"doc.md","size":4,"uploaded_at":"test","chunk_count":1}"#,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn doc_transaction_restores_files_after_index_failure() {
+        let dir = std::env::temp_dir().join(format!("rag-doc-backup-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (content_path, meta_path) = test_doc_paths(&dir);
+        std::fs::write(&content_path, "old content").unwrap();
+        std::fs::write(&meta_path, "old meta").unwrap();
+
+        let result = commit_doc_files(
+            Some((&content_path, "new content")),
+            &meta_path,
+            || async { Err::<(), _>(anyhow!("injected index failure")) },
+            |_| Ok(()),
+        )
+        .await;
+
+        assert!(matches!(result, Err(DocTransactionFailure::Index(_))));
+        assert_eq!(std::fs::read_to_string(&content_path).unwrap(), "old content");
+        assert_eq!(std::fs::read_to_string(&meta_path).unwrap(), "old meta");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn doc_transaction_removes_new_files_after_index_failure() {
+        let dir = std::env::temp_dir().join(format!("rag-doc-create-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (content_path, meta_path) = test_doc_paths(&dir);
+
+        let result = commit_doc_files(
+            Some((&content_path, "new content")),
+            &meta_path,
+            || async { Err::<(), _>(anyhow!("injected index failure")) },
+            |_| Ok(()),
+        )
+        .await;
+
+        assert!(matches!(result, Err(DocTransactionFailure::Index(_))));
+        assert!(!content_path.exists());
+        assert!(!meta_path.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn doc_transaction_restores_files_after_metadata_failure() {
+        let dir = std::env::temp_dir().join(format!("rag-doc-meta-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (content_path, meta_path) = test_doc_paths(&dir);
+        std::fs::write(&content_path, "old content").unwrap();
+        std::fs::write(&meta_path, "old meta").unwrap();
+
+        let result = commit_doc_files(
+            Some((&content_path, "new content")),
+            &meta_path,
+            || async { Ok(7) },
+            |_| {
+                std::fs::write(&meta_path, "new meta")?;
+                Err::<(), _>(anyhow!("injected metadata failure"))
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(DocTransactionFailure::Metadata(_))));
+        assert_eq!(std::fs::read_to_string(&content_path).unwrap(), "old content");
+        assert_eq!(std::fs::read_to_string(&meta_path).unwrap(), "old meta");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn doc_transaction_drop_during_index_restores_files() {
+        let dir = std::env::temp_dir().join(format!("rag-doc-cancel-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (content_path, meta_path) = test_doc_paths(&dir);
+        std::fs::write(&content_path, "old content").unwrap();
+        std::fs::write(&meta_path, "old meta").unwrap();
+
+        let (index_started, index_started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            commit_doc_files(
+                Some((&content_path, "new content")),
+                &meta_path,
+                || async move {
+                    let _ = index_started.send(());
+                    std::future::pending::<Result<()>>().await
+                },
+                |_| -> Result<()> { Ok(()) },
+            )
+            .await
+        });
+        index_started_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+
+        let (content_path, meta_path) = test_doc_paths(&dir);
+        assert_eq!(std::fs::read_to_string(&content_path).unwrap(), "old content");
+        assert_eq!(std::fs::read_to_string(&meta_path).unwrap(), "old meta");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn doc_transaction_keeps_old_metadata_visible_while_indexing() {
+        let dir = std::env::temp_dir().join(format!("rag-doc-meta-visible-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (content_path, meta_path) = test_doc_paths(&dir);
+        std::fs::write(&content_path, "old content").unwrap();
+        std::fs::write(&meta_path, "old meta").unwrap();
+
+        let (index_started_tx, index_started_rx) = tokio::sync::oneshot::channel();
+        let (resume_index_tx, resume_index_rx) = tokio::sync::oneshot::channel();
+        let worker_meta_path = meta_path.clone();
+        let task = tokio::spawn(async move {
+            commit_doc_files(
+                Some((&content_path, "new content")),
+                &worker_meta_path,
+                || async move {
+                    let _ = index_started_tx.send(());
+                    let _ = resume_index_rx.await;
+                    Ok::<_, anyhow::Error>(())
+                },
+                |_| {
+                    std::fs::write(&worker_meta_path, "new meta")?;
+                    Ok(())
+                },
+            )
+            .await
+        });
+
+        index_started_rx.await.unwrap();
+        assert_eq!(std::fs::read_to_string(&meta_path).unwrap(), "old meta");
+        resume_index_tx.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(&meta_path).unwrap(), "new meta");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn chunk_input_conversion_preserves_snapshot_tags_and_replaces_only_forward_tags() {
+        let records = vec![
+            crate::rag::vectordb::ChunkRecord {
+                chunk_id: "chunk-a".to_string(),
+                doc_id: "doc".to_string(),
+                doc_name: "doc.txt".to_string(),
+                chunk_index: 0,
+                chunk_text: "first".to_string(),
+                embedding: vec![1.0, 0.0],
+                tags: vec!["actual-a".to_string()],
+            },
+            crate::rag::vectordb::ChunkRecord {
+                chunk_id: "chunk-b".to_string(),
+                doc_id: "doc".to_string(),
+                doc_name: "doc.txt".to_string(),
+                chunk_index: 1,
+                chunk_text: "second".to_string(),
+                embedding: vec![0.0, 1.0],
+                tags: vec!["actual-b".to_string(), "shared".to_string()],
+            },
+        ];
+
+        let restored = chunk_inputs(&records, None);
+        assert_eq!(restored[0].tags, vec!["actual-a"]);
+        assert_eq!(restored[1].tags, vec!["actual-b", "shared"]);
+        assert_eq!(restored[0].chunk_id, records[0].chunk_id);
+        assert_eq!(restored[1].chunk_text, records[1].chunk_text);
+        assert_eq!(restored[1].embedding, records[1].embedding);
+
+        let replacement = vec!["new-tag".to_string()];
+        let updated = chunk_inputs(&records, Some(&replacement));
+        assert_eq!(updated[0].tags, replacement);
+        assert_eq!(updated[1].tags, replacement);
+        assert_eq!(updated[1].chunk_id, records[1].chunk_id);
+        assert_eq!(updated[1].chunk_index, records[1].chunk_index);
+    }
+
+    #[tokio::test]
+    async fn delete_meta_failure_restores_content_metadata_and_vectors() {
+        let dir = std::env::temp_dir().join(format!("rag-delete-rollback-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let content_path = dir.join("doc.md");
+        let meta_path = dir.join("doc.meta");
+        std::fs::write(&content_path, "old content").unwrap();
+        std::fs::write(&meta_path, "old meta").unwrap();
+        let meta = test_meta();
+        let content_paths = delete_content_paths(&dir, "doc", Some(&meta));
+        assert_eq!(
+            content_paths.iter().filter(|path| *path == &content_path).count(),
+            1,
+            "overlapping content candidates must be deduplicated"
+        );
+
+        let vectors = std::sync::Arc::new(Mutex::new(vec!["old vector".to_string()]));
+        let deleted_vectors = vectors.clone();
+        let restored_vectors = vectors.clone();
+        let result = commit_doc_delete(
+            &content_paths,
+            &meta_path,
+            move || async move {
+                deleted_vectors.lock().await.clear();
+                Ok(())
+            },
+            move || async move {
+                *restored_vectors.lock().await = vec!["old vector".to_string()];
+                Ok(())
+            },
+            || {
+                remove_meta_if_present(&meta_path)?;
+                Err(anyhow!("injected metadata removal failure"))
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&content_path).unwrap(), "old content");
+        assert_eq!(std::fs::read_to_string(&meta_path).unwrap(), "old meta");
+        assert_eq!(*vectors.lock().await, vec!["old vector"]);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_commits_files_and_keeps_metadata_visible_during_vector_delete() {
+        let dir = std::env::temp_dir().join(format!("rag-delete-commit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let content_path = dir.join("doc.txt");
+        let meta_path = dir.join("doc.meta");
+        std::fs::write(&content_path, "old content").unwrap();
+        std::fs::write(&meta_path, "published meta").unwrap();
+        let content_paths = vec![content_path.clone()];
+        let worker_meta_path = meta_path.clone();
+        let vectors = std::sync::Arc::new(Mutex::new(vec!["old vector".to_string()]));
+        let deleted_vectors = vectors.clone();
+        let restored_vectors = vectors.clone();
+        let (delete_started_tx, delete_started_rx) = tokio::sync::oneshot::channel();
+        let (resume_delete_tx, resume_delete_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            commit_doc_delete(
+                &content_paths,
+                &worker_meta_path,
+                || async move {
+                    deleted_vectors.lock().await.clear();
+                    let _ = delete_started_tx.send(());
+                    let _ = resume_delete_rx.await;
+                    Ok(())
+                },
+                || async move {
+                    *restored_vectors.lock().await = vec!["old vector".to_string()];
+                    Ok(())
+                },
+                || remove_meta_if_present(&worker_meta_path),
+            )
+            .await
+        });
+
+        delete_started_rx.await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&meta_path).unwrap(),
+            "published meta"
+        );
+        resume_delete_tx.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        assert!(!content_path.exists());
+        assert!(!meta_path.exists());
+        assert!(vectors.lock().await.is_empty());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_does_not_remove_same_name_legacy_content_for_id_owned_doc() {
+        let dir = std::env::temp_dir().join(format!("rag-delete-same-name-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "12345678-1234-1234-1234-123456789abc";
+        let owned_content = dir.join(format!("{id}.md"));
+        let legacy_content = dir.join("shared-name.md");
+        let meta_path = dir.join(format!("{id}.meta"));
+        std::fs::write(&owned_content, "current document").unwrap();
+        std::fs::write(&legacy_content, "another legacy document").unwrap();
+        let mut meta = test_meta();
+        meta.id = id.to_string();
+        meta.name = "shared-name.md".to_string();
+        std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        let paths = delete_content_paths(&dir, id, Some(&meta));
+        commit_doc_delete(
+            &paths,
+            &meta_path,
+            || async { Ok(()) },
+            || async { Ok(()) },
+            || remove_meta_if_present(&meta_path),
+        )
+        .await
+        .unwrap();
+
+        assert!(!owned_content.exists());
+        assert_eq!(
+            std::fs::read_to_string(&legacy_content).unwrap(),
+            "another legacy document"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_preserves_symlink_original_and_rejects_directory_candidates() {
+        let dir = std::env::temp_dir().join(format!("rag-delete-symlink-{}", Uuid::new_v4()));
+        let files_dir = dir.join("files");
+        std::fs::create_dir_all(&files_dir).unwrap();
+        let source_path = dir.join("source.txt");
+        let meta_path = files_dir.join("doc.meta");
+        std::fs::write(&source_path, "linked source").unwrap();
+        let mut meta = test_meta();
+        meta.method = Some("symlink".to_string());
+        meta.original_path = Some(source_path.to_string_lossy().into_owned());
+        std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+        let paths = delete_content_paths(&files_dir, "doc", Some(&meta));
+        assert!(paths.is_empty());
+        commit_doc_delete(
+            &paths,
+            &meta_path,
+            || async { Ok(()) },
+            || async { Ok(()) },
+            || remove_meta_if_present(&meta_path),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&source_path).unwrap(), "linked source");
+        assert!(!meta_path.exists());
+
+        let invalid_path = files_dir.join("doc.md");
+        std::fs::create_dir(&invalid_path).unwrap();
+        let vector_delete_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delete_called = vector_delete_called.clone();
+        let result = commit_doc_delete(
+            std::slice::from_ref(&invalid_path),
+            &meta_path,
+            move || async move {
+                delete_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            || async { Ok(()) },
+            || remove_meta_if_present(&meta_path),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!vector_delete_called.load(std::sync::atomic::Ordering::SeqCst));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dropped_doc_mutation_request_before_start_cancels_transaction() {
+        let (request, cancellation) = DocMutationRequest::new();
+        drop(request);
+
+        assert!(!cancellation.begin_transaction());
+    }
+
+    #[test]
+    fn dropped_doc_mutation_request_after_start_keeps_transaction_active() {
+        let (request, cancellation) = DocMutationRequest::new();
+        assert!(cancellation.begin_transaction());
+        drop(request);
+
+        assert!(cancellation.begin_transaction());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_doc_mutation_queued_on_lock_never_starts() {
+        let dir = std::env::temp_dir().join(format!("rag-doc-queued-cancel-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker_path = dir.join("started");
+        let lock = std::sync::Arc::new(Mutex::new(()));
+        let held_guard = lock.clone().lock_owned().await;
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+
+        let caller_lock = lock.clone();
+        let caller_marker = marker_path.clone();
+        let caller = tokio::spawn(async move {
+            let _ = queued_tx.send(());
+            run_doc_mutation_with_lock(caller_lock, move |_| async move {
+                std::fs::write(&caller_marker, "started")?;
+                Ok(())
+            })
+            .await
+        });
+        queued_rx.await.unwrap();
+        caller.abort();
+        let _ = caller.await;
+        drop(held_guard);
+        tokio::task::yield_now().await;
+
+        assert!(!marker_path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_finishes_current_update_before_next_locked_update() {
+        let dir = std::env::temp_dir().join(format!("rag-doc-worker-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (content_path, meta_path) = test_doc_paths(&dir);
+        std::fs::write(&content_path, "old content").unwrap();
+        std::fs::write(&meta_path, "old meta").unwrap();
+        let vectors = std::sync::Arc::new(Mutex::new(vec!["old vector".to_string()]));
+        let lock = std::sync::Arc::new(Mutex::new(()));
+        let (index_started_tx, index_started_rx) = tokio::sync::oneshot::channel();
+        let (resume_index_tx, resume_index_rx) = tokio::sync::oneshot::channel();
+
+        let first_vectors = vectors.clone();
+        let first_content = content_path.clone();
+        let first_meta = meta_path.clone();
+        let first_lock = lock.clone();
+        let caller = tokio::spawn(async move {
+            run_doc_mutation_with_lock(first_lock, move |cancellation| async move {
+                assert!(cancellation.begin_transaction());
+                commit_doc_files(
+                    Some((&first_content, "first update")),
+                    &first_meta,
+                    || async move {
+                        *first_vectors.lock().await = vec!["first vector".to_string()];
+                        let _ = index_started_tx.send(());
+                        let _ = resume_index_rx.await;
+                        Ok::<_, anyhow::Error>(())
+                    },
+                    |_| {
+                        std::fs::write(&first_meta, "first meta")?;
+                        Ok(())
+                    },
+                )
+                .await
+                .map(|_| ())
+                .map_err(|_| anyhow!("first update failed"))
+            })
+            .await
+        });
+        index_started_rx.await.unwrap();
+        caller.abort();
+        let _ = caller.await;
+        assert!(lock.try_lock().is_err());
+
+        let second_vectors = vectors.clone();
+        let second_content = content_path.clone();
+        let second_meta = meta_path.clone();
+        let second_lock = lock.clone();
+        let second = tokio::spawn(async move {
+            run_doc_mutation_with_lock(second_lock, move |cancellation| async move {
+                assert_eq!(std::fs::read_to_string(&second_content).unwrap(), "first update");
+                assert_eq!(std::fs::read_to_string(&second_meta).unwrap(), "first meta");
+                assert_eq!(*second_vectors.lock().await, vec!["first vector"]);
+                assert!(cancellation.begin_transaction());
+                std::fs::write(&second_content, "second update")?;
+                std::fs::write(&second_meta, "second meta")?;
+                *second_vectors.lock().await = vec!["second vector".to_string()];
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+        });
+
+        resume_index_tx.send(()).unwrap();
+        second.await.unwrap().unwrap();
+
+        assert_eq!(std::fs::read_to_string(&content_path).unwrap(), "second update");
+        assert_eq!(std::fs::read_to_string(&meta_path).unwrap(), "second meta");
+        assert_eq!(*vectors.lock().await, vec!["second vector"]);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_new_doc_worker_cleans_vectors_and_files_on_index_error() {
+        let dir = std::env::temp_dir().join(format!("rag-doc-worker-new-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (content_path, meta_path) = test_doc_paths(&dir);
+        let vectors = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let lock = std::sync::Arc::new(Mutex::new(()));
+        let (index_started_tx, index_started_rx) = tokio::sync::oneshot::channel();
+        let (resume_index_tx, resume_index_rx) = tokio::sync::oneshot::channel();
+
+        let worker_vectors = vectors.clone();
+        let index_vectors = vectors.clone();
+        let worker_content = content_path.clone();
+        let worker_meta = meta_path.clone();
+        let completion_lock = lock.clone();
+        let caller = tokio::spawn(async move {
+            run_doc_mutation_with_lock(lock, move |cancellation| async move {
+                assert!(cancellation.begin_transaction());
+                let result = commit_doc_files(
+                    Some((&worker_content, "new document")),
+                    &worker_meta,
+                    || async move {
+                        *index_vectors.lock().await = vec!["partial new vector".to_string()];
+                        let _ = index_started_tx.send(());
+                        let _ = resume_index_rx.await;
+                        Err::<(), _>(anyhow!("injected index failure"))
+                    },
+                    |_| Ok(()),
+                )
+                .await;
+                if result.is_err() {
+                    worker_vectors.lock().await.clear();
+                }
+                assert!(matches!(result, Err(DocTransactionFailure::Index(_))));
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+        });
+        index_started_rx.await.unwrap();
+        caller.abort();
+        let _ = caller.await;
+        resume_index_tx.send(()).unwrap();
+
+        // The test needs to observe the detached worker's completion. Acquiring
+        // the same lock is the deterministic completion barrier.
+        let _guard = completion_lock.lock().await;
+        assert!(vectors.lock().await.is_empty());
+        assert!(!content_path.exists());
+        assert!(!meta_path.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        drop(_guard);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn doc_transaction_commits_after_index_and_metadata_succeed() {
+        let dir = std::env::temp_dir().join(format!("rag-doc-commit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (content_path, meta_path) = test_doc_paths(&dir);
+        std::fs::write(&content_path, "old content").unwrap();
+        std::fs::write(&meta_path, "old meta").unwrap();
+
+        let result = commit_doc_files(
+            Some((&content_path, "new content")),
+            &meta_path,
+            || async { Ok(7) },
+            |_| {
+                let meta = test_meta();
+                write_meta_atomic(&meta_path, &meta)?;
+                Ok(meta)
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.0, 7);
+        assert_eq!(std::fs::read_to_string(&content_path).unwrap(), "new content");
+        assert_eq!(
+            serde_json::from_slice::<DocMeta>(&std::fs::read(&meta_path).unwrap())
+                .unwrap()
+                .name,
+            "doc.md"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn doc_transaction_without_content_write_preserves_symlink_source() {
+        let dir = std::env::temp_dir().join(format!("rag-doc-symlink-{}", Uuid::new_v4()));
+        let files_dir = dir.join("files");
+        std::fs::create_dir_all(&files_dir).unwrap();
+        let source_path = dir.join("source.txt");
+        std::fs::write(&source_path, "linked source").unwrap();
+        let meta_path = files_dir.join("doc.meta");
+        let content_path = doc_content_path_for_write(&files_dir, "doc.md", Some("symlink"));
+        assert!(content_path.is_none());
+
+        commit_doc_files(
+            content_path.as_deref().map(|path| (path, "replacement")),
+            &meta_path,
+            || async { Ok(1) },
+            |_| {
+                let mut meta = test_meta();
+                meta.method = Some("symlink".to_string());
+                meta.original_path = Some(source_path.to_string_lossy().into_owned());
+                write_meta_atomic(&meta_path, &meta)?;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&source_path).unwrap(), "linked source");
+        assert!(!files_dir.join("doc.md").exists());
+        assert_eq!(
+            serde_json::from_slice::<DocMeta>(&std::fs::read(&meta_path).unwrap())
+                .unwrap()
+                .method
+                .as_deref(),
+            Some("symlink")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn metadata_rename_failure_removes_temporary_file() {
+        let dir = std::env::temp_dir().join(format!("rag-meta-tmp-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta_path = dir.join("doc.meta");
+        std::fs::create_dir(&meta_path).unwrap();
+        let tmp_path = meta_path.with_extension("meta.tmp");
+
+        assert!(write_meta_atomic(&meta_path, &test_meta()).is_err());
+        assert!(meta_path.is_dir());
+        assert!(!tmp_path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn file_backup_restores_original_when_update_is_abandoned() {
+        let dir = std::env::temp_dir().join(format!("rag-backup-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.md");
+        std::fs::write(&path, "old").unwrap();
+
+        {
+            let _backup = FileBackup::new(&path).unwrap();
+            std::fs::write(&path, "new").unwrap();
+        }
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn file_backup_discards_original_after_commit() {
+        let dir = std::env::temp_dir().join(format!("rag-backup-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.md");
+        std::fs::write(&path, "old").unwrap();
+
+        let backup = FileBackup::new(&path).unwrap();
+        std::fs::write(&path, "new").unwrap();
+        backup.commit();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn utf8_window_preserves_page_boundaries_and_offsets() {
+        let content = "a中b";
+
+        assert_eq!(slice_utf8_window(content, 2, 1), ("中".into(), true, 4));
+        assert_eq!(slice_utf8_window(content, 4, 1), ("b".into(), false, 5));
+        assert_eq!(slice_utf8_window(content, 99, 2), ("".into(), false, 5));
+        assert_eq!(slice_utf8_window(content, 0, 0), ("".into(), true, 0));
+    }
 }
 
 /// Sniff whether `bytes` look like plain text (vs binary). Content-based — we
@@ -4395,7 +8006,9 @@ fn slice_utf8_window(content: &str, offset_bytes: u64, limit_bytes: u64) -> (Str
 /// - Otherwise, if >30% of the sample is non-text control bytes -> binary.
 /// ASCII/UTF-8/legacy-CJK text passes (printable ASCII, tab/LF/CR, or high
 /// bytes for multibyte/extended chars are all "text").
-fn is_likely_text(bytes: &[u8]) -> bool {
+/// `pub(crate)`: also used by the `text` fallback strategy in
+/// `rag::extract::text`.
+pub(crate) fn is_likely_text(bytes: &[u8]) -> bool {
     let sample = &bytes[..bytes.len().min(8192)];
     if sample.is_empty() {
         return true; // empty file -> treat as text
@@ -4489,9 +8102,11 @@ fn reveal_in_file_manager(file: &Path) -> std::io::Result<()> {
 #[cfg(target_os = "windows")]
 fn reveal_in_file_manager(file: &Path) -> std::io::Result<()> {
     // `explorer /select,<path>` opens Explorer with the file selected.
-    std::process::Command::new("explorer")
-        .arg(format!("/select,{}", file.display()))
-        .spawn()?;
+    let mut c = std::process::Command::new("explorer");
+    c.arg(format!("/select,{}", file.display()));
+    use std::os::windows::process::CommandExt;
+    c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    c.spawn()?;
     Ok(())
 }
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -4504,80 +8119,134 @@ fn reveal_in_file_manager(file: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+mod exclusion_tests {
     use super::*;
 
-    fn test_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("mcphub-rag-{}-{}", name, Uuid::new_v4()))
+    #[test]
+    fn path_under_root_directory_semantics() {
+        // The exclusion registry reuses path_under_root: a directory entry
+        // excludes everything under it; sibling prefixes must not match.
+        assert!(path_under_root("/a/b/c.txt", "/a/b"));
+        assert!(path_under_root("/a/b", "/a/b"));
+        assert!(!path_under_root("/a/bc/x.txt", "/a/b"));
+        assert!(!path_under_root("", "/a/b"));
+        assert!(!path_under_root("/a/b/c.txt", ""));
     }
 
     #[test]
-    fn file_backup_restores_when_not_committed() {
-        let path = test_path("backup-restore");
-        std::fs::write(&path, b"old").unwrap();
-        {
-            let _backup = FileBackup::new(&path).unwrap();
-            std::fs::write(&path, b"new").unwrap();
-        }
-        assert_eq!(std::fs::read(&path).unwrap(), b"old");
-        let _ = std::fs::remove_file(path);
+    fn is_excluded_sync_matches_files_and_dirs() {
+        let reg = vec!["/data/skip.txt".to_string(), "/data/dir".to_string()];
+        assert!(is_excluded_sync("/data/skip.txt", &reg));
+        assert!(is_excluded_sync("/data/dir/inner.txt", &reg));
+        assert!(is_excluded_sync("/data/dir", &reg));
+        assert!(!is_excluded_sync("/data/other.txt", &reg));
+        assert!(!is_excluded_sync("", &reg));
+        assert!(!is_excluded_sync("/data/skip.txt", &[]));
     }
 
     #[test]
-    fn file_backup_keeps_new_content_when_committed() {
-        let path = test_path("backup-commit");
-        std::fs::write(&path, b"old").unwrap();
-        {
-            let backup = FileBackup::new(&path).unwrap();
-            std::fs::write(&path, b"new").unwrap();
-            backup.commit();
-        }
-        assert_eq!(std::fs::read(&path).unwrap(), b"new");
-        let _ = std::fs::remove_file(path);
+    fn registry_normalizes_trim_dedup_drop_empty() {
+        // set_excluded_paths' normalization: trim, drop empties, dedup
+        // (order-preserving). (The DB round-trip itself runs against the
+        // global pool which tests can't initialize — covered by the pure
+        // helper + the path-matching tests above.)
+        let out = normalize_excluded_paths(vec![
+            " /x/a.txt ".to_string(),
+            "/x/b.txt".to_string(),
+            "/x/a.txt".to_string(), // duplicate -> deduped
+            "   ".to_string(),      // blank -> dropped
+        ]);
+        assert_eq!(out, vec!["/x/a.txt".to_string(), "/x/b.txt".to_string()]);
+        assert!(normalize_excluded_paths(Vec::new()).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    fn meta_from(json: &str) -> DocMeta {
+        serde_json::from_str(json).unwrap()
     }
 
     #[test]
-    fn read_file_content_decodes_non_utf8_source() {
-        let path = test_path("gbk");
-        let original = "这是一个用于验证 GBK 编码读取的较长文本。".repeat(20);
-        let (encoded, _, _) = encoding_rs::GBK.encode(&original);
-        std::fs::write(&path, encoded.as_ref()).unwrap();
-        let content = read_file_content(&path, "test.txt").unwrap();
-        assert_eq!(content, original);
-        let _ = std::fs::remove_file(path);
+    fn legacy_meta_no_method_no_original_is_copy_semantics() {
+        // Legacy: no method, no original_path, no md5.
+        let m = meta_from(r#"{"id":"a","name":"a.md","size":1,"uploaded_at":"t"}"#);
+        let c = classify_original(&m, &[]);
+        assert_eq!(c.method, "copy");
+        assert!(!c.has_original_path);
+        assert!(!c.has_md5);
+        assert!(!c.original_changed, "no original path -> cannot be changed");
+        assert!(!c.lost_original);
     }
 
     #[test]
-    fn slice_utf8_window_preserves_character_boundaries() {
-        let content = "a中b😀c";
-        let (first, truncated, next) = slice_utf8_window(content, 0, 3);
-        assert_eq!(first, "a中");
-        assert!(truncated);
-        assert_eq!(next, "a中".len() as u64);
-
-        let (second, truncated, next) = slice_utf8_window(content, next, 3);
-        assert_eq!(second, "b😀");
-        assert!(truncated);
-        assert_eq!(next, "a中b😀".len() as u64);
-
-        let (last, truncated, next) = slice_utf8_window(content, next, 3);
-        assert_eq!(last, "c");
-        assert!(!truncated);
-        assert_eq!(next, content.len() as u64);
+    fn symlink_lost_original_detected() {
+        let m = meta_from(
+            r#"{"id":"a","name":"a.md","size":1,"uploaded_at":"t","method":"symlink","original_path":"/definitely/not/here/x.md","md5":"abc"}"#,
+        );
+        let c = classify_original(&m, &[]);
+        assert!(c.has_original_path);
+        assert!(!c.original_exists);
+        assert!(!c.original_changed, "missing source is not 'changed'");
+        assert!(c.lost_original, "symlink + missing source = lost");
     }
 
     #[test]
-    fn deferred_prune_repeats_after_mutation_during_prune() {
-        let mut state = DeferredPruneState::default();
-        assert!(state.request());
-        let first_generation = state.generation;
+    fn copy_lost_original_also_lost_badge() {
+        let m = meta_from(
+            r#"{"id":"a","name":"a.md","size":1,"uploaded_at":"t","method":"copy","original_path":"/definitely/not/here/x.md","md5":"abc"}"#,
+        );
+        let c = classify_original(&m, &[]);
+        assert!(c.lost_original, "copy docs with vanished source are lost too");
+    }
 
-        assert!(!state.request());
-        let second_generation = state.generation;
-        assert!(state.complete(first_generation));
-        assert!(state.running);
+    #[test]
+    fn legacy_no_md5_with_existing_source_is_changed() {
+        // Real temp file so md5_of_file/existence checks run.
+        let dir = std::env::temp_dir().join(format!("rag-cls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("src.md");
+        std::fs::write(&p, b"hello").unwrap();
+        let json = format!(
+            r#"{{"id":"a","name":"a.md","size":1,"uploaded_at":"t","method":"symlink","original_path":"{}"}}"#,
+            p.to_str().unwrap().replace('\\', "\\\\")
+        );
+        let m = meta_from(&json);
+        let c = classify_original(&m, &[]);
+        assert!(c.original_exists);
+        assert!(!c.has_md5);
+        assert!(c.original_changed, "legacy (no md5) + existing source = has update");
+        assert!(!c.lost_original);
 
-        assert!(!state.complete(second_generation));
-        assert!(!state.running);
+        // Store the md5 -> not changed. Then modify the file -> changed.
+        let md5 = md5_of_file(&p).unwrap();
+        let json2 = format!(
+            r#"{{"id":"a","name":"a.md","size":1,"uploaded_at":"t","method":"symlink","original_path":"{}","md5":"{}"}}"#,
+            p.to_str().unwrap().replace('\\', "\\\\"),
+            md5
+        );
+        let m2 = meta_from(&json2);
+        assert!(!classify_original(&m2, &[]).original_changed);
+        std::fs::write(&p, b"hello world").unwrap();
+        assert!(classify_original(&m2, &[]).original_changed);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn excluded_paths_skip_changed_detection() {
+        let dir = std::env::temp_dir().join(format!("rag-clx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("src.md");
+        std::fs::write(&p, b"x").unwrap();
+        let json = format!(
+            r#"{{"id":"a","name":"a.md","size":1,"uploaded_at":"t","method":"symlink","original_path":"{}"}}"#,
+            p.to_str().unwrap().replace('\\', "\\\\")
+        );
+        let m = meta_from(&json);
+        let c = classify_original(&m, &[dir.to_string_lossy().to_string()]);
+        assert!(c.excluded);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

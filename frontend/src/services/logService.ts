@@ -11,10 +11,13 @@ export interface LogEntry {
   processId?: string;
 }
 
-// Fetch all logs
-export const fetchLogs = async (): Promise<LogEntry[]> => {
+// Fetch logs; optional keyword routes to backend FTS search (desktop:
+// weighted relevance over the full app_log table, up to 200 rows)
+export const fetchLogs = async (search?: string): Promise<LogEntry[]> => {
   try {
-    const response = await apiGet<{ success: boolean; data: LogEntry[]; error?: string }>('/logs');
+    const key = search?.trim() ?? '';
+    const qs = key ? `?search=${encodeURIComponent(key)}&pageSize=200` : '';
+    const response = await apiGet<{ success: boolean; data: LogEntry[]; error?: string }>(`/logs${qs}`);
 
     if (!response.success) {
       throw new Error(response.error || 'Failed to fetch logs');
@@ -103,6 +106,16 @@ class LogStreamManager {
         this.subscribers.forEach((cb) => cb(event));
       };
 
+      // Reset attempts only once the connection is actually established.
+      // `new EventSource()` returns immediately and connects asynchronously, so
+      // resetting here (rather than in onopen) cleared the counter on every
+      // attempt and pinned the backoff below to its first step - a fixed 1s
+      // retry loop whenever the stream kept dropping.
+      this.eventSource.onopen = () => {
+        this.openAttempts = 0;
+        console.log('[LogStreamManager] EventSource opened successfully');
+      };
+
       this.eventSource.onerror = () => {
         console.warn('[LogStreamManager] EventSource error, attempting reconnect...');
         this.closeEventSource();
@@ -110,10 +123,6 @@ class LogStreamManager {
           this.scheduleReconnect();
         }
       };
-
-      // Reset attempts on successful connection
-      this.openAttempts = 0;
-      console.log('[LogStreamManager] EventSource opened successfully');
     } catch (error) {
       console.error('[LogStreamManager] Failed to open EventSource:', error);
       this.closeEventSource();

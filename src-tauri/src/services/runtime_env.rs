@@ -18,6 +18,9 @@ static ACTIVE_PYTHON: OnceLock<RwLock<String>> = OnceLock::new();
 /// source the user's shell profile to get tools like nvm, asdf, pyenv, etc.
 static ENHANCED_PATH: OnceLock<String> = OnceLock::new();
 
+#[cfg(not(target_os = "windows"))]
+const MAX_CAPTURED_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
 /// Initialize with the resolved runtimes directory.
 /// Call once on app startup before spawning any MCP servers.
 pub fn init(runtimes: PathBuf) {
@@ -64,7 +67,22 @@ fn runtimes_dir() -> Option<&'static PathBuf> {
 /// Get the enhanced PATH from user's login shell.
 /// GUI apps on macOS/Linux don't inherit the shell PATH, so we need to
 /// execute the user's shell to get the full PATH with tools like nvm, asdf, etc.
-fn get_enhanced_path() -> String {
+/// Cached login-shell PATH (populated by `init`). Consumers (runtime
+/// settings page) must reuse this instead of re-running the 5s shell probe
+/// on every call — a hung rc file would stall an async worker each time.
+pub fn cached_enhanced_path() -> Option<String> {
+    ENHANCED_PATH.get().cloned()
+}
+
+/// Cache-first PATH for synchronous subprocess helpers: falls back to the raw
+/// process PATH when the login-shell probe hasn't populated the cache yet, so
+/// sync callers never need to block_on the shell probe (which would panic on
+/// a tokio worker) — review round 8, 2026-10-04.
+pub fn cached_enhanced_path_or_env() -> String {
+    ENHANCED_PATH.get().cloned().unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
+}
+
+pub(crate) fn get_enhanced_path() -> String {
     log::info!("[runtime_env] Getting enhanced PATH from user's login shell");
 
     let path = {
@@ -76,13 +94,226 @@ fn get_enhanced_path() -> String {
     };
 
     let display_path = if path.len() > 300 {
-        format!("{}...", &path[..300])
+        // Byte-safe truncation: slicing at a fixed byte offset panics when it
+        // lands mid-UTF-8 (paths with non-ASCII user directories are common).
+        let cut = path.char_indices().map(|(i, _)| i).take_while(|&i| i <= 300).last().unwrap_or(0);
+        format!("{}...", &path[..cut])
     } else {
         path.clone()
     };
     log::info!("[runtime_env] Enhanced PATH: {}", display_path);
 
     path
+}
+
+/// Run a command with a wall-clock timeout, returning `None` on timeout or
+/// spawn failure. Synchronous `Command::output()` has no timeout — an
+/// interactive login shell (`-l -i`) can hang forever on user config that
+/// prompts (keychain agents, password prompts), which would freeze app
+/// startup (`runtime_env::init`) and the runtime settings page alike.
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn run_with_timeout(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let deadline = std::time::Instant::now() + timeout;
+    // Isolate this command so timeout cleanup never signals the app's group.
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0);
+    let mut child = cmd.spawn().ok()?;
+    let process_group = child.id() as libc::pid_t;
+    let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        kill_process_group(process_group);
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+
+    // A bounded poll loop drains both streams without reader threads that can
+    // remain blocked when a shell descendant inherits a pipe.
+    for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            kill_process_group(process_group);
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    }
+
+    let mut status = None;
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+
+    loop {
+        // Decide timeout before observing child status. Otherwise an exit
+        // first noticed after the deadline can be accepted by the completed
+        // child + closed pipes fast path below.
+        if !observed_before_deadline(deadline, std::time::Instant::now()) {
+            kill_process_group(process_group);
+            if let Some(exit_status) = status {
+                return Some(std::process::Output {
+                    status: exit_status,
+                    stdout: stdout_bytes,
+                    stderr: stderr_bytes,
+                });
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(exit_status)) => {
+                    if !observed_before_deadline(deadline, std::time::Instant::now()) {
+                        kill_process_group(process_group);
+                        let _ = child.wait();
+                        return None;
+                    }
+                    status = Some(exit_status);
+                    // The direct child has finished. Reap any descendants
+                    // even when they redirected both captured streams.
+                    kill_process_group(process_group);
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    kill_process_group(process_group);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+
+        if status.is_some() && !stdout_open && !stderr_open {
+            break;
+        }
+
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            kill_process_group(process_group);
+            if let Some(exit_status) = status {
+                return Some(std::process::Output {
+                    status: exit_status,
+                    stdout: stdout_bytes,
+                    stderr: stderr_bytes,
+                });
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        let mut poll_fds = [
+            libc::pollfd {
+                fd: if stdout_open { stdout.as_raw_fd() } else { -1 },
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: if stderr_open { stderr.as_raw_fd() } else { -1 },
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            },
+        ];
+        let remaining = deadline.saturating_duration_since(now);
+        let poll_timeout = remaining.as_millis().clamp(1, 20) as libc::c_int;
+        let poll_result =
+            unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, poll_timeout) };
+        if poll_result < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            kill_process_group(process_group);
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+
+        if stdout_open && (poll_fds[0].revents != 0 || poll_result == 0) {
+            match drain_pipe(&mut stdout, &mut stdout_bytes, 64 * 1024) {
+                Ok(open) => stdout_open = open,
+                Err(()) => {
+                    kill_process_group(process_group);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+        if stderr_open && (poll_fds[1].revents != 0 || poll_result == 0) {
+            match drain_pipe(&mut stderr, &mut stderr_bytes, 64 * 1024) {
+                Ok(open) => stderr_open = open,
+                Err(()) => {
+                    kill_process_group(process_group);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        }
+    }
+
+    Some(std::process::Output {
+        status: status?,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn kill_process_group(process_group: libc::pid_t) {
+    if process_group > 0 {
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn observed_before_deadline(deadline: std::time::Instant, observed_at: std::time::Instant) -> bool {
+    observed_at < deadline
+}
+
+#[cfg(not(target_os = "windows"))]
+fn drain_pipe(
+    pipe: &mut impl std::io::Read,
+    output: &mut Vec<u8>,
+    byte_budget: usize,
+) -> Result<bool, ()> {
+    let mut buffer = [0; 8192];
+    let mut drained = 0;
+    loop {
+        let remaining_output = MAX_CAPTURED_OUTPUT_BYTES.saturating_sub(output.len());
+        let limit = buffer
+            .len()
+            .min(byte_budget.saturating_sub(drained))
+            .min(remaining_output.saturating_add(1));
+        if limit == 0 {
+            return Ok(true);
+        }
+        match pipe.read(&mut buffer[..limit]) {
+            Ok(0) => return Ok(false),
+            Ok(read) => {
+                if read > remaining_output {
+                    return Err(());
+                }
+                output.extend_from_slice(&buffer[..read]);
+                drained += read;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(true),
+            Err(_) => return Ok(false),
+        }
+    }
 }
 
 /// Get PATH from user's login shell on Unix (macOS/Linux)
@@ -93,22 +324,46 @@ fn get_unix_path() -> String {
 
         // Execute shell with -l (login) and -i (interactive) flags
         // to load .bash_profile/.zprofile and .bashrc/.zshrc
-        if let Ok(output) = std::process::Command::new(&shell_path)
-            .arg("-l")
-            .arg("-i")
-            .arg("-c")
-            .arg("echo $PATH")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-        {
+        // Bounded by a timeout: interactive shells can hang on user config
+        // (agents prompting for input), which would block startup forever.
+        if let Some(output) = run_with_timeout(
+            {
+                let mut c = std::process::Command::new(&shell_path);
+                c.arg("-l").arg("-i").arg("-c").arg("echo $PATH");
+                c
+            },
+            std::time::Duration::from_secs(5),
+        ) {
             if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                // User rc files often echo extra lines (nvm hints, banners).
+                // A PATH value must contain ':' separators — take the last
+                // line that looks like a PATH instead of trusting all stdout.
+                // Guards: >= 2 separators (a minimal legitimate PATH like
+                // "/usr/local/bin:/usr/bin:/bin" has 2) and every segment
+                // starts with '/'. NOTE: whitespace is NOT a rejection
+                // signal — macOS PATH entries legitimately contain spaces
+                // ("/Applications/VMware Fusion.app/Contents/Public");
+                // rejecting any line with a space silently discarded such
+                // PATHs and broke managed spawns for users with those apps.
+                let path = String::from_utf8_lossy(&output.stdout);
+                let looks_like_path = |l: &str| {
+                    l.matches(':').count() >= 2
+                        && !l.contains('=')
+                        && l.split(':').filter(|s| !s.is_empty()).all(|s| s.starts_with('/'))
+                };
+                let path = path
+                    .lines()
+                    .filter(|l| looks_like_path(l))
+                    .last()
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_default();
                 if !path.is_empty() {
                     log::info!("[runtime_env] Successfully got PATH from shell (length: {})", path.len());
                     return path;
                 }
             }
+        } else {
+            log::warn!("[runtime_env] Shell PATH probe timed out after 5s, using fallback");
         }
     }
 
@@ -744,8 +999,19 @@ pub fn app_data_dir(name: &str) -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Returns the per-server npm cache directory path WITHOUT creating it.
+/// Matches the `npm_config_cache` env override (`npm-cache-{server}`) that
+/// `env_overrides` sets for node/npx/npm spawns — reinstall/clear_cache must
+/// target THIS directory (its `_npx` holds the actual package installs), not
+/// the legacy shared `runtimes/_npx` which managed spawns never write.
+pub fn npm_server_cache_dir(server_name: &str) -> Option<PathBuf> {
+    let base = app_cache_base()?;
+    Some(base.join("mcphub-desktop").join(format!("npm-cache-{}", server_name)))
+}
+
 /// Returns the npm/npx cache directory used by the managed Node.js runtime.
-/// This is the `_npx` directory inside the runtimes dir.
+/// Legacy shared location (kept for reference; managed npx spawns point at
+/// `npm_server_cache_dir` via `npm_config_cache` instead).
 pub fn npm_cache_dir() -> Option<PathBuf> {
     let rt = runtimes_dir()?;
     Some(rt.join("_npx"))
@@ -756,4 +1022,189 @@ pub fn npm_cache_dir() -> Option<PathBuf> {
 pub fn uvx_cache_dir() -> Option<PathBuf> {
     let rt = runtimes_dir()?;
     Some(rt.join("uv-cache"))
+}
+
+/// Returns the per-server uvx cache directory path WITHOUT creating it.
+/// Matches the `UV_CACHE_DIR` env override (`uv-cache-{server}`) that
+/// `env_overrides` sets for uvx servers — reinstalls must clear this
+/// directory to force a package re-download.
+pub fn uvx_server_cache_dir(server_name: &str) -> Option<PathBuf> {
+    let base = app_cache_base()?;
+    Some(base.join("mcphub-desktop").join(format!("uv-cache-{}", server_name)))
+}
+
+fn app_cache_base() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let base = std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join("Library").join("Caches"));
+    #[cfg(target_os = "linux")]
+    let base = std::env::var("XDG_CACHE_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".cache"))
+        });
+    #[cfg(target_os = "windows")]
+    let base = std::env::var("LOCALAPPDATA").ok().map(PathBuf::from);
+    base
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod timeout_tests {
+    use super::run_with_timeout;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn shell(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(script);
+        command
+    }
+
+    struct TempFixture(std::path::PathBuf);
+
+    impl TempFixture {
+        fn new() -> Self {
+            let id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "mcphub-runtime-timeout-{}-{id}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("create temporary fixture");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn returns_normal_stdout_and_stderr() {
+        let output = run_with_timeout(shell("printf out; printf err >&2"), Duration::from_secs(2))
+            .expect("shell should complete");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+    }
+
+    #[test]
+    fn drains_output_larger_than_pipe_capacity() {
+        let output = run_with_timeout(
+            shell("head -c 131072 /dev/zero; head -c 131072 /dev/zero >&2"),
+            Duration::from_secs(3),
+        )
+        .expect("shell should complete");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 131072);
+        assert_eq!(output.stderr.len(), 131072);
+    }
+
+    #[test]
+    fn returns_when_descendant_keeps_stdout_open() {
+        let started = Instant::now();
+        let output = run_with_timeout(
+            shell("sleep 6 2>/dev/null & printf done"),
+            Duration::from_millis(200),
+        )
+        .expect("direct shell should exit before the deadline");
+        let elapsed = started.elapsed();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"done");
+        assert!(elapsed < Duration::from_secs(1), "helper took {elapsed:?}");
+    }
+
+    #[test]
+    fn returns_when_descendant_keeps_stderr_open() {
+        let started = Instant::now();
+        let output = run_with_timeout(
+            shell("sleep 6 >/dev/null & printf done"),
+            Duration::from_millis(200),
+        )
+        .expect("direct shell should exit before the deadline");
+        let elapsed = started.elapsed();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"done");
+        assert!(elapsed < Duration::from_secs(1), "helper took {elapsed:?}");
+    }
+
+    #[test]
+    fn kills_redirected_descendant_after_successful_shell_exit() {
+        let fixture = TempFixture::new();
+        let started = fixture.0.join("started");
+        let survived = fixture.0.join("survived");
+        let mut command = shell(
+            r#"(printf started > "$1"; sleep 1; printf survived > "$2") >/dev/null 2>&1 & while [ ! -e "$1" ]; do sleep 0.01; done; printf done"#,
+        );
+        command.arg("sh").arg(&started).arg(&survived);
+
+        let output = run_with_timeout(command, Duration::from_secs(2))
+            .expect("shell should complete successfully");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"done");
+        assert!(started.exists(), "descendant should have started");
+
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(
+            !survived.exists(),
+            "redirected descendant survived the shell's successful exit"
+        );
+    }
+
+    #[test]
+    fn deadline_edge_rejects_completion_at_or_after_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        assert!(super::observed_before_deadline(
+            deadline,
+            deadline - Duration::from_nanos(1)
+        ));
+        assert!(!super::observed_before_deadline(deadline, deadline));
+        assert!(!super::observed_before_deadline(
+            deadline,
+            deadline + Duration::from_nanos(1)
+        ));
+    }
+
+    #[test]
+    fn times_out_if_child_closes_pipes_but_keeps_running() {
+        let started = Instant::now();
+        let output = run_with_timeout(
+            shell("exec >/dev/null 2>&1; sleep 6"),
+            Duration::from_millis(200),
+        );
+
+        assert!(output.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn times_out_during_continuous_stdout() {
+        let started = Instant::now();
+        let output = run_with_timeout(shell("yes"), Duration::from_millis(200));
+
+        assert!(output.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn stops_continuous_stdout_when_capture_limit_is_reached() {
+        let started = Instant::now();
+        let output = run_with_timeout(shell("yes"), Duration::from_secs(5));
+
+        assert!(output.is_none());
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
 }

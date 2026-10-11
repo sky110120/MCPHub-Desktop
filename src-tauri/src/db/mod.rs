@@ -14,6 +14,26 @@ pub fn pool() -> &'static SqlitePool {
     DB_POOL.get().expect("Database not initialized")
 }
 
+#[cfg(test)]
+pub(crate) async fn initialize_test_pool(pool: SqlitePool) -> Result<()> {
+    let databases = sqlx::query("PRAGMA database_list")
+        .fetch_all(&pool)
+        .await?;
+    let is_memory_only = !databases.is_empty()
+        && databases.iter().all(|row| {
+            use sqlx::Row;
+            row.try_get::<String, _>("file")
+                .map(|path| path.is_empty())
+                .unwrap_or(false)
+        });
+    if !is_memory_only {
+        anyhow::bail!("test database pool must use in-memory SQLite only");
+    }
+    DB_POOL
+        .set(pool)
+        .map_err(|_| anyhow::anyhow!("test database pool already initialized"))
+}
+
 pub async fn initialize(app: &AppHandle) -> Result<()> {
     let app_dir = app
         .path()
@@ -22,6 +42,7 @@ pub async fn initialize(app: &AppHandle) -> Result<()> {
 
     std::fs::create_dir_all(&app_dir)?;
     let db_path = app_dir.join("mcphub.db");
+    let db_existed_before_connect = db_path.exists();
     let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
 
     // Keep migrations on a single connection and disable the statement cache.
@@ -52,10 +73,18 @@ pub async fn initialize(app: &AppHandle) -> Result<()> {
         .connect_with(options)
         .await?;
 
+    // Backup database before applying pending migrations (pre-migration copy
+    // for manual rollback, requirement: mcphub.db.bak). Only runs when
+    // migrations are pending; failure aborts startup — never migrate without
+    // a backup. See db/migration.rs::backup_before_migration.
+    migration::backup_before_migration(&pool, &db_path, db_existed_before_connect).await?;
+
     // Run version-wise migrations
     migration::run_pending(&pool).await?;
 
-    DB_POOL.set(pool).ok();
+    DB_POOL
+        .set(pool)
+        .map_err(|_| anyhow::anyhow!("db pool already initialized"))?;
     log::info!("Database initialized at {}", db_path.display());
     Ok(())
 }

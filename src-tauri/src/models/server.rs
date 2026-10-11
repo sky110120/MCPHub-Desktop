@@ -32,6 +32,11 @@ pub struct ServerOptions {
     pub timeout: Option<u64>,
     pub reset_timeout_on_progress: Option<bool>,
     pub max_total_timeout: Option<u64>,
+    /// Origin #1284: stdio read buffer limit in bytes (JS SDK option, default
+    /// 10 MiB). Persisted for config round-trip parity; the desktop's rmcp
+    /// transport has no buffer cap, so this is accepted but not consumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_buffer_size: Option<u64>,
 }
 
 /// OpenAPI security configuration
@@ -159,6 +164,20 @@ pub struct ServerConfig {
     /// from the frontend so an edit of any other field does not drop it.
     #[serde(default)]
     pub proxy: Option<ProxychainsConfig>,
+    /// Keep-alive toggle for sse/streamable-http servers (frontend round-trip).
+    /// Persisted and compared for connection-relevant edits, but the rmcp
+    /// transport currently manages its own connection health — not yet wired
+    /// to runtime behavior.
+    #[serde(default)]
+    pub enable_keep_alive: Option<bool>,
+    /// Keep-alive ping interval in milliseconds (frontend round-trip only).
+    #[serde(default)]
+    pub keep_alive_interval: Option<u64>,
+    /// Extra headers passed through to the upstream on every request
+    /// (sse/streamable-http). Persisted for round-trip; consumed by the rmcp
+    /// transport's request headers once wired.
+    #[serde(default)]
+    pub passthrough_headers: Option<Vec<String>>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -210,6 +229,25 @@ pub struct Tool {
     /// when the tool also returns `structuredContent` on call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<serde_json::Value>,
+    /// Origin #1286 optional fields (human-readable display name). rmcp SDK
+    /// `Tool.title` — carried through so toolDefinitionFields can surface it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// MCP Apps / 2026 execution hints (`execution.taskSupport` etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<serde_json::Value>,
+    /// Tool icons (MCP Apps).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icons: Option<serde_json::Value>,
+    /// Tool-level `_meta` (MCP Apps visibility hints etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+    /// Set by apply_tool_filters when a user description override was applied.
+    /// Internal index bookkeeping only (never serialized to wire): the smart
+    /// toolset hash includes the override text so editing it triggers a
+    /// re-embed (origin #1198 — "whose change MUST invalidate the cache").
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub description_overridden: bool,
 }
 
 /// Result of a tool invocation
@@ -222,6 +260,12 @@ pub struct ToolCallResult {
     /// only when the tool declared an outputSchema and returned structured data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<serde_json::Value>,
+    /// Upstream result `_meta`, verbatim (A2/A9: carries MRTR
+    /// `resultType: "input_required"` + `inputRequests`, and OTel trace keys
+    /// when the upstream echoes them). Downstream shaping decides what to do
+    /// with it per protocol revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_meta: Option<serde_json::Value>,
 }
 
 /// Combined server info returned to the dashboard

@@ -26,19 +26,34 @@ export const openExternal = async (url: string): Promise<void> => {
   window.open(url, '_blank', 'noopener,noreferrer');
 };
 
-/** Route plain target=_blank links through the native external URL command. */
+/**
+ * Document-level fallback interceptor for external links.
+ *
+ * Replaces the one tauri-plugin-shell used to inject (the plugin was removed:
+ * its `open` command spawns via pre_exec/double-fork, which crashes in
+ * _malloc_fork_child with mimalloc's malloc-zone override on macOS 26).
+ * Bare `<a target="_blank">` links without their own onClick (Markdown,
+ * Dashboard, Market pages, Header, ...) are routed through `openExternal`,
+ * which spawns the OS opener via posix_spawn - no fork, no crash.
+ *
+ * Links whose own onClick already called preventDefault (e.g. AboutDialog's
+ * handleExternalClick) are skipped, so the URL only opens once.
+ *
+ * No-op on web: native target="_blank" navigation works there.
+ */
 export function installExternalLinkInterceptor(): void {
   if (!isTauri()) return;
-  document.addEventListener('click', (event) => {
-    if (event.defaultPrevented) return;
-    let node = event.target as HTMLElement | null;
+  document.addEventListener('click', (e) => {
+    if (e.defaultPrevented) return;
+    let node = e.target as HTMLElement | null;
     while (node) {
       if (node instanceof HTMLAnchorElement) {
-        if (node.target === '_blank' && /^(https?|mailto|tel):/.test(node.href)) {
-          event.preventDefault();
-          void openExternal(node.href);
+        const a = node as HTMLAnchorElement;
+        if (a.target === '_blank' && a.href && /^(https?|mailto|tel):/.test(a.href)) {
+          e.preventDefault();
+          void openExternal(a.href);
         }
-        return;
+        break;
       }
       node = node.parentElement;
     }

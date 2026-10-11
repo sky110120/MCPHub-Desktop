@@ -1,0 +1,3 @@
+-- Local schema v26 -> v27. Runtime Rust migration merges newly bundled agent
+-- defaults into system_config.config_json.skills.agents by id, preserving
+-- existing user entries and order. This is intentionally not a static UPDATE.

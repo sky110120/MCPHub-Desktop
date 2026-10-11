@@ -127,6 +127,35 @@ export function mapRestToCommand(method: string, endpoint: string, body?: unknow
     };
 
   // Per-server tool/prompt/resource toggle & description overrides.
+  // Server-level $smart pin: POST /servers/:s/tools/:t/pin
+  if (
+    segs[0] === 'servers' &&
+    segs.length === 5 &&
+    segs[2] === 'tools' &&
+    segs[4] === 'pin' &&
+    m === 'POST'
+  ) {
+    const b = body as { pinned?: boolean } | null;
+    return {
+      command: 'set_server_tool_pinned',
+      args: {
+        serverName: decodeURIComponent(segs[1]),
+        itemType: 'tool',
+        itemName: decodeURIComponent(segs[3]),
+        pinned: b?.pinned ?? true,
+      },
+    };
+  }
+  // List server-level pinned tools: GET /servers/:s/tools/pins
+  if (
+    segs[0] === 'servers' &&
+    segs.length === 4 &&
+    segs[2] === 'tools' &&
+    segs[3] === 'pins' &&
+    m === 'GET'
+  ) {
+    return { command: 'list_server_tool_pins', args: { serverName: decodeURIComponent(segs[1]) } };
+  }
   if (
     segs[0] === 'servers' &&
     segs.length >= 5 &&
@@ -352,7 +381,19 @@ export function mapRestToCommand(method: string, endpoint: string, body?: unknow
   if (p === 'config/export' && m === 'GET') return { command: 'export_settings', args: {} };
 
   // Logs
-  if (p === 'logs' && m === 'GET') return { command: 'get_logs', args: { query: {} } };
+  if (p === 'logs' && m === 'GET') {
+    // Optional ?search=&pageSize= → LogQuery (backend FTS weighted search);
+    // empty query keeps the default latest-50 fetch used by polling.
+    let query: Record<string, unknown> = {};
+    const qsi = endpoint.indexOf('?');
+    if (qsi >= 0) {
+      const qs = new URLSearchParams(endpoint.slice(qsi + 1));
+      const search = qs.get('search')?.trim();
+      const pageSize = Number(qs.get('pageSize'));
+      if (search) query = { search, page: 1, pageSize: pageSize > 0 ? pageSize : 200 };
+    }
+    return { command: 'get_logs', args: { query } };
+  }
   if (p === 'logs' && m === 'DELETE') return { command: 'clear_logs', args: {} };
   if (p === 'logs/activity' && m === 'GET')
     return { command: 'get_tool_activities', args: { page: 1, pageSize: 50 } };
@@ -419,6 +460,20 @@ export function mapRestToCommand(method: string, endpoint: string, body?: unknow
   if (segs[0] === 'activities') {
     if (p === 'activities/available') return { command: 'get_activity_available', args: {} };
     if (p === 'activities/filters') return { command: 'get_activity_filters', args: {} };
+    // Paginated searchable filter options (server/tool/group/keyName dropdowns)
+    if (p === 'activities/filter-options') {
+      const qsIdx = endpoint.indexOf('?');
+      const qs = qsIdx >= 0 ? new URLSearchParams(endpoint.slice(qsIdx + 1)) : new URLSearchParams();
+      return {
+        command: 'get_activity_filter_options',
+        args: {
+          field: qs.get('field') ?? '',
+          search: qs.get('search') ?? null,
+          page: Number(qs.get('page') ?? 1),
+          pageSize: Number(qs.get('pageSize') ?? 50),
+        },
+      };
+    }
     if (segs[1] === 'stats') {
       // Pass filter params through to stats query
       const qsIdx = endpoint.indexOf('?');
@@ -429,6 +484,8 @@ export function mapRestToCommand(method: string, endpoint: string, body?: unknow
           server: qs.get('server') ?? null,
           status: qs.get('status') ?? null,
           tool: qs.get('tool') ?? null,
+          groupName: qs.get('group') ?? null,
+          keyName: qs.get('keyName') ?? null,
         },
       };
     }
@@ -449,6 +506,8 @@ export function mapRestToCommand(method: string, endpoint: string, body?: unknow
           server: qs.get('server') ?? null,
           status: qs.get('status') ?? null,
           tool: qs.get('tool') ?? null,
+          groupName: qs.get('group') ?? null,
+          keyName: qs.get('keyName') ?? null,
         },
       };
     }
@@ -473,7 +532,7 @@ export function mapRestToCommand(method: string, endpoint: string, body?: unknow
     }
     // /market/servers/:name
     if (segs[1] === 'servers' && segs[2])
-      return { command: 'get_market_server', args: { name: segs[2] } };
+      return { command: 'get_market_server', args: { name: decodeURIComponent(segs[2]) } };
     // /market/servers (list all)
     if (m === 'GET') return { command: 'list_market_servers', args: {} };
     return { command: '__stub__', args: { __response: { success: true, data: null } } };
@@ -481,7 +540,26 @@ export function mapRestToCommand(method: string, endpoint: string, body?: unknow
 
   if (segs[0] === 'registry') {
     if (segs[1] === 'servers' && segs[2] && segs[3] === 'versions' && m === 'GET')
-      return { command: 'get_registry_server_versions', args: { name: decodeURIComponent(segs[2]) } };
+      return { command: 'get_registry_server_versions', args: { serverName: decodeURIComponent(segs[2]) } };
+    // /registry/servers/versions?serverName=X — query-based variant used by
+    // useRegistryData's version list; without this branch it falls through to
+    // list_registry_servers and silently returns the whole registry.
+    if (segs[1] === 'servers' && segs[2] === 'versions' && m === 'GET') {
+      const qsIdx = endpoint.indexOf('?');
+      const qs = qsIdx >= 0 ? new URLSearchParams(endpoint.slice(qsIdx + 1)) : new URLSearchParams();
+      const serverName = qs.get('serverName');
+      if (serverName)
+        return { command: 'get_registry_server_versions', args: { serverName } };
+    }
+    // /registry/servers/version?serverName=X&version=Y — single version detail
+    if (segs[1] === 'servers' && segs[2] === 'version' && m === 'GET') {
+      const qsIdx = endpoint.indexOf('?');
+      const qs = qsIdx >= 0 ? new URLSearchParams(endpoint.slice(qsIdx + 1)) : new URLSearchParams();
+      const serverName = qs.get('serverName');
+      const version = qs.get('version');
+      if (serverName && version)
+        return { command: 'get_registry_server_version', args: { serverName, version } };
+    }
     if (segs[1] === 'servers' && m === 'GET') {
       const qsIdx = endpoint.indexOf('?');
       const qs = qsIdx >= 0 ? new URLSearchParams(endpoint.slice(qsIdx + 1)) : new URLSearchParams();
@@ -513,6 +591,20 @@ export function mapRestToCommand(method: string, endpoint: string, body?: unknow
     // /cloud/servers
     if (segs[1] === 'servers' && m === 'GET')
       return { command: 'list_cloud_servers', args: {} };
+    // /cloud/servers/:name/tools/:tool/call — tool calls for remote MCPRouter
+    // cloud servers are not supported by the desktop client. Must NOT fall
+    // through to the success stub below: callServerTool treats success:true
+    // as a real invocation and would show a false "call succeeded" toast.
+    if (segs[1] === 'servers' && segs[2] && segs[3] === 'tools' && m === 'POST')
+      return {
+        command: '__stub__',
+        args: {
+          __response: {
+            success: false,
+            message: 'Tool calls for cloud (MCPRouter) servers are not supported in desktop mode',
+          },
+        },
+      };
     // /cloud/categories and /cloud/tags — no separate cloud equivalents, return empty
     if (segs[1] === 'categories' || segs[1] === 'tags')
       return { command: '__stub__', args: { __response: { success: true, data: [] } } };
@@ -658,6 +750,21 @@ export function mapRestToCommand(method: string, endpoint: string, body?: unknow
   // RAG endpoints — (rag_toggle, rag_status, list_rag_docs, get_rag_doc,
   // upload_rag_docs, delete_rag_doc, rag_search_command, get_rag_settings,
   // save_rag_settings, open_rag_file_location).
+  // ── Smart Routing (desktop commands, Phase 4) ─────────────────────────
+  // NOTE: must live OUTSIDE the `segs[0] === 'rag'` block — it was previously
+  // nested inside it, so /smart-routing/* never matched ("Unmapped route").
+  // GET /smart-routing/performance — index summary mapped into the origin
+  // panel shape (vectorStore rows + byServer; coverage/database are
+  // desktop-degenerate but keep the keys the panel reads).
+  if (p === 'smart-routing/performance' && m === 'GET')
+    return { command: 'smart_routing_performance', args: {} };
+  // POST /smart-routing/reindex — full index rebuild with per-server results.
+  if (p === 'smart-routing/reindex' && m === 'POST')
+    return { command: 'smart_routing_reindex', args: {} };
+  // GET /smart-routing/status
+  if (p === 'smart-routing/status' && m === 'GET')
+    return { command: 'smart_routing_status', args: {} };
+
   if (segs[0] === 'rag') {
     // GET /rag/status — runtime status (switch state)
     if (segs[1] === 'status' && m === 'GET')
@@ -716,10 +823,42 @@ export function mapRestToCommand(method: string, endpoint: string, body?: unknow
       const b = body as { id?: string; tags?: string[] } | null;
       return { command: 'set_rag_tags', args: { id: b?.id ?? '', tags: b?.tags ?? [] } };
     }
+    // GET /rag/excluded-paths — the exclusion registry (paths the update
+    // pipeline ignores). Backs the import dialog's ban toggles + doc badges.
+    if (segs[1] === 'excluded-paths' && m === 'GET')
+      return { command: 'list_rag_excluded_paths', args: {} };
+    // POST /rag/excluded-paths/set — replace the registry wholesale (the
+    // import dialog persists its dialog-local diff in one call).
+    if (segs[1] === 'excluded-paths' && segs[2] === 'set' && m === 'POST') {
+      const b = body as { paths?: string[] } | null;
+      return { command: 'set_rag_excluded_paths', args: { paths: b?.paths ?? [] } };
+    }
+    // GET /rag/git-clone-dir?url=… — the persistent clone dir for a git
+    // source (the tree view's per-source exclude button registry entry).
+    if (segs[1] === 'git-clone-dir' && m === 'GET') {
+      const q = new URLSearchParams(endpoint.split('?')[1] || '');
+      return { command: 'get_rag_git_clone_dir', args: { url: q.get('url') ?? '' } };
+    }
+    // POST /rag/source-alias — set/clear a folder/git source's display alias
+    // (the tree view's per-source rename button).
+    if (segs[1] === 'source-alias' && m === 'POST') {
+      const b = body as { kind?: string; identity?: string; alias?: string } | null;
+      return {
+        command: 'set_rag_source_alias',
+        args: { kind: b?.kind ?? '', identity: b?.identity ?? '', alias: b?.alias ?? '' },
+      };
+    }
     // POST /rag/open-location — reveal a doc's file in the OS file manager
+    // (target: "source" = original file, default/omitted = content file)
     if (segs[1] === 'open-location' && m === 'POST') {
+      const b = body as { id?: string; target?: string } | null;
+      return { command: 'open_rag_file_location', args: { id: b?.id ?? '', target: b?.target } };
+    }
+    // POST /rag/open-source-file — open a doc's ORIGINAL source file with the
+    // OS default application ("view source file" for PDF/Office/image docs)
+    if (segs[1] === 'open-source-file' && m === 'POST') {
       const b = body as { id?: string } | null;
-      return { command: 'open_rag_file_location', args: { id: b?.id ?? '' } };
+      return { command: 'open_rag_doc_source_file', args: { id: b?.id ?? '' } };
     }
     // POST /rag/reindex-all — re-embed every doc with the currently-loaded
     // model (after a model swap recreated the vector table). Emits progress
@@ -730,6 +869,10 @@ export function mapRestToCommand(method: string, endpoint: string, body?: unknow
     // GET /rag/models - list available model sizes (ready / downloadable).
     if (segs[1] === 'models' && m === 'GET')
       return { command: 'rag_list_models', args: {} };
+    // GET /rag/ocr-status - OCR capability probe (upload dialog pre-flight +
+    // the OCR-missing failure dialog). Linux tesseract probe is cached.
+    if (segs[1] === 'ocr-status' && m === 'GET')
+      return { command: 'get_ocr_status', args: {} };
     // GET /rag/model - the currently-selected model size (or null).
     if (segs[1] === 'model' && m === 'GET')
       return { command: 'rag_current_model', args: {} };
@@ -746,22 +889,59 @@ export function mapRestToCommand(method: string, endpoint: string, body?: unknow
     // POST /rag/docs/pick — OS multi-file picker (plain-text), returns paths
     if (segs[1] === 'docs' && segs[2] === 'pick' && m === 'POST')
       return { command: 'pick_rag_files', args: {} };
-    // POST /rag/docs/pick-folder — OS folder picker; backend scans the folder's
-    // immediate file children (non-recursive) + returns them as import candidates.
-    if (segs[1] === 'docs' && segs[2] === 'pick-folder' && m === 'POST')
-      return { command: 'pick_rag_folder', args: {} };
+    // POST /rag/docs/pick-folder — OS folder picker; backend scans the folder
+    // (recursive=true walks all descendant dirs, skipping dev dirs/hidden/
+    // symlinks, capped; false = immediate file children only) and returns a
+    // grouped candidate list for the Upload dialog's tree view.
+    if (segs[1] === 'docs' && segs[2] === 'pick-folder' && m === 'POST') {
+      const b = body as { recursive?: boolean } | null;
+      return { command: 'pick_rag_folder', args: { recursive: b?.recursive ?? false } };
+    }
+    // POST /rag/pick-git — Git data source: clone/pull the repo (optional
+    // username/password for auth) and scan the clone dir, returning the same
+    // grouped scan shape as the folder picker. GIT_AUTH_REQUIRED-prefixed
+    // errors are shown inline in the Git form (advanced section auto-expands).
+    if (segs[1] === 'pick-git' && m === 'POST') {
+      const b = body as { url?: string; branch?: string; username?: string; password?: string; depth?: number } | null;
+      return {
+        command: 'pick_rag_git_repo',
+        args: {
+          url: b?.url ?? '',
+          branch: b?.branch ?? null,
+          username: b?.username ?? null,
+          password: b?.password ?? null,
+          depth: b?.depth ?? 1,
+        },
+      };
+    }
+    // POST /rag/cancel-git-pick — cancel an in-flight git pick/clone.
+    if (segs[1] === 'cancel-git-pick' && m === 'POST') {
+      const b = body as { url?: string } | null;
+      return { command: 'cancel_rag_git_pick', args: { url: b?.url ?? '' } };
+    }
+    // POST /rag/import-session/begin|end — bracket the frontend upload loop.
+    // While the session is active the backend defers git-source refreshes +
+    // the auto-update tick (no clone-swap racing per-file imports) and can
+    // request a cancel when the window is closed mid-import.
+    if (segs[1] === 'import-session' && m === 'POST') {
+      return {
+        command: segs[2] === 'end' ? 'end_rag_import_session' : 'begin_rag_import_session',
+        args: {},
+      };
+    }
     // POST /rag/docs/upload — upload a single file by disk path (backend reads
     // bytes from disk + detects encoding; no base64/JSON byte transfer). `method`
     // selects the import method: "symlink" (default — record original_path, no
-    // copy) or "copy".
+    // copy) or "copy". `source` carries data-source provenance (file/folder/git).
     if (segs[1] === 'docs' && segs[2] === 'upload' && m === 'POST') {
-      const b = body as { filePath?: string; tags?: string[]; method?: string } | null;
+      const b = body as { filePath?: string; tags?: string[]; method?: string; source?: unknown } | null;
       return {
         command: 'upload_rag_doc',
         args: {
           filePath: b?.filePath ?? '',
           tags: b?.tags ?? [],
           method: b?.method ?? 'symlink',
+          source: b?.source ?? null,
         },
       };
     }
@@ -795,14 +975,44 @@ export function mapRestToCommand(method: string, endpoint: string, body?: unknow
     if (segs[1] === 'docs' && segs[2] === 'batch-preview' && m === 'POST') {
       return { command: 'preview_batch_update', args: {} };
     }
+    // GET /rag/git-errors - last recorded git-source refresh failures (no
+    // network I/O). Backs the progress dialog's warning icon.
+    if (segs[1] === 'git-errors' && m === 'GET') {
+      return { command: 'get_git_source_errors', args: {} };
+    }
     // POST /rag/docs/batch-update - kick off the background re-index pass.
     if (segs[1] === 'docs' && segs[2] === 'batch-update' && m === 'POST') {
       return { command: 'batch_update_rag_docs', args: {} };
     }
+    // POST /rag/source-update — source-level manual update (the tree view's
+    // per-source refresh button): git force-refresh + scoped sync + scoped
+    // md5 re-index. Shares the batch flow's progress events + running guard.
+    // ⚠️ Must require segs.length === 2 — otherwise this branch also swallows
+    // /rag/source-update/preview (segs[1] is still 'source-update') and the
+    // preview call would EXECUTE the update and return [added,removed,updated],
+    // leaving the confirm dialog counts undefined/blank.
+    if (segs[1] === 'source-update' && segs.length === 2 && m === 'POST') {
+      const b = body as { kind?: string; url?: string; root?: string } | null;
+      return {
+        command: 'refresh_rag_source',
+        args: { kind: b?.kind ?? '', url: b?.url ?? null, root: b?.root ?? null },
+      };
+    }
+    // POST /rag/source-update/preview — source-scoped batch preview (the
+    // confirm dialog counts for the per-source refresh button).
+    if (segs[1] === 'source-update' && segs[2] === 'preview' && m === 'POST') {
+      const b = body as { kind?: string; url?: string; root?: string } | null;
+      return {
+        command: 'preview_rag_source_update',
+        args: { kind: b?.kind ?? '', url: b?.url ?? null, root: b?.root ?? null },
+      };
+    }
     // GET /rag/docs/:id — full document (with content)
     if (segs[1] === 'docs' && m === 'GET' && segs.length === 3)
       return { command: 'get_rag_doc', args: { id: decodeURIComponent(segs[2]) } };
-    // POST /rag/docs/get-paged — bounded UTF-8-safe document detail read.
+    // POST /rag/docs/get-paged - paged doc-detail read for the View dialog
+    // (offsetBytes skipped, limitBytes returned; 0 limit = configured page
+    // size). Returns truncated/nextOffset/contentTotalBytes for "load more".
     if (segs[1] === 'docs' && segs[2] === 'get-paged' && m === 'POST') {
       const b = body as { id?: string; offsetBytes?: number; limitBytes?: number } | null;
       return {
@@ -820,7 +1030,8 @@ export function mapRestToCommand(method: string, endpoint: string, body?: unknow
       const b = body as { id?: string } | null;
       return { command: 'get_rag_chunks', args: { id: b?.id ?? '' } };
     }
-    // POST /rag/docs/chunks-paged — bounded chunk detail read.
+    // POST /rag/docs/chunks-paged - paginated chunks (offset skipped, pageSize
+    // returned + total) for the scroll-to-load-more "view chunks" dialog.
     if (segs[1] === 'docs' && segs[2] === 'chunks-paged' && m === 'POST') {
       const b = body as { id?: string; offset?: number; pageSize?: number } | null;
       return {
@@ -866,8 +1077,72 @@ export function transformTauriResponse(command: string, result: unknown): unknow
     return { success: true };
   }
 
+  // ── Smart Routing commands: map desktop shapes into the origin panel API ──
+  if (command === 'smart_routing_performance') {
+    const r = (result ?? {}) as {
+      serverRows?: number; toolRows?: number; totalRows?: number;
+    };
+    // Desktop command returns row totals; per-server breakdown arrives via a
+    // follow-up status call in the service layer when available.
+    return {
+      success: true,
+      data: {
+        enabled: true,
+        reindexing: false,
+        config: { provider: 'local', model: null, configuredDimensions: null },
+        database: { connected: true, healthy: true, lastError: null },
+        vectorStore: {
+          available: true,
+          totalRows: r.totalRows ?? 0,
+          toolRows: r.toolRows ?? 0,
+          serverRows: r.serverRows ?? 0,
+          distinctServers: r.serverRows ?? 0,
+          dimensions: null,
+          byModel: [],
+          byServer: [],
+          oldestUpdatedAt: null,
+          newestUpdatedAt: null,
+        },
+        coverage: {
+          totalServers: r.serverRows ?? 0,
+          connectedServers: r.serverRows ?? 0,
+          personalCredentialServers: 0,
+          indexedServers: r.serverRows ?? 0,
+          missingIndexServerCount: 0,
+          missingIndexServers: [],
+        },
+      },
+    };
+  }
+  if (command === 'smart_routing_reindex') {
+    return { success: true, data: result };
+  }
+  if (command === 'smart_routing_status') {
+    return { success: true, data: result };
+  }
+
   // ── Void-return commands ──────────────────────────────────────────────────
+  // NOTE: commands returning Option<T> (get_server, get_market_server, ...)
+  // must NOT hit this generic null-success fallback — a null here means
+  // "not found" and must surface as a failure. Those are handled explicitly
+  // below (and in their own branches), so intercept them first.
   if (result === null || result === undefined) {
+    // All Result<Option<T>, String> commands: a null result must surface as a
+  // not-found FAILURE, not {success:true} with no data (stale-list opens
+  // rendered empty dialogs instead of "no longer exists" errors).
+  const optionCommands = [
+    'get_server',
+    'get_market_server',
+    'get_rag_doc',
+    'get_rag_doc_paged',
+    'get_rag_chunks',
+    'get_rag_chunks_paged',
+    'get_builtin_prompt',
+    'get_builtin_resource',
+  ];
+    if (optionCommands.includes(command)) {
+      return { success: false, message: 'Server not found' };
+    }
     return { success: true };
   }
 
@@ -966,8 +1241,9 @@ export function transformTauriResponse(command: string, result: unknown): unknow
       data: { items, total: r?.total ?? items.length, page: r?.page ?? 0, pageSize: r?.pageSize ?? items.length },
     };
   }
-
-  // get_rag_chunks_paged returns { items, total, offset, pageSize }.
+  // get_rag_chunks_paged returns RagChunkPage { items, total, offset, pageSize }
+  // — same camelCase passthrough, but with an offset (0-based chunk index)
+  // instead of a page number.
   if (command === 'get_rag_chunks_paged') {
     const r = result as { items?: unknown[]; total?: number; offset?: number; pageSize?: number } | null;
     const items = r?.items ?? [];
@@ -1054,6 +1330,19 @@ export function transformTauriResponse(command: string, result: unknown): unknow
     const r = result as Record<string, unknown> | null;
     return { success: true, data: { deletedCount: (r?.deletedCount as number) ?? 0 } };
   }
+  if (command === 'get_activity_filter_options') {
+    const r = result as Record<string, unknown> | null;
+    if (!r) return { success: true, data: { options: [], total: 0, page: 1, pageSize: 50 } };
+    return {
+      success: true,
+      data: {
+        options: (r.options as string[]) ?? [],
+        total: (r.total as number) ?? 0,
+        page: (r.page as number) ?? 1,
+        pageSize: (r.pageSize as number) ?? 50,
+      },
+    };
+  }
 
   // ── call_tool: frontend reads response.content directly (not response.data.content)
   if (command === 'call_tool') {
@@ -1075,9 +1364,22 @@ export function transformTauriResponse(command: string, result: unknown): unknow
         }
       }
       const detail = errorTexts.length > 0 ? errorTexts.join('\n') : 'Unknown error';
-      return { success: false, content: contentArr, message: detail };
+      // Keep structuredContent/_meta so callers can detect MRTR
+      // input_required flows and render structured results later.
+      return {
+        success: false,
+        content: contentArr,
+        message: detail,
+        structuredContent: (r as Record<string, unknown>).structuredContent ?? null,
+        _meta: (r as Record<string, unknown>).rawMeta ?? null,
+      };
     }
-    return { success: true, content: r?.content ?? [] };
+    return {
+      success: true,
+      content: r?.content ?? [],
+      structuredContent: (r as Record<string, unknown>).structuredContent ?? null,
+      _meta: (r as Record<string, unknown>).rawMeta ?? null,
+    };
   }
 
   // ── list_tools: keep as plain array (consumers iterate or use .data)
@@ -1195,27 +1497,27 @@ export async function invokeMapped<T>(command: string, args: Record<string, unkn
       return { success: false, message: `Group '${id}' not found` } as T;
     }
     const currentServers = Array.isArray(group.servers) ? (group.servers as unknown[]) : [];
-    const namesOf = (list: unknown[]): string[] =>
-      list
-        .map(s => (typeof s === 'string' ? s : (s as { name?: string })?.name ?? ''))
-        .filter(Boolean);
-    let nextNames: string[];
+    const nameOf = (s: unknown): string =>
+      typeof s === 'string' ? s : ((s as { name?: string })?.name ?? '');
+    // Preserve the FULL member objects (strings stay strings, config objects
+    // keep url/headers/...) — collapsing to bare names silently dropped
+    // per-member config when adding/removing a single member.
+    let nextServers: unknown[];
     if (command === '__group_add_server__') {
       const sn = String(args.serverName ?? '');
-      const set = new Set(namesOf(currentServers));
-      if (sn) set.add(sn);
-      nextNames = Array.from(set);
+      const exists = currentServers.some(s => nameOf(s) === sn);
+      nextServers = exists ? [...currentServers] : sn ? [...currentServers, { name: sn }] : [...currentServers];
     } else if (command === '__group_remove_server__') {
       const sn = String(args.serverName ?? '');
-      nextNames = namesOf(currentServers).filter(n => n !== sn);
+      nextServers = currentServers.filter(s => nameOf(s) !== sn);
     } else {
-      // For __group_update_servers__, preserve the full config format
-      nextNames = namesOf((args.servers as unknown[]) ?? []);
+      // For __group_update_servers__, use the caller-provided full configs
+      nextServers = (args.servers as unknown[]) ?? [];
     }
     const payload = {
       name: group.name,
       description: group.description,
-      servers: command === '__group_update_servers__' ? (args.servers as unknown[] ?? []) : nextNames,
+      servers: nextServers,
     };
     try {
       const updated = await invoke<Record<string, unknown>>('update_group', {

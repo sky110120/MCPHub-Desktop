@@ -4,9 +4,11 @@ import {
   RagDocInfo,
   RagChunk,
   RagChunkPage,
+  RagFolderScan,
   RagPickedFile,
   RagSettings,
   RagSearchResult,
+  GitSourceError,
   RagStatus,
   RagTagStat,
   RagTagPage,
@@ -14,7 +16,9 @@ import {
   RagModelLimits,
   RagModelInfo,
   RagUpdateCheck,
+  RagOcrStatus,
   BatchPreview,
+  DocSource,
   ApiResponse,
 } from '@/types';
 
@@ -39,14 +43,61 @@ export const listRagDocs = async (): Promise<RagDocInfo[]> => {
   return response.data || [];
 };
 
-/** Get the full content of a document (for MCP and legacy callers). */
+/** Read the exclusion registry: absolute paths (or directories) the update
+ *  pipeline ignores (no re-index, no source-sync add/remove). */
+export const listRagExcludedPaths = async (): Promise<string[]> => {
+  const response: ApiResponse<string[]> = await apiGet('/rag/excluded-paths');
+  if (!response.success) throw new Error(response.message || 'Failed to list excluded paths');
+  return response.data || [];
+};
+
+/** Replace the exclusion registry wholesale. Returns the stored list. */
+export const setRagExcludedPaths = async (paths: string[]): Promise<string[]> => {
+  const response: ApiResponse<string[]> = await apiPost('/rag/excluded-paths/set', { paths });
+  if (!response.success) throw new Error(response.message || 'Failed to set excluded paths');
+  return response.data || [];
+};
+
+/** The persistent clone directory for a git source URL — the tree view's
+ *  per-source exclude button adds it to the exclusion registry (a dir entry
+ *  prefix-covers every doc of that repo). */
+export const getRagGitCloneDir = async (url: string): Promise<string> => {
+  const response: ApiResponse<string> = await apiGet(
+    `/rag/git-clone-dir?url=${encodeURIComponent(url)}`,
+  );
+  if (!response.success) throw new Error(response.message || 'Failed to get git clone dir');
+  return response.data || '';
+};
+
+/** Set (alias non-empty) or clear (alias empty) a folder/git source's display
+ *  alias. `identity` = folder root path / git URL (sourceRoot / gitUrl from
+ *  the doc list). */
+export const setRagSourceAlias = async (
+  kind: 'folder' | 'git',
+  identity: string,
+  alias: string,
+): Promise<void> => {
+  const response: ApiResponse<null> = await apiPost('/rag/source-alias', {
+    kind,
+    identity,
+    alias,
+  });
+  if (!response.success) throw new Error(response.message || 'Failed to set source alias');
+};
+
+/** Get the full content of a document (for the View dialog). Unpaged — kept
+ *  for the rag_get MCP path; the View dialog uses `getRagDocPaged`. */
 export const getRagDoc = async (id: string): Promise<RagDoc | null> => {
   const response: ApiResponse<RagDoc | null> = await apiGet(`/rag/docs/${encodeURIComponent(id)}`);
   if (!response.success) throw new Error(response.message || 'Failed to get RAG doc');
   return response.data ?? null;
 };
 
-/** Read one UTF-8-safe page of document content for the View dialog. */
+/** Paged doc-detail read for the View dialog: skip `offsetBytes` UTF-8 bytes
+ *  of the decoded content, return up to `limitBytes` more (0 = the user's
+ *  configured docLoadChunkKb page size). The result's truncated / nextOffset /
+ *  contentTotalBytes drive the "load more" button. Prevents loading a huge
+ *  document's whole content at once (which crashed the WebView). */
 export const getRagDocPaged = async (
   id: string,
   offsetBytes: number,
@@ -62,14 +113,17 @@ export const getRagDocPaged = async (
 };
 
 /** Get a document's chunks (index + text, no embeddings) for the "view
- *  chunks" dialog. Requires RAG enabled (chunks live in lancedb). */
+ *  chunks" dialog. Requires RAG enabled (chunks live in lancedb). Unpaged —
+ *  the dialog uses `getRagChunksPaged`. */
 export const getRagChunks = async (id: string): Promise<RagChunk[]> => {
   const response: ApiResponse<RagChunk[]> = await apiPost('/rag/docs/chunks', { id });
   if (!response.success) throw new Error(response.message || 'Failed to get RAG chunks');
   return response.data ?? [];
 };
 
-/** Read a bounded page of document chunks for the View chunks dialog. */
+/** Paginated chunks for the "view chunks" dialog: `offset` chunks skipped,
+ *  then up to `pageSize` returned + the total count, so the UI can auto-load
+ *  the next page on scroll-to-bottom. Requires RAG enabled. */
 export const getRagChunksPaged = async (
   id: string,
   offset: number,
@@ -96,15 +150,17 @@ export const pickRagFiles = async (): Promise<RagPickedFile[]> => {
 };
 
 /**
- * Open the OS folder picker, scan the folder's immediate (non-recursive) file
- * children, and return them as import candidates — same shape as pickRagFiles
- * so the rest of the upload pipeline (per-file upload + progress) is identical.
- * Hidden files + sub-directories are skipped by the backend.
+ * Open the OS folder picker and scan the folder for import candidates,
+ * grouped per sub-directory. `recursive=false` scans only immediate file
+ * children (single root group, the pre-existing behavior); `recursive=true`
+ * walks all descendant directories, skipping dev dirs (folder_ignore.json),
+ * hidden entries, and symlinks, with a 500-file candidate cap. No file bytes
+ * cross the IPC boundary.
  */
-export const pickRagFolder = async (): Promise<RagPickedFile[]> => {
-  const response: ApiResponse<RagPickedFile[]> = await apiPost('/rag/docs/pick-folder', {});
+export const pickRagFolder = async (recursive: boolean): Promise<RagFolderScan> => {
+  const response: ApiResponse<RagFolderScan> = await apiPost('/rag/docs/pick-folder', { recursive });
   if (!response.success) throw new Error(response.message || 'Failed to pick folder');
-  return response.data || [];
+  return response.data || { root: '', skippedDirs: 0, skippedFiles: 0, groups: [], truncated: false };
 };
 
 /**
@@ -118,9 +174,59 @@ export const uploadRagDoc = async (
   filePath: string,
   tags: string[] = [],
   method: 'symlink' | 'copy' = 'symlink',
+  source?: DocSource,
 ): Promise<void> => {
-  const response: ApiResponse = await apiPost('/rag/docs/upload', { filePath, tags, method });
+  const response: ApiResponse = await apiPost('/rag/docs/upload', { filePath, tags, method, source: source ?? null });
   if (!response.success) throw new Error(response.message || 'Failed to upload RAG doc');
+};
+
+/**
+ * Bracket an import batch: `begin` before the per-file upload loop, `end`
+ * when the loop finishes (or is cancelled — the caller's finally block must
+ * always end it). While the session is active the backend defers git-source
+ * refreshes + the auto-update tick so they can't race the in-flight imports,
+ * and a window close asks the loop to stop at the next file boundary
+ * (rag://import-cancel-requested).
+ */
+export const beginRagImportSession = async (): Promise<void> => {
+  const response: ApiResponse = await apiPost('/rag/import-session/begin', {});
+  if (!response.success) throw new Error(response.message || 'Failed to begin import session');
+};
+
+export const endRagImportSession = async (): Promise<void> => {
+  const response: ApiResponse = await apiPost('/rag/import-session/end', {});
+  if (!response.success) throw new Error(response.message || 'Failed to end import session');
+};
+
+/**
+ * Git data source: clone (first time) or refresh the repo into the app-data
+ * clone dir, then scan it with the same candidate rules as the folder picker.
+ * `username`/`password` are optional (public repos pull anonymously). Throws
+ * an `GIT_AUTH_REQUIRED:`-prefixed error when the remote demands credentials.
+ */
+export const pickRagGitRepo = async (
+  url: string,
+  branch?: string,
+  username?: string,
+  password?: string,
+  depth: number = 1,
+): Promise<RagFolderScan> => {
+  const response: ApiResponse<RagFolderScan> = await apiPost('/rag/pick-git', {
+    url,
+    branch: branch ?? '',
+    username: username ?? '',
+    password: password ?? '',
+    depth,
+  });
+  if (!response.success) throw new Error(response.message || 'Failed to fetch git repo');
+  return response.data || { root: '', skippedDirs: 0, skippedFiles: 0, groups: [], truncated: false };
+};
+
+/** Cancel an in-flight git pick/clone (the "取消" button). The pending
+ *  pickRagGitRepo promise then rejects with a PICK_CANCELLED error. */
+export const cancelRagGitPick = async (url: string): Promise<boolean> => {
+  const response: ApiResponse<boolean> = await apiPost('/rag/cancel-git-pick', { url });
+  return response.success ? !!response.data : false;
 };
 
 /** Delete a document: removes its files + vector DB records. For "symlink"
@@ -173,7 +279,23 @@ export const checkRagUpdate = async (id: string): Promise<RagUpdateCheck> => {
 export const previewBatchUpdate = async (): Promise<BatchPreview> => {
   const response: ApiResponse<BatchPreview> = await apiPost('/rag/docs/batch-preview', {});
   if (!response.success) throw new Error(response.message || 'Failed to preview batch update');
-  return response.data ?? { total: 0, toUpdate: 0, skipped: 0, lost: 0 };
+  return response.data ?? { total: 0, toUpdate: 0, skipped: 0, lost: 0, added: 0, removed: 0 };
+};
+
+/** Last recorded git-source refresh failures (no network I/O). Backs the
+ *  batch-update progress dialog's warning icon (click -> error list). */
+export const getGitSourceErrors = async (): Promise<GitSourceError[]> => {
+  const response: ApiResponse<GitSourceError[]> = await apiGet('/rag/git-errors');
+  if (!response.success) throw new Error(response.message || 'Failed to query git source errors');
+  return response.data ?? [];
+};
+
+/** OCR capability probe: upload-dialog pre-flight + the OCR-missing failure
+ *  dialog (Linux needs the external tesseract binary + language packs). */
+export const getOcrStatus = async (): Promise<RagOcrStatus> => {
+  const response: ApiResponse<RagOcrStatus> = await apiGet('/rag/ocr-status');
+  if (!response.success) throw new Error(response.message || 'Failed to get OCR status');
+  return response.data ?? { available: true, platform: '', distro: null, engine: '', missingLangs: [] };
 };
 
 /** Run the batch update in the background: re-index every doc whose source
@@ -182,6 +304,51 @@ export const previewBatchUpdate = async (): Promise<BatchPreview> => {
 export const batchUpdateRagDocs = async (): Promise<void> => {
   const response: ApiResponse = await apiPost('/rag/docs/batch-update', {});
   if (!response.success) throw new Error(response.message || 'Failed to start batch update');
+};
+
+/** Source-level manual update (the tree view's per-source refresh button):
+ *  git — force-refresh the repo's persistent clone; then (both kinds) run the
+ *  source-level sync scoped to this source + re-index its changed docs.
+ *  Runs INLINE (awaited) — progress arrives via the shared
+ *  `rag://batch-update-progress` events. Returns (added, removed, updated). */
+export const refreshRagSource = async (
+  kind: 'git' | 'folder' | 'file',
+  opts: { url?: string; root?: string } = {},
+): Promise<{ added: number; removed: number; updated: number }> => {
+  const response: ApiResponse<[number, number, number]> = await apiPost('/rag/source-update', {
+    kind,
+    url: opts.url ?? '',
+    root: opts.root ?? '',
+  });
+  if (!response.success) throw new Error(response.message || 'Failed to refresh source');
+  const [added = 0, removed = 0, updated = 0] = response.data || [];
+  return { added, removed, updated };
+};
+
+/** Source-scoped batch preview: the confirm-dialog counts for the per-source
+ *  refresh button (same shape as the batch preview, scoped to one source;
+ *  git targets are force-refreshed first so counts reflect the remote). */
+export const previewRagSourceUpdate = async (
+  kind: 'git' | 'folder' | 'file',
+  opts: { url?: string; root?: string } = {},
+): Promise<BatchPreview> => {
+  const response: ApiResponse<BatchPreview> = await apiPost('/rag/source-update/preview', {
+    kind,
+    url: opts.url ?? '',
+    root: opts.root ?? '',
+  });
+  if (!response.success) throw new Error(response.message || 'Failed to preview source update');
+  return (
+    response.data || {
+      total: 0,
+      toUpdate: 0,
+      skipped: 0,
+      lost: 0,
+      added: 0,
+      removed: 0,
+      gitErrors: [],
+    }
+  );
 };
 
 /** Set the absolute tag list for a document (re-indexes its chunks). */
@@ -243,7 +410,8 @@ export const ragDocSearchPaged = async (
   return response.data ?? { items: [], total: 0, page, pageSize };
 };
 
-/** Get RAG search settings (weights + max results + background update settings). */
+/** Get RAG search settings (weights + max results + auto-update + doc page
+ *  size). */
 export const getRagSettings = async (): Promise<RagSettings> => {
   const response: ApiResponse<RagSettings> = await apiGet('/rag/settings');
   if (!response.success) throw new Error(response.message || 'Failed to get RAG settings');
@@ -258,6 +426,8 @@ export const getRagSettings = async (): Promise<RagSettings> => {
       autoUpdateEnabled: false,
       autoUpdateIntervalSecs: 300,
       docLoadChunkKb: 200,
+      sourceSyncAddEnabled: false,
+      sourceSyncRemoveEnabled: true,
     }
   );
 };
@@ -282,10 +452,19 @@ export const getRagTools = async (): Promise<Record<string, unknown>[]> => {
   return response.data ?? [];
 };
 
-/** Reveal a document's file location in the OS file manager. */
-export const openRagFileLocation = async (id: string): Promise<void> => {
-  const response: ApiResponse = await apiPost('/rag/open-location', { id });
+/** Reveal a document's file location in the OS file manager.
+ *  `target: "source"` reveals the ORIGINAL imported file; default/omitted
+ *  reveals the content file (extracted Markdown for PDF/Office/image docs). */
+export const openRagFileLocation = async (id: string, target?: 'source' | 'content'): Promise<void> => {
+  const response: ApiResponse = await apiPost('/rag/open-location', { id, target });
   if (!response.success) throw new Error(response.message || 'Failed to open file location');
+};
+
+/** Open a doc's ORIGINAL source file with the OS default application
+ *  ("view source file" for PDF/Office/image imports). */
+export const openRagSourceFile = async (id: string): Promise<void> => {
+  const response: ApiResponse = await apiPost('/rag/open-source-file', { id });
+  if (!response.success) throw new Error(response.message || 'Failed to open source file');
 };
 
 /**

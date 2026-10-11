@@ -22,9 +22,11 @@ export interface SystemConfig {
     basePacingDelayMs?: number;
     embeddingProvider?: 'openai' | 'azure_openai';
     embeddingEncodingFormat?: 'auto' | 'base64' | 'float';
-    openaiApiBaseUrl?: string;
-    openaiApiKey?: string;
-    openaiApiEmbeddingModel?: string;
+    embeddingDimensions?: number;
+    embeddingDimensionsApiPassthrough?: boolean;
+    llmProviderBaseUrl?: string;
+    llmProviderApiKey?: string;
+    embeddingModel?: string;
     azureOpenaiEndpoint?: string;
     azureOpenaiApiKey?: string;
     azureOpenaiApiVersion?: string;
@@ -43,6 +45,8 @@ export interface SystemConfig {
       enabled?: boolean;
       basePath?: string;
       trustedOrigins?: string[];
+      // Effective value: only true while an SSO provider is enabled
+      disablePasswordLogin?: boolean;
       providers?: {
         google?: {
           enabled?: boolean;
@@ -68,6 +72,7 @@ interface BetterAuthConfig {
   baseUrl?: string;
   basePath?: string;
   trustedOrigins?: string[];
+  disablePasswordLogin?: boolean;
   providers?: {
     google?: {
       enabled?: boolean;

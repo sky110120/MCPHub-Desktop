@@ -4,7 +4,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useAuth } from '@/contexts/AuthContext';
 import { useToast } from '@/contexts/ToastContext';
 import { isTauri } from '@/utils/tauriClient';
-import { BatchPreview, RagChunk, RagDoc, RagDocInfo, RagModelInfo, RagModelLimits, RagPickedFile, RagSettings, RagSearchResult, RagUpdateCheck } from '@/types';
+import { BatchPreview, RagChunk, RagDoc, RagDocInfo, RagFolderScan, RagModelInfo, RagModelLimits, RagOcrStatus, RagPickedFile, RagSettings, RagSearchResult, RagUpdateCheck } from '@/types';
 import {
   listRagDocs,
   getRagSettings,
@@ -15,9 +15,12 @@ import {
   getRagDocPaged,
   getRagChunksPaged,
   uploadRagDoc,
+  beginRagImportSession,
+  endRagImportSession,
   pickRagFiles,
   pickRagFolder,
   openRagFileLocation,
+  openRagSourceFile,
   ragToggle,
   ragStatus,
   searchRagDocs,
@@ -30,6 +33,7 @@ import {
   checkRagUpdate,
   previewBatchUpdate,
   batchUpdateRagDocs,
+  getOcrStatus,
 } from '@/services/ragService';
 
 /**
@@ -52,11 +56,11 @@ const useRagDataState = () => {
   const { showToast } = useToast();
 
   const [ragDocs, setRagDocs] = useState<RagDocInfo[]>([]);
-  // Monotonic refresh signal for paginated consumers. The paginated query
-  // must react to list mutations without depending on `ragDocs` itself:
-  // `fetchDocs` replaces that array on every request, which would otherwise
-  // make the page continuously re-fetch.
-  const [ragDocsRevision, setRagDocsRevision] = useState(0);
+  // 每次 fetchDocs 完成后自增。导入/删除/更新/批量更新等所有变更路径最终都会
+  // 调 fetchDocs(刷新 ragDocs),但页面的真实列表走独立的后端分页查询
+  // (RagPage 的 ragDocSearchPaged effect)——它无法感知 ragDocs 变化。这个
+  // 版本号作为「数据已变」信号暴露出去,分页 effect 把它加入依赖即可联动刷新。
+  const [docsVersion, setDocsVersion] = useState(0);
   const [enabled, setEnabled] = useState(false);
   const [initializing, setInitializing] = useState(false);
   // Target state of an in-flight toggle ('on' | 'off' | null) so the loading
@@ -67,38 +71,64 @@ const useRagDataState = () => {
   // `initializing` (toggle on/off) so the switch can show "切换中" instead of
   // "开启中". Either flag grays out the page.
   const [switchingModel, setSwitchingModel] = useState(false);
-  const [settings, setSettings] = useState<RagSettings>({
-    vectorWeight: 0.9,
-    keywordWeight: 0.1,
-    maxResults: 20,
-    scoreThreshold: 0.65,
-    chunkSize: 0,
-    chunkOverlap: 0,
-    autoUpdateEnabled: false,
-    autoUpdateIntervalSecs: 300,
-    docLoadChunkKb: 200,
-  });
+  const [settings, setSettings] = useState<RagSettings>({ vectorWeight: 0.9, keywordWeight: 0.1, maxResults: 20, scoreThreshold: 0.65, chunkSize: 0, chunkOverlap: 0, autoUpdateEnabled: false, autoUpdateIntervalSecs: 300, docLoadChunkKb: 200, sourceSyncAddEnabled: false, sourceSyncRemoveEnabled: true });
   const [modelLimits, setModelLimits] = useState<RagModelLimits>({ maxContext: 2048 });
   const [viewedDoc, setViewedDoc] = useState<RagDoc | null>(null);
   const [viewLoading, setViewLoading] = useState(false);
-  // True while the next page of a viewed document is loading.
+  // True while a "load more" page of the viewed doc's content is fetching
+  // (drives the spinner on the View dialog's load-more button).
   const [viewMoreLoading, setViewMoreLoading] = useState(false);
-  // "View chunks" dialog: the doc whose chunks are shown + loaded chunks +
-  // the backend-reported total.
+  // "View chunks" dialog: the doc whose chunks are shown + the loaded chunks +
+  // a loading flag while fetching (RAG must be enabled to read lancedb).
+  // Chunks load in pages (5 at a time); `chunksTotal` is the backend-reported
+  // full count so the UI knows when to stop auto-loading on scroll.
   const [chunksDoc, setChunksDoc] = useState<RagDocInfo | null>(null);
   const [chunksList, setChunksList] = useState<RagChunk[]>([]);
   const [chunksTotal, setChunksTotal] = useState(0);
   const [chunksLoading, setChunksLoading] = useState(false);
+  // True while the next chunks page is fetching (scroll-to-bottom auto-load).
   const [chunksMoreLoading, setChunksMoreLoading] = useState(false);
   const [searchResults, setSearchResults] = useState<RagSearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<{ current: number; total: number; name: string } | null>(null);
+  // Elapsed-time tracking for the import overlay: `startedAt` = batch start
+  // (total elapsed), `fileStartedAt` = current file's start (per-file elapsed),
+  // `fileSize` = current file's byte size (drives the "large file" hint).
+  // `tick` re-renders once per second so the mm:ss labels advance. Set by
+  // `upload`/`updateDoc`/`reindexAll`; cleared in their finally blocks.
+  const [uploadTiming, setUploadTiming] = useState<{
+    startedAt: number;
+    fileStartedAt: number;
+    fileSize: number;
+    tick: number;
+  } | null>(null);
+  // One re-render per second while the overlay is up, so elapsed labels tick.
+  // Interval lives only while `uploadTiming` is non-null (no timers otherwise).
+  useEffect(() => {
+    if (!uploadTiming) return;
+    const id = window.setInterval(() => {
+      setUploadTiming((prev) => (prev ? { ...prev, tick: prev.tick + 1 } : prev));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [uploadTiming !== null]);
   // Per-document (character-based) progress, updated from the backend's
   // `rag://upload-progress` event during indexing. `null` outside an upload;
   // the UI shows it as a SECOND bar under the per-file bar. `charsDone` is the
   // number of document characters embedded so far, `charsTotal` the whole doc.
-  const [charProgress, setCharProgress] = useState<{ name: string; charsDone: number; charsTotal: number } | null>(null);
+  // `chunksDone`/`chunksTotal` drive a THIRD bar (chunk-level); total is 0
+  // while still chunking (count unknown) and the UI hides the bar then.
+  // `chunkingDone`/`chunkingTotal` fill the "分片中…" row during the chunking
+  // phase (chars scanned by the chunker, per code AST partition).
+  const [charProgress, setCharProgress] = useState<{
+    name: string;
+    charsDone: number;
+    charsTotal: number;
+    chunksDone: number;
+    chunksTotal: number;
+    chunkingDone: number;
+    chunkingTotal: number;
+  } | null>(null);
   // True while a model-swap-triggered reindex of all docs is running. The
   // upload overlay is reused (same bars); `reindexing` just switches the
   // title text from "uploading" to "reindexing".
@@ -140,12 +170,58 @@ const useRagDataState = () => {
   // itself failed early, e.g. files_dir/read_dir error; the dialog shows the
   // failure state instead of a green "complete" checkmark).
   const [batchUpdateRunning, setBatchUpdateRunning] = useState(false);
+  // OCR-missing dialog: set when an import fails with the `OCR_MISSING:`
+  // sentinel (standalone image import on Linux without tesseract). The page
+  // renders the install-command dialog; dismissed on close.
+  const [ocrMissing, setOcrMissing] = useState<RagOcrStatus | null>(null);
+  const dismissOcrMissing = useCallback(() => setOcrMissing(null), []);
+  // Shared detector: true if `err` carries the OCR_MISSING sentinel —
+  // fetches the platform status and opens the dialog. Returns false when the
+  // error is something else (caller falls back to its toast).
+  const reportOcrMissingIf = useCallback(async (err: unknown): Promise<boolean> => {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.startsWith('OCR_MISSING')) return false;
+    try {
+      const status = await getOcrStatus();
+      if (mounted.current) setOcrMissing(status);
+    } catch {
+      // Status probe failed — still surface the dialog with a minimal stub.
+      if (mounted.current) {
+        setOcrMissing({ available: false, platform: 'linux', distro: null, engine: 'tesseract', missingLangs: [] });
+      }
+    }
+    return true;
+  }, []);
   const [batchProgress, setBatchProgress] = useState<{
     current: number;
     total: number;
     name: string;
-    phase: 'checking' | 'reindexing' | 'done' | 'error';
+    phase: 'checking' | 'sync' | 'reindexing' | 'done' | 'error';
   } | null>(null);
+  // Batch-update elapsed timing: `startedAt` = when the FIRST progress event of
+  // the current pass arrived (works for both the manual button and the timed
+  // auto-update — neither the dialog nor the hook initiated the auto pass, so
+  // the event itself is the only reliable start signal). `fileStartedAt` =
+  // when the current doc's first event arrived (per-doc elapsed); `name` tracks
+  // the doc the clock is for (a name change resets it). `tick` bumps once per
+  // second to re-render the mm:ss labels. Lives HERE (hook level), not in the
+  // dialog component: the dialog can be closed/reopened mid-pass and must NOT
+  // reset the clock on remount. Cleared on terminal phases (done/error).
+  const [batchTiming, setBatchTiming] = useState<{
+    startedAt: number;
+    fileStartedAt: number;
+    name: string;
+    tick: number;
+  } | null>(null);
+  // Per-second tick for the batch dialog's elapsed labels. Lives only while
+  // `batchTiming` is non-null (a pass is in flight).
+  useEffect(() => {
+    if (!batchTiming) return;
+    const id = window.setInterval(() => {
+      setBatchTiming((prev) => (prev ? { ...prev, tick: prev.tick + 1 } : prev));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [batchTiming !== null]);
   const mounted = useRef(true);
 
   const fetchDocs = useCallback(async () => {
@@ -153,12 +229,12 @@ const useRagDataState = () => {
       const data = await listRagDocs();
       if (mounted.current) {
         setRagDocs(data);
-        setRagDocsRevision((revision) => revision + 1);
+        setDocsVersion((v) => v + 1);
       }
     } catch {
       if (mounted.current) {
         setRagDocs([]);
-        setRagDocsRevision((revision) => revision + 1);
+        setDocsVersion((version) => version + 1);
       }
     }
   }, []);
@@ -248,12 +324,21 @@ const useRagDataState = () => {
     let unlistenUpload: UnlistenFn | undefined;
     let unlistenReindex: UnlistenFn | undefined;
     let unlistenDownload: UnlistenFn | undefined;
+    let unlistenInvalidated: (() => void) | undefined;
     let unlistenBatch: UnlistenFn | undefined;
     let cancelled = false;
-    listen<{ name: string; charsDone: number; charsTotal: number }>('rag://upload-progress', (event) => {
+    listen<{ name: string; charsDone: number; charsTotal: number; chunksDone?: number; chunksTotal?: number; chunkingDone?: number; chunkingTotal?: number }>('rag://upload-progress', (event) => {
       const p = event.payload;
       if (!p || !mounted.current) return;
-      setCharProgress({ name: p.name, charsDone: p.charsDone, charsTotal: p.charsTotal });
+      setCharProgress({
+        name: p.name,
+        charsDone: p.charsDone,
+        charsTotal: p.charsTotal,
+        chunksDone: p.chunksDone ?? 0,
+        chunksTotal: p.chunksTotal ?? 0,
+        chunkingDone: p.chunkingDone ?? 0,
+        chunkingTotal: p.chunkingTotal ?? 0,
+      });
     }).then((un) => {
       if (cancelled) un();
       else unlistenUpload = un;
@@ -272,37 +357,76 @@ const useRagDataState = () => {
     });
 
     // Batch-update progress: the backend emits one event per doc (checking /
-    // reindexing phases) + a final "done". Drives the batch-progress dialog's
-    // file-level bar; the char-level sub-bar reuses `rag://upload-progress`
-    // above (reindex_doc emits it). On "done" we clear the running flag + refetch
-    // the doc list (chunk counts / version / md5 changed).
+    // reindexing phases) + a final "done" (or "error" on early failure). Drives
+    // the batch-progress dialog's file-level bar; the char-level sub-bar reuses
+    // `rag://upload-progress` above (reindex_doc emits it). On either terminal
+    // phase we clear the running flag + refetch the doc list (chunk counts /
+    // version / md5 changed; on error a partial pass may still have changed
+    // some docs).
+    //
+    // Any non-terminal event also SETS the running flag: the backend's timed
+    // auto-update pass emits the same events without the frontend having
+    // initiated it, and the header button must flip to "查看进度" for that
+    // pass too (manual + auto share one state).
     listen<{ current: number; total: number; name: string; phase: string }>(
       'rag://batch-update-progress',
       (event) => {
         const p = event.payload;
         if (!p || !mounted.current) return;
         const phase =
-          p.phase === 'checking' || p.phase === 'reindexing' || p.phase === 'done' || p.phase === 'error'
-            ? (p.phase as 'checking' | 'reindexing' | 'done' | 'error')
+          p.phase === 'checking' || p.phase === 'sync' || p.phase === 'reindexing' || p.phase === 'done' || p.phase === 'error'
+            ? (p.phase as 'checking' | 'sync' | 'reindexing' | 'done' | 'error')
             : 'checking';
         setBatchProgress({ current: p.current, total: p.total, name: p.name, phase });
+        // Elapsed timing: the FIRST event of a pass starts the batch clock;
+        // a doc-name change (or the pass's very first event) starts the
+        // per-doc clock. Cleared on terminal phases. Event-driven so the
+        // timed auto-update (which no frontend code initiated) is timed too.
+        setBatchTiming((prev) => {
+          if (phase === 'done' || phase === 'error') return null;
+          if (!prev) return { startedAt: Date.now(), fileStartedAt: Date.now(), name: p.name, tick: 0 };
+          if (p.name && p.name !== prev.name) {
+            return { ...prev, fileStartedAt: Date.now(), name: p.name };
+          }
+          return prev;
+        });
         if (phase === 'done' || phase === 'error') {
-          // A failed batch can still have changed documents before the error,
-          // so refresh after either terminal phase.
+          // Both terminal phases clear the running flag. On either terminal
+          // phase we also refetch the doc list: "done" because chunk counts /
+          // versions / md5 changed, "error" because a partially-applied pass
+          // (some docs re-indexed before the failure) still changed state and
+          // the list must not stay stale. The original code skipped the refetch
+          // on error, which left the list out of sync after a failed batch.
           setBatchUpdateRunning(false);
+          // Slight delay on "done" so the "完成" state is visible before the
+          // dialog clears. On "error" refetch immediately (no success state to
+          // hold the dialog open for). `mounted.current` guards the unmount
+          // race; the fetch itself is best-effort (fetchDocs swallows).
+          const delay = phase === 'done' ? 600 : 0;
           setTimeout(() => {
             if (mounted.current) fetchDocs();
-          }, phase === 'done' ? 600 : 0);
+          }, delay);
         } else {
-          // Auto-update runs in the backend without a frontend trigger. Treat
-          // its progress events like manual batch-update events so the shared
-          // progress dialog and header state stay accurate.
+          // An in-flight pass (manual OR the timed auto-update): the button
+          // shows "查看进度" so the user can open the shared progress dialog.
           setBatchUpdateRunning(true);
         }
       },
     ).then((un) => {
       if (cancelled) un();
       else unlistenBatch = un;
+    });
+
+    // Backend nudge: the timed auto-update's IDLE pass found docs whose
+    // original vanished (nothing to update/import/remove, so no progress
+    // events were emitted). The "原始丢失" badge is computed at list time —
+    // refetch the list so it appears without a manual page refresh. List-only
+    // refresh: no dialog, no button state.
+    listen<number>('rag://docs-invalidated', () => {
+      if (mounted.current) fetchDocs();
+    }).then((un) => {
+      if (cancelled) un();
+      else unlistenInvalidated = un;
     });
 
     // Model download progress (download.url -> .zip extract). Drives the
@@ -344,6 +468,7 @@ const useRagDataState = () => {
       unlistenReindex?.();
       unlistenDownload?.();
       unlistenBatch?.();
+      unlistenInvalidated?.();
     };
   }, [fetchModels]);
 
@@ -377,6 +502,8 @@ const useRagDataState = () => {
     setUploading(true);
     setUploadProgress({ current: 0, total: 0, name: '' });
     setCharProgress(null);
+    const startedAt = Date.now();
+    setUploadTiming({ startedAt, fileStartedAt: startedAt, fileSize: 0, tick: 0 });
     try {
       const done = await reindexAllRag();
       console.log('[RAG] reindexAll: backend returned', done);
@@ -394,6 +521,7 @@ const useRagDataState = () => {
         setUploading(false);
         setUploadProgress(null);
         setCharProgress(null);
+        setUploadTiming(null);
       }
     }
   }, [fetchDocs, t, showToast]);
@@ -534,46 +662,117 @@ const useRagDataState = () => {
       if (files.length === 0) return { success: 0, failed: 0 };
       setUploading(true);
       setUploadProgress({ current: 0, total: files.length, name: files[0].name });
+      const batchStart = Date.now();
+      setUploadTiming({ startedAt: batchStart, fileStartedAt: batchStart, fileSize: files[0].size ?? 0, tick: 0 });
       // Reset the per-document bar at the start of each batch; the backend
       // emits fresh events as each file is indexed.
       setCharProgress(null);
       let success = 0;
       let failed = 0;
+      // Aggregate failure reasons instead of toasting per file — a 100-file
+      // batch must not flood the screen. Toast shows a summary (first few
+      // distinct reasons + totals) at the end; full details go to console.
+      const failureLines: string[] = [];
+      let ocrMissingShown = false;
+      // Window closed mid-import: the backend emits rag://import-cancel-requested
+      // so the loop stops at the next file boundary. Only the files that
+      // actually finished importing stay in the doc list; the rest are NOT
+      // imported (closing the window mid-import means "cancel the remainder",
+      // not "keep importing in the hidden tray webview").
+      let importCancelled = false;
+      let unlistenImportCancel: UnlistenFn | undefined;
       try {
+        // Register the cancel listener BEFORE opening the session — the
+        // close-to-tray handler only emits while a session is active, so
+        // this ordering guarantees no emitted event can fall into a gap
+        // before the listener exists.
+        if (isTauri()) {
+          unlistenImportCancel = await listen('rag://import-cancel-requested', () => {
+            importCancelled = true;
+          });
+        }
+        // Session bracket: while active the backend defers git refreshes +
+        // the auto-update tick (no persistent-clone swap racing per-file
+        // imports, no source-sync importing the files this loop handles).
+        // Best-effort: a bracket failure (e.g. web dev mode) must not break
+        // the actual import.
+        await beginRagImportSession().catch((e) =>
+          console.warn('[RAG] begin import session failed:', e),
+        );
         for (let i = 0; i < files.length; i++) {
-          if (!mounted.current) break;
+          if (!mounted.current || importCancelled) break;
           setUploadProgress({ current: i, total: files.length, name: files[i].name });
+          setUploadTiming((prev) =>
+            prev ? { ...prev, fileStartedAt: Date.now(), fileSize: files[i].size ?? 0 } : prev,
+          );
           // Drop the previous file's char progress so the second bar restarts
           // from 0 for the next file (the backend pushes the new file's events
           // once its embedding begins).
-          setCharProgress({ name: files[i].name, charsDone: 0, charsTotal: 0 });
+          setCharProgress({ name: files[i].name, charsDone: 0, charsTotal: 0, chunksDone: 0, chunksTotal: 0, chunkingDone: 0, chunkingTotal: 0 });
           try {
-            await uploadRagDoc(files[i].path, tags, method);
+            await uploadRagDoc(files[i].path, tags, method, files[i].source);
             success++;
           } catch (err) {
             failed++;
             if (!mounted.current) break;
             const msg = err instanceof Error ? err.message : String(err);
-            if (msg.startsWith('UNSUPPORTED_FORMAT')) {
-              showToast(t('pages.rag.unsupportedFile', { name: files[i].name }), 'error');
+            if (msg.startsWith('OCR_MISSING')) {
+              // No OCR engine on this platform -> dialog with install
+              // commands (once per batch, not per file).
+              if (!ocrMissingShown) {
+                ocrMissingShown = true;
+                await reportOcrMissingIf(err);
+              }
+            } else if (msg.startsWith('UNSUPPORTED_FORMAT')) {
+              failureLines.push(`${files[i].name}: ${msg.replace('UNSUPPORTED_FORMAT:', '').trim()}`);
+            } else if (msg.startsWith('EXTRACT_FAILED')) {
+              // Supported document kind but extraction produced nothing
+              // usable — keep the backend's concrete reason (e.g. scanned
+              // PDF without a text layer).
+              const reason = msg.split(':').slice(1).join(':').trim();
+              failureLines.push(`${files[i].name}: ${reason}`);
             } else {
-              showToast(`${t('pages.rag.uploadFailedFile', { name: files[i].name })}: ${msg}`, 'error');
+              failureLines.push(`${files[i].name}: ${msg}`);
             }
             console.error('[RAG] upload failed for', files[i].name, err);
           }
         }
         setUploadProgress({ current: files.length, total: files.length, name: '' });
+        if (importCancelled) {
+          console.log(
+            `[RAG] import cancelled by window close — ${success} of ${files.length} file(s) imported; the rest were skipped`,
+          );
+        }
         await fetchDocs();
+        if (failed > 0) {
+          const MAX_LINES = 5;
+          const shown = failureLines.slice(0, MAX_LINES).join('\n');
+          const more =
+            failureLines.length > MAX_LINES
+              ? `\n…${t('pages.rag.andMoreFailures', { count: failureLines.length - MAX_LINES })}`
+              : '';
+          showToast(
+            `${t('pages.rag.uploadSummary', { success, failed })}\n${shown}${more}`,
+            'error',
+          );
+        }
       } finally {
+        unlistenImportCancel?.();
         if (mounted.current) {
           setUploading(false);
           setUploadProgress(null);
           setCharProgress(null);
+          setUploadTiming(null);
         }
+        // Always end the session, even on cancel/error — a leaked session
+        // would block git refreshes + auto-update ticks until app restart.
+        // Awaited LAST so a new upload() starting right after this finally
+        // cannot race its begin past this end.
+        await endRagImportSession().catch((e) => console.warn('[RAG] end import session failed:', e));
       }
       return { success, failed };
     },
-    [fetchDocs],
+    [fetchDocs, reportOcrMissingIf],
   );
 
   const pickFiles = useCallback(async (): Promise<RagPickedFile[]> => {
@@ -585,13 +784,15 @@ const useRagDataState = () => {
   }, []);
 
   // Pick a folder: the backend opens the OS folder picker and scans the
-  // folder's immediate file children (non-recursive). Returns the same shape
-  // as `pickFiles` so the upload loop + dedup merge identically.
-  const pickFolder = useCallback(async (): Promise<RagPickedFile[]> => {
+  // folder — immediate file children only when `recursive` is false, all
+  // descendant dirs when true (dev dirs / hidden entries / symlinks skipped,
+  // 500-file cap). Returns a grouped result the Upload dialog renders as a
+  // tree; multi-file picks are folded into the same shape by the page.
+  const pickFolder = useCallback(async (recursive: boolean): Promise<RagFolderScan> => {
     try {
-      return await pickRagFolder();
+      return await pickRagFolder(recursive);
     } catch {
-      return [];
+      return { root: '', skippedDirs: 0, skippedFiles: 0, groups: [], truncated: false };
     }
   }, []);
 
@@ -608,7 +809,17 @@ const useRagDataState = () => {
       setUploading(true);
       setUpdatingDoc(true);
       setUploadProgress({ current: 0, total: 1, name });
-      setCharProgress({ name, charsDone: 0, charsTotal: 0 });
+      setCharProgress({ name, charsDone: 0, charsTotal: 0, chunksDone: 0, chunksTotal: 0, chunkingDone: 0, chunkingTotal: 0 });
+      const startedAt = Date.now();
+      setUploadTiming({ startedAt, fileStartedAt: startedAt, fileSize: 0, tick: 0 });
+      // Import-session bracket (same as batch upload): while a single-doc
+      // update runs, the backend defers git refreshes + the auto-update tick.
+      // Without this, the 60s auto tick's git re-clone (~60s+ of network/CPU)
+      // races the update's chunking + embedding and stretches it severalfold
+      // (measured: a 37s chunk+embed took 5min with clones interleaved).
+      await beginRagImportSession().catch((e) =>
+        console.warn('[RAG] begin import session (update) failed:', e),
+      );
       try {
         await updateRagDoc(id, opts);
         setUploadProgress({ current: 1, total: 1, name });
@@ -618,6 +829,18 @@ const useRagDataState = () => {
         setUpdatingDoc(false);
         setUploadProgress(null);
         setCharProgress(null);
+        setUploadTiming(null);
+        // Always end the session, even on error (same rationale as upload).
+        await endRagImportSession().catch((e) =>
+          console.warn('[RAG] end import session (update) failed:', e),
+        );
+        // Refresh in `finally` regardless of success: the backend re-index
+        // (reindex_doc) returns once chunks are re-embedded, and even on error
+        // the on-disk meta/version may have partially changed. Without this, a
+        // thrown update (error swallowed into {success:false} by apiRequest ->
+        // updateRagDoc re-throws) left the row showing the old version/md5,
+        // which is the "file list doesn't update after single update" symptom.
+        await fetchDocs();
       }
     },
     [fetchDocs],
@@ -643,16 +866,27 @@ const useRagDataState = () => {
     if (batchUpdateRunning) return;
     setBatchUpdateRunning(true);
     setBatchProgress({ current: 0, total: 0, name: '', phase: 'checking' });
+    const startedAt = Date.now();
+    setBatchTiming({ startedAt, fileStartedAt: startedAt, name: '', tick: 0 });
     try {
       await batchUpdateRagDocs();
     } catch (err) {
-      if (mounted.current) setBatchUpdateRunning(false);
+      if (mounted.current) {
+        setBatchUpdateRunning(false);
+        setBatchTiming(null);
+      }
       throw err;
     }
   }, [batchUpdateRunning]);
 
   const remove = useCallback(
     async (id: string) => {
+      // Refresh in `finally` regardless of success: the backend delete_doc
+      // returns once the doc's vectors are removed (the slow lancedb Prune now
+      // runs deferred in the background), so even on error the on-disk state
+      // may have partially changed and the list should be re-read. Without this
+      // a thrown delete (error swallowed into {success:false} by apiRequest ->
+      // deleteRagDoc re-throws) would skip fetchDocs and the row would linger.
       try {
         await deleteRagDoc(id);
       } finally {
@@ -663,7 +897,15 @@ const useRagDataState = () => {
   );
 
   // Batch delete: delete each doc by id, then refresh the list once. Each
-  // delete also reclaims lancedb vectors on the backend (see delete_doc).
+  // delete also reclaims lancedb vectors on the backend (the Prune is deduped
+  // + deferred, so a 50-doc burst prunes once, not 50× — see delete_doc).
+  //
+  // Tolerates per-item failures: one bad id (e.g. meta already gone, or a
+  // transient lock error) must NOT abort the remaining deletes AND skip the
+  // final refresh (which left the list stale — the original symptom). Each
+  // failure is collected + re-thrown AFTER the refresh so the caller can still
+  // surface an error toast, but the list always reflects what actually got
+  // deleted.
   const removeMany = useCallback(
     async (ids: string[]) => {
       const failures: string[] = [];
@@ -671,51 +913,64 @@ const useRagDataState = () => {
         for (const id of ids) {
           try {
             await deleteRagDoc(id);
-          } catch (error) {
-            failures.push(`${id}: ${error instanceof Error ? error.message : String(error)}`);
+          } catch (e) {
+            failures.push(`${id}: ${e instanceof Error ? e.message : String(e)}`);
           }
         }
       } finally {
+        // Always refresh: even if every delete threw, a prior partial delete
+        // (the IPC returned {success:false} but the backend had already
+        // removed the .meta) means the list is stale.
         await fetchDocs();
       }
       if (failures.length > 0) {
-        throw new Error(`Failed to delete ${failures.length} of ${ids.length} document(s): ${failures.join('; ')}`);
+        throw new Error(`Failed to delete ${failures.length} of ${ids.length} doc(s): ${failures.join('; ')}`);
       }
     },
     [fetchDocs],
   );
 
-  // Load only the first page for the View dialog. The backend applies the
-  // configured docLoadChunkKb when limitBytes is zero.
+  // Open the View dialog with the FIRST page of the doc's content (paged by
+  // the user's docLoadChunkKb setting — limitBytes 0 lets the backend apply
+  // it). Further pages come from `loadMoreView` until truncated=false.
   const view = useCallback(async (id: string) => {
     setViewLoading(true);
     try {
       const doc = await getRagDocPaged(id, 0, 0);
-      if (mounted.current) setViewedDoc(doc);
+      setViewedDoc(doc);
     } finally {
       if (mounted.current) setViewLoading(false);
     }
   }, []);
 
+  // Fetch the next page of the viewed doc's content (the "load more" button):
+  // reads from the doc's nextOffset (end of what's loaded so far) and APPENDS
+  // to the loaded content. A no-op when nothing is viewed / already complete.
+  // `viewFetchingRef` is a synchronous lock (refs update immediately, unlike
+  // state) so rapid double-clicks / stacked scroll events can't fire two
+  // fetches for the same page before the re-render lands.
   const viewFetchingRef = useRef(false);
   const loadMoreView = useCallback(async () => {
     const doc = viewedDoc;
-    if (!doc?.truncated || viewFetchingRef.current) return;
+    if (!doc || !doc.truncated) return;
+    if (viewFetchingRef.current) return;
     viewFetchingRef.current = true;
     setViewMoreLoading(true);
     try {
       const next = await getRagDocPaged(doc.id, doc.nextOffset ?? 0, 0);
       if (next && mounted.current) {
-        setViewedDoc((previous) => {
-          if (!previous || previous.id !== next.id) return previous;
-          return {
-            ...next,
-            content: previous.content + next.content,
-            // Keep the local tag edit visible while the page request is in
-            // flight; tag persistence is handled by the existing callback.
-            tags: previous.tags,
-          };
-        });
+        setViewedDoc((prev) =>
+          prev && prev.id === next.id
+            ? {
+                ...next,
+                // Append: the page's content is the NEXT slice, not a
+                // replacement. Everything else (truncated/nextOffset/totals)
+                // comes fresh from this response.
+                content: prev.content + next.content,
+                tags: prev.tags,
+              }
+            : prev,
+        );
       }
     } finally {
       viewFetchingRef.current = false;
@@ -725,26 +980,32 @@ const useRagDataState = () => {
 
   const closeView = useCallback(() => setViewedDoc(null), []);
 
+  // Fetch a document's chunks (for the "view chunks" dialog) — first page
+  // only (5 chunks). RAG must be enabled (chunks live in lancedb); the
+  // backend errors otherwise - we surface it as a toast and don't open the
+  // dialog. Further pages auto-load on scroll via `loadMoreChunks`.
   const CHUNKS_PAGE_SIZE = 5;
-  // Load the first chunk page. Further pages are fetched on scroll-to-bottom.
-  const viewChunks = useCallback(async (doc: RagDocInfo) => {
-    setChunksLoading(true);
-    setChunksList([]);
-    setChunksTotal(0);
-    setChunksDoc(doc);
-    try {
-      const page = await getRagChunksPaged(doc.id, 0, CHUNKS_PAGE_SIZE);
-      if (mounted.current) {
-        setChunksList(page.items);
-        setChunksTotal(page.total);
+  const viewChunks = useCallback(
+    async (doc: RagDocInfo) => {
+      setChunksLoading(true);
+      setChunksList([]);
+      setChunksTotal(0);
+      setChunksDoc(doc);
+      try {
+        const page = await getRagChunksPaged(doc.id, 0, CHUNKS_PAGE_SIZE);
+        if (mounted.current) {
+          setChunksList(page.items);
+          setChunksTotal(page.total);
+        }
+      } catch (e) {
+        showToast(e instanceof Error ? e.message : 'Failed to load chunks', 'error');
+        if (mounted.current) setChunksDoc(null);
+      } finally {
+        if (mounted.current) setChunksLoading(false);
       }
-    } catch (e) {
-      showToast(e instanceof Error ? e.message : 'Failed to load chunks', 'error');
-      if (mounted.current) setChunksDoc(null);
-    } finally {
-      if (mounted.current) setChunksLoading(false);
-    }
-  }, [showToast]);
+    },
+    [showToast],
+  );
 
   const chunksFetchingRef = useRef(false);
   const loadMoreChunks = useCallback(async () => {
@@ -773,8 +1034,12 @@ const useRagDataState = () => {
     setChunksTotal(0);
   }, []);
 
-  const openLocation = useCallback(async (id: string) => {
-    await openRagFileLocation(id);
+  const openLocation = useCallback(async (id: string, target?: 'source' | 'content') => {
+    await openRagFileLocation(id, target);
+  }, []);
+
+  const openSourceFile = useCallback(async (id: string) => {
+    await openRagSourceFile(id);
   }, []);
 
   const search = useCallback(async (query: string, tags: string[] = []) => {
@@ -806,7 +1071,7 @@ const useRagDataState = () => {
   return {
     t,
     ragDocs,
-    ragDocsRevision,
+    docsVersion,
     enabled,
     initializing,
     togglingTo,
@@ -822,6 +1087,7 @@ const useRagDataState = () => {
     uploading,
     uploadProgress,
     charProgress,
+    uploadTiming,
     reindexing,
     updatingDoc,
     reindexConfirm,
@@ -851,6 +1117,7 @@ const useRagDataState = () => {
     loadMoreChunks,
     closeChunks,
     openLocation,
+    openSourceFile,
     search,
     setTags,
     updateSettings,
@@ -860,6 +1127,11 @@ const useRagDataState = () => {
     batchUpdate,
     batchUpdateRunning,
     batchProgress,
+    batchTiming,
+    // OCR-missing dialog (image/PDF/Office imports on Linux w/o tesseract).
+    ocrMissing,
+    dismissOcrMissing,
+    reportOcrMissingIf,
     refresh: fetchDocs,
   };
 };

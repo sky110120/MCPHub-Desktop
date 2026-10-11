@@ -2,6 +2,19 @@
 @import 'tailwindcss';
 @custom-variant dark (&:where(.dark, .dark *));
 
+@layer base {
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+}
+
+/* 【模型和向量】设置区：共享运行时未启动时，模型切换/运行设备等设置禁用 */
+.mv-disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
 /* ----- redesign tokens (hairline borders, Linear-style density) ----- */
 :root {
   --hub-bg: oklch(0.985 0.002 250);
@@ -91,7 +104,7 @@
 .hub-tag {
   display: inline-flex;
   align-items: center;
-  padding: 1px 7px;
+  padding: 2px 8px;
   border-radius: 5px;
   font-size: 11px;
   color: var(--hub-ink-2);
@@ -143,6 +156,8 @@
   gap: 6px;
   height: 30px;
   padding: 0 12px;
+  white-space: nowrap;
+  flex-shrink: 0;
   border-radius: 7px;
   border: 1px solid var(--hub-line);
   background: var(--hub-surface);
@@ -426,34 +441,41 @@
 /* Endpoint copy box */
 .hub-endpoint {
   display: flex;
-  align-items: center;
+  align-items: stretch;
   gap: 0;
   border: 1px solid var(--hub-line);
   border-radius: 8px;
   background: var(--hub-bg-2);
   /* overflow: visible so the copy dropdown (an absolutely-positioned child of
      the button) can extend below the row. URL truncation is handled by
-     .hub-endpoint-url's own overflow:hidden + ellipsis, not by the parent. */
+     .hub-endpoint-url's own overflow rules, not by the parent. */
   overflow: visible;
   min-width: 0;
-  height: 32px;
+  /* No fixed height anywhere in this component: the row is content-driven
+     with a min-height floor. Fixed heights + height:100% children deadlock
+     WKWebView's cyclic-percentage resolution and pin the row height even
+     when the URL wraps. */
+  min-height: 32px;
 }
 .hub-endpoint .hub-endpoint-label {
   padding: 0 10px;
-  height: 100%;
   display: flex;
   align-items: center;
   border-right: 1px solid var(--hub-line);
   font-size: 11px;
   color: var(--hub-ink-3);
   font-family: var(--hub-mono);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+  /* No text-transform: the label IS a URL path fragment (/mcp/, /api/) —
+     uppercasing it misrepresents the actual endpoint casing. */
+  letter-spacing: 0.02em;
   flex: 0 0 auto;
 }
 .hub-endpoint .hub-endpoint-url {
   flex: 1;
-  padding: 0 10px;
+  /* 6px vertical padding is the *constant* visual padding: single-line rows sit
+     on the 32px min-height (text vertically centered, ≈6px top/bottom), and
+     multi-line rows grow to 2*line-height + 12px so the padding never compresses. */
+  padding: 6px 10px;
   font-family: var(--hub-mono);
   font-size: 12.5px;
   color: var(--hub-ink-2);
@@ -462,10 +484,12 @@
   text-overflow: ellipsis;
   min-width: 0;
   letter-spacing: -0.01em;
+  display: flex;
+  align-items: center;
 }
 .hub-endpoint .hub-endpoint-copy {
   border-radius: 0;
-  height: 100%;
+  align-self: stretch;
   width: 32px;
   border-left: 1px solid var(--hub-line);
   color: var(--hub-ink-3);
@@ -480,6 +504,30 @@
 }
 .hub-endpoint .hub-endpoint-copy:hover { background: var(--hub-surface-hover); }
 .hub-endpoint .hub-endpoint-copy.copied { color: var(--hub-ok); }
+
+/* URL + copy buttons form one unbreakable flex unit inside the row.
+   Stretch fills the row height (single-line rows = 32px); no height:100%
+   anywhere so WKWebView's cyclic-percentage quirk can't pin the height. */
+.hub-endpoint-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  align-self: stretch;
+}
+.hub-endpoint-actions {
+  height: auto;
+  align-self: stretch;
+}
+/* Dashboard endpoint cards: keep the original label-left / URL-right row, but
+   let the URL section wrap onto multiple lines when the column is narrow so
+   long URLs stay fully readable (no ellipsis truncation). Opt-in className. */
+.hub-endpoint.hub-endpoint-wrap .hub-endpoint-url {
+  white-space: normal;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
 
 /* Generic Settings page field rows — flatten heavy gray bg to hair-line */
 /* Only inside the settings page body, scoped via .page-card descendants */
@@ -594,7 +642,7 @@
 .btn-primary {
   background: var(--hub-ink) !important;
   color: var(--hub-bg) !important;
-  border: 1px solid var(--hub-ink) !important;
+  border: 1px solid transparent !important;
   border-radius: 7px !important;
   box-shadow: none !important;
   transition: background 0.15s ease !important;
@@ -609,7 +657,7 @@
 .dark .btn-primary {
   background: var(--hub-ink) !important;
   color: oklch(0.18 0.005 250) !important;
-  border-color: var(--hub-ink) !important;
+  border-color: transparent !important;
 }
 .dark .btn-primary:hover {
   background: oklch(0.92 0.005 250) !important;
@@ -847,7 +895,7 @@ textarea.form-input:focus {
 body {
   margin: 0;
   font-family:
-    'Inter',
+    system-ui,
     'PingFang SC',
     -apple-system,
     BlinkMacSystemFont,
@@ -1401,6 +1449,14 @@ button.text-white.is-loading::after {
   to { transform: rotate(360deg); }
 }
 
+/* Indeterminate progress bar: a half-width bar sweeps left→right→left.
+   Used by the update-check confirm dialog's scan phase (no known total). */
+@keyframes hub-indeterminate {
+  0% { margin-left: -40%; }
+  50% { margin-left: 60%; }
+  100% { margin-left: -40%; }
+}
+
 /* Custom checkbox — reliable across WKWebView (accent-color is unreliable there).
    appearance:none removes the native control; :checked paints a blue box + white tick. */
 .hub-checkbox {
@@ -1437,4 +1493,24 @@ button.text-white.is-loading::after {
 .hub-checkbox:focus-visible {
   outline: none;
   box-shadow: 0 0 0 2px var(--hub-surface), 0 0 0 3px #2563eb;
+}
+
+@keyframes toast-in {
+  from { transform: translateX(24px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+.animate-toast-in { animation: toast-in 0.25s ease-out; }
+
+/* ── RAG 页窄窗口响应式（rag-col-* 列逐级隐藏） ─────────────────────────
+   文档行的 大小/分块/时间 列固定宽度 + 操作按钮列共 ~484px，窄窗口时把
+   名称列压到重叠（用户截图反馈）。按 时间→大小→分块 的信息优先级逐级
+   隐藏次要列，名称 + 操作列始终完整可见。表头同一组类名同步隐藏。 */
+@media (max-width: 1180px) {
+  .rag-col-time { display: none !important; }
+}
+@media (max-width: 1010px) {
+  .rag-col-size { display: none !important; }
+}
+@media (max-width: 900px) {
+  .rag-col-chunks { display: none !important; }
 }

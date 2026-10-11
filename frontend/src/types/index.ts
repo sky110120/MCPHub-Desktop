@@ -267,16 +267,30 @@ export interface RagDoc {
   /** True iff the recorded originalPath is missing on disk (both symlink +
    *  copy count — the ⚠️ badge + auto-update skip apply to both). */
   lostOriginal?: boolean;
+  /** True iff the doc's originalPath is in the exclusion registry (see
+   *  RagDocInfo.excluded). */
+  excluded?: boolean;
   /** True iff the doc's content is readable right now (symlink = original
    *  exists; copy = the rag/files copy exists). View/open-location are gated
    *  on this — a copy doc whose original vanished still has its copy. */
   contentAvailable?: boolean;
-  /** Whether `content` is only the currently loaded page. */
+  /** True iff `content` is only a prefix of the full document (paged read via
+   *  `get_rag_doc_paged`). Drives the "load more" button in the View dialog. */
   truncated?: boolean;
-  /** UTF-8 byte offset to use when loading the next content page. */
+  /** UTF-8 byte offset of the END of the returned `content` within the full
+   *  document — pass back as the offset for the next page. */
   nextOffset?: number;
-  /** Full decoded document size in UTF-8 bytes. */
+  /** Total size of the full decoded content in UTF-8 bytes (independent of how
+   *  much was returned) — for the "已加载 X / 全部 Y KB" hint. */
   contentTotalBytes?: number;
+  /** Data-source display fields (kind "file"|"folder"|"git"|"tool" + label +
+   *  root + rel dir chain + git url/branch). Legacy docs classify as "file". */
+  sourceKind?: string;
+  sourceLabel?: string;
+  sourceRoot?: string;
+  relPath?: string;
+  gitUrl?: string;
+  gitBranch?: string;
 }
 
 // Document metadata for the list view (no content).
@@ -306,10 +320,52 @@ export interface RagDocInfo {
   /** True iff the recorded originalPath is missing on disk (both symlink +
    *  copy count — the ⚠️ badge + auto-update skip apply to both). */
   lostOriginal?: boolean;
+  /** True iff the doc's originalPath is in the exclusion registry — all
+   *  update paths (batch/auto/single check + source sync add/remove) ignore
+   *  it. The UI shows a badge + a toggle to re-include. */
+  excluded?: boolean;
   /** True iff the doc's content is readable right now (symlink = original
    *  exists; copy = the rag/files copy exists). View/open-location are gated
    *  on this — a copy doc whose original vanished still has its copy. */
   contentAvailable?: boolean;
+  /** Data-source display fields (see RagDoc) — tree-view grouping input. */
+  sourceKind?: string;
+  sourceLabel?: string;
+  sourceRoot?: string;
+  relPath?: string;
+  gitUrl?: string;
+  gitBranch?: string;
+}
+
+/** Git remote info attached to a doc's data source (kind = "git"). */
+export interface GitSourceInfo {
+  url: string;
+  branch?: string;
+  commit?: string;
+  subdir?: string;
+}
+
+/** Where a document came from ("data source"). Sent with uploads; persisted
+ *  in the doc meta by the backend. Legacy docs (no source) read back as
+ *  kind "file" — the tree view groups them under the file-pick node. */
+export interface DocSource {
+  /** "file" | "folder" | "git" | "tool" */
+  kind: string;
+  /** Display label for the source node in the tree view. */
+  label: string;
+  /** Source root (absolute dir / clone dir). */
+  root?: string;
+  /** Directory chain relative to root ("/"-separated, "" = root level). */
+  relPath?: string;
+  git?: GitSourceInfo;
+}
+
+/** Paged searchable filter options (desktop: Tauri backend get_activity_filter_options). */
+export interface FilterOptionsPage {
+  options: string[];
+  total: number;
+  page: number;
+  pageSize: number;
 }
 
 /** Single-doc update check result (drives the per-row UpdateDialog branches). */
@@ -327,14 +383,50 @@ export interface RagUpdateCheck {
   originalChanged: boolean;
   /** True iff symlink method + originalPath missing (UI: manual-upload only). */
   lostOriginal: boolean;
+  /** True iff the doc's originalPath is in the exclusion registry — the
+   *  UpdateDialog explains why auto-update is off + offers to re-include. */
+  excluded?: boolean;
+  /** Git source refresh failure (credentials revoked / address moved). The
+   *  md5 check above may be against a stale clone. */
+  gitError?: GitSourceError | null;
+}
+
+/** One git repo's refresh failure (batch preview / per-doc update check). */
+export interface GitSourceError {
+  url: string;
+  branch: string;
+  /** True = credentials problem (re-enter them); false = not found / network. */
+  auth: boolean;
+  message: string;
+}
+
+/** OCR capability report from the backend (get_ocr_status command). */
+export interface RagOcrStatus {
+  /** Whether OCR can run at all on this machine. */
+  available: boolean;
+  /** "macos" | "windows" | "linux". */
+  platform: string;
+  /** Linux distro id from /etc/os-release (drives the install-command pick). */
+  distro?: string | null;
+  /** Human-readable engine name ("Apple Vision" / "Windows.Media.Ocr" / "tesseract"). */
+  engine: string;
+  /** Missing tesseract language packs (Linux only). */
+  missingLangs: string[];
 }
 
 /** Batch-update preview counts (shown in the confirm dialog). */
 export interface BatchPreview {
-  total: number;
-  toUpdate: number;
+  total: number;  toUpdate: number;
   skipped: number;
   lost: number;
+  /** Files detected in folder/git sources that no doc references -> will be imported. */
+  added: number;
+  /** Docs whose source file vanished from a known folder/git source -> will be removed. */
+  removed: number;
+  /** Docs in the exclusion registry — deliberately ignored by this batch. */
+  excluded?: number;
+  /** Per-repo git refresh failures (credentials revoked / address moved). */
+  gitErrors?: GitSourceError[];
 }
 
 // RAG search settings: weights applied to hybrid search scoring.
@@ -351,12 +443,23 @@ export interface RagSettings {
   /** Chunk overlap in tokens. `0` = "auto" — use the model's deploy.json
    * `chunkOverlap` (else 100). A positive value is an explicit override. */
   chunkOverlap: number;
-  /** Periodic source-file check and re-index. Disabled by default on desktop. */
+  /** Auto doc update: periodically re-check every doc's recorded original
+   *  (md5) and re-index changed docs in the background — same pass as the
+   *  manual "批量更新" button. Default true. */
   autoUpdateEnabled: boolean;
-  /** Auto-update interval in seconds. Backend clamps this to 60..86400. */
+  /** Auto-update interval in seconds. Default 300 (5 min); clamped to
+   *  [60, 86400] by the backend. */
   autoUpdateIntervalSecs: number;
-  /** Content loaded per document-detail page in KiB. */
+  /** Doc-detail page size in KiB: how much content each View-dialog load
+   *  returns. Default 200; clamped to [10, 65536] by the backend. */
   docLoadChunkKb: number;
+  /** Auto-import NEW files appearing in folder/git data sources during
+   *  update checks. Default false — only files selected at import time
+   *  update (removal sync always runs). */
+  sourceSyncAddEnabled: boolean;
+  /** Auto-remove docs whose source file vanished. Default true — off keeps
+   *  docs flagged "lost original" in the UI instead of deleting them. */
+  sourceSyncRemoveEnabled: boolean;
 }
 
 /** Model context window (tokens), read from the model's config.json. */
@@ -378,10 +481,13 @@ export interface RagChunk {
   chunkText: string;
 }
 
-/** A bounded page of document chunks. */
+/** A page of a document's chunks from the backend paginated query (the
+ *  "view chunks" dialog loads 5 at a time, auto-loading more on scroll). */
 export interface RagChunkPage {
   items: RagChunk[];
+  /** Total chunks across all pages (NOT just this page). */
   total: number;
+  /** Index of the first returned chunk (0-based). */
   offset: number;
   pageSize: number;
 }
@@ -404,6 +510,12 @@ export interface RagStatus {
    *  swapped). The frontend must trigger `reindexAll` to re-embed docs with
    *  the new model — old embeddings are gone. */
   needsReindex?: boolean;
+  /** Real embedding dimension of the loaded model (from the GGUF at load
+   *  time). Undefined while nothing is loaded. */
+  embedDim?: number;
+  /** True when the SHARED mv runtime is running (model loaded for any
+   *  consumer — RAG or Smart Routing), not just RAG itself. */
+  mvRunning?: boolean;
 }
 
 /** One selectable model size (scanned from runtimes/rag/model/<family>/<size>/).
@@ -458,6 +570,56 @@ export interface RagDocPage {
 export interface RagPickedFile {
   path: string;
   name: string;
+  /** Bytes (0/undefined if unknown — e.g. single-file picks that skipped the
+   *  folder scan). Used by the import overlay to show a "large file" hint. */
+  size?: number;
+  /** Data-source provenance for this file (kind/label/root/relPath/git) —
+   *  built by the Upload dialog from the active data source + scan group.
+   *  Omitted on legacy paths (backend classifies as "file"). */
+  source?: DocSource;
+}
+
+/** A scan-candidate file with its size, for the grouped folder-scan result
+ *  (the Upload dialog shows sizes + a total in its summary bar). */
+export interface RagScanFile {
+  path: string;
+  name: string;
+  /** Bytes (0 if metadata failed — the file is still listed). */
+  size: number;
+  /** Dir chain relative to the scan root ("/"-separated, "" = root level).
+   *  Carried into the imported doc's DocSource.relPath for the tree view. */
+  relPath?: string;
+  /** Absolute path to check/set in the exclusion registry for this file. For
+   *  folder scans this equals `path`; for git scans the backend re-stamps it
+   *  to the persistent-clone path (the path the doc's originalPath will
+   *  record), so excluding a git file also blocks its future sync re-import.
+   *  Empty for multi-file picks (no root → not part of a sync-able source). */
+  matchPath?: string;
+}
+
+/** One folder group in a recursive folder-scan result: the folder's path
+ *  relative to the scanned root ('' for the root itself) + its import
+ *  candidates. Multi-file picks are folded into a single pseudo-group by the
+ *  frontend, so all entry points share one rendering. */
+export interface RagScanGroup {
+  relPath: string;
+  files: RagScanFile[];
+}
+
+/** Result of a folder scan (recursive or flat) for the Upload dialog's
+ *  grouped tree view. Flat scans return a single root group. */
+export interface RagFolderScan {
+  /** Absolute path of the scanned folder ('' for multi-file picks). */
+  root: string;
+  /** HEAD commit sha of the scanned git clone (git data source only). */
+  commit?: string;
+  /** Sub-directories skipped by folder_ignore.json (recursive only). */
+  skippedDirs: number;
+  /** Candidate files dropped (unsupported ext / binary sniff / over cap). */
+  skippedFiles: number;
+  groups: RagScanGroup[];
+  /** True iff the scan stopped early at the backend candidate cap. */
+  truncated: boolean;
 }
 
 
@@ -498,15 +660,18 @@ export interface ServerConfig {
   idleTimeoutMs?: number; // Milliseconds of inactivity before shutting down (default: 300000 = 5 min)
   tools?: Record<string, { enabled: boolean; description?: string }>; // Tool-specific configurations with enable/disable state and custom descriptions
   prompts?: Record<string, { enabled: boolean; description?: string }>; // Prompt-specific configurations with enable/disable state and custom descriptions
+  resources?: Record<string, { enabled: boolean; description?: string }>; // Resource-specific configurations with enable/disable state and custom descriptions
   options?: {
     timeout?: number; // Request timeout in milliseconds
     resetTimeoutOnProgress?: boolean; // Reset timeout on progress notifications
     maxTotalTimeout?: number; // Maximum total timeout in milliseconds
+    maxBufferSize?: number; // Stdio read buffer limit in bytes
   }; // MCP request options configuration
   // Proxychains4 proxy configuration for STDIO servers (Linux/macOS only, Windows not supported)
   proxy?: ProxychainsConfig;
   // OAuth authentication for upstream MCP servers
   oauth?: {
+    allowInsecureTokenEndpoint?: boolean; // Admin-only HTTP token endpoint exception
     clientId?: string; // OAuth client ID
     clientSecret?: string; // OAuth client secret
     scopes?: string[]; // Required OAuth scopes
@@ -535,6 +700,7 @@ export interface ServerConfig {
     resource?: string; // OAuth resource parameter (RFC8707)
     authorizationEndpoint?: string; // Authorization endpoint (authorization code flow)
     tokenEndpoint?: string; // Token endpoint for exchanging authorization codes for tokens
+    redirectUri?: string; // Preferred redirect URI for authorization requests and registration
     revocationEndpoint?: string; // Token revocation endpoint (RFC 7009)
     pendingAuthorization?: {
       authorizationUrl?: string;
@@ -595,6 +761,11 @@ export interface Server {
   error?: string;
   /** Running version reported by the MCP handshake (stdio servers). */
   version?: string;
+  // Resolved npx/uvx package version + registry update hint for stdio servers
+  // (#1166). Runtime state at the top level, like `version`.
+  packageVersion?: string;
+  latestVersion?: string;
+  updateAvailable?: boolean;
   tools?: Tool[];
   prompts?: Prompt[];
   resources?: Resource[];
@@ -616,6 +787,7 @@ export interface IGroupServerConfig {
   tools?: string[] | 'all'; // Array of specific tool names to include, or 'all' for all tools (default: 'all')
   prompts?: string[] | 'all'; // Array of specific prompt names to include, or 'all' for all prompts (default: 'all')
   resources?: string[] | 'all'; // Array of specific resource URIs to include, or 'all' for all resources (default: 'all')
+  pinnedTools?: string[]; // Tool names listed next to the meta-tools on $smart/<group> (must also be selected in tools)
 }
 
 export interface Group {
@@ -652,6 +824,7 @@ export interface ServerFormData {
     timeout?: number;
     resetTimeoutOnProgress?: boolean;
     maxTotalTimeout?: number;
+    maxBufferSize?: number;
   };
   // Proxychains4 proxy configuration for STDIO servers (Linux/macOS only).
   // Round-tripped from the stored config so an edit does not drop it.
@@ -666,6 +839,7 @@ export interface ServerFormData {
   startOnDemand?: boolean;
   idleTimeoutMs?: number;
   oauth?: {
+    allowInsecureTokenEndpoint?: boolean;
     clientId?: string;
     clientSecret?: string;
     scopes?: string;
@@ -674,6 +848,13 @@ export interface ServerFormData {
     authorizationEndpoint?: string;
     tokenEndpoint?: string;
     resource?: string;
+    // Round-trip-only OAuth sub-fields (#1193). The form has no editors for
+    // them, so the edit/duplicate flows carry the stored values through
+    // `ServerFormData` to the submit payload instead of dropping them.
+    // Note: `dynamicRegistration` is the RFC7591 sub-object (not a boolean).
+    dynamicRegistration?: NonNullable<ServerConfig['oauth']>['dynamicRegistration'];
+    redirectUri?: string;
+    revocationEndpoint?: string;
   };
   // OpenAPI specific fields
   openapi?: {
@@ -1018,6 +1199,7 @@ export interface TemplateServerConfig {
   options?: ServerConfig['options'];
   proxy?: ProxychainsConfig;
   oauth?: {
+    allowInsecureTokenEndpoint?: boolean;
     clientId?: string;
     clientSecret?: string;
     scopes?: string[];

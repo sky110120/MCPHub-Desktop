@@ -26,6 +26,10 @@ tauri = { version = "2", features = [
   "image-png",
   "devtools",
 ] }
+# tauri-plugin-shell intentionally absent: its injected init script opens
+# target=_blank links via pre_exec/double-fork, which crashes in
+# _malloc_fork_child with mimalloc's malloc-zone override on macOS 26.
+# External links use the `open_external_url` command (posix_spawn) instead.
 tauri-plugin-fs = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
@@ -45,7 +49,7 @@ serde_json = "1"
 reqwest = { version = "0.13", features = [
   "json",
   "stream",
-  "rustls-native-certs",
+  "rustls",
   "query",
 ] }
 
@@ -58,6 +62,15 @@ sqlx = { version = "0.9", features = [
   "uuid",
   "chrono",
 ] }
+
+# Git data source (RAG): pure-Rust gitoxide, compiled into the binary (no
+# external git needed). blocking-network-client = synchronous network client
+# (used inside spawn_blocking); worktree-mutation = checkout support.
+gix = { version = "0.73", features = ["blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation"] }
+# HTTP(S) basic-auth over plain http:// (self-hosted GitLab/Gitea on intranets):
+# gix-transport refuses credentials on http by default; this feature flag lifts
+# that guard. Same 0.48 as gix uses -> feature unification applies.
+gix-transport = { version = "0.48", features = ["http-client-insecure-credentials"] }
 
 # Authentication
 # jsonwebtoken 11 requires exactly one CryptoProvider feature (or a manual
@@ -76,6 +89,10 @@ uuid = { version = "1", features = ["v4"] }
 # the feature spec.
 md-5 = "0.10"
 
+# scrypt KDF for the smart-routing toolset hash (origin parity: N=2048, r=8,
+# p=1, 32 bytes over a stable-serialized normalized tool list).
+scrypt = { version = "0.11", default-features = false }
+
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
 
@@ -86,12 +103,17 @@ env_logger = "0.11"
 # Error handling
 thiserror = "2"
 anyhow = "1"
+sha2 = "0.10"
+hex = "0.4"
 
 # OS keychain (secure credential storage)
-keyring = { version = "4", features = ["v1"] }
 
 # HTTP server (expose MCP endpoints when expose_http = true)
 axum = { version = "0.8", features = ["json"] }
+http-body-util = "0.1"
+tower = "0.5"
+tokio-util = "0.7"
+percent-encoding = "2"
 tower-http = { version = "0.7", features = ["cors"] }
 
 # Async trait
@@ -115,7 +137,35 @@ tokio-stream = "0.1"
 # Archive extraction for bundled runtime installation
 flate2 = "1"
 tar = "0.4"
-rmcp-openapi = "0.31"
+rmcp-openapi = "0.32"
+
+# Official MCP SDK (replaces hand-written dispatch_mcp on /mcp; POC verified
+# in AGENTS.md §3.9.2). Macros feature required for rmcp's derive ecosystem;
+# tower feature pulled in by transport-streamable-http-server.
+rmcp = { version = "3.4", features = ["server", "client", "macros", "transport-streamable-http-server", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+http = "1"
+
+# RAG binary office-document import (rag/extract/): pure-Rust extractors,
+# both output Markdown directly.
+pdf_oxide = "0.3"      # PDF -> markdown (default features: icc + legacy-crypto)
+office_oxide = "0.1"   # docx/doc/xlsx/xls/pptx/ppt -> markdown (default features: none)
+# Image decoding for the OCR pipeline (validate uploads, re-encode to PNG for
+# tesseract on Linux). Feature set matches the formats the image OCR strategy
+# accepts; merges with pdf_oxide's image subset into one compilation.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff"] }
+# ZIP container reading (OOXML office files). Promoted from the Windows target
+# section to all platforms with default features off: only the pure-Rust
+# deflate backend (matches office_oxide/pdf_oxide internal declarations for a
+# single compilation; avoids zstd-sys/bzip2/lzma C deps from default features).
+zip = { version = "8", default-features = false, features = ["deflate"] }
+
+# SQLite FTS5 全文检索分词链（2026-09-05）：
+# charabia（Meilisearch 分词器，default = 全语言：中文/日/韩/泰/希伯来/希腊等）+
+# latin camelCase/snake_case 拆分 + pinyin（汉字→全拼/首字母，生成拼音索引列）。
+# 严禁启用 charabia 的 `chinese-normalization-pinyin`（会把中文 lemma 归一成拼音，
+# 破坏 zh 列"存原文词元"的语义）。
+charabia = { version = "0.10", features = ["latin-camelcase", "latin-snakecase"] }
+pinyin = { version = "0.10", features = ["plain"] }
 
 # RAG: embedding inference (tokenizers + candle) + vector DB (lancedb).
 # `default-features = false` avoids the esaxx C++ dependency (the macOS CLT
@@ -172,8 +222,10 @@ libmimalloc-sys = { version = "0.1", features = ["extended"] }
 libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-zip = "8"
 winreg = "0.56"
+# Windows OCR engine (Windows.Media.Ocr, built into the OS) for the RAG
+# image/PDF/Office OCR pipeline. Feature set unlocks the WinRT types used by
+# rag/extract/ocr.rs (engine + bitmap decode + stream plumbing).
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_UI_Shell",
@@ -187,12 +239,30 @@ windows = { version = "0.62", features = [
     # elevation check in lib::win_deelevate (relaunch non-elevated when the
     # NSIS installer auto-launches the app elevated after a per-machine install).
     "Win32_Security",
+    # CoInitializeEx / CoUninitialize apartment init for the WinRT OCR
+    # pipeline (rag/extract/ocr.rs recognize()).
+    "Win32_System_Com",
+    # WinRT OCR pipeline (rag/extract/ocr.rs).
+    "Foundation",
+    "Globalization",
+    "Graphics",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
 ] }
 # Windows RAG embedding is CPU-only (candle has no DirectML EP).
 
 # macOS: set process display name in Dock during dev
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
+# Apple Vision OCR bindings for the RAG image/PDF/Office OCR pipeline
+# (rag/extract/ocr.rs). Pure objc2 header bindings — links the system Vision
+# framework, no extra build toolchain (deliberately NOT a cidre-based crate:
+# cidre's build script requires a full Xcode install, unavailable with
+# CommandLineTools alone).
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-vision = "0.3"
 # candle Metal (GPU) + accelerate (Apple BLAS sgemm) on macOS. The `accelerate`
 # feature makes candle's CPU f32 matmul route through Apple Accelerate (vDSP/
 # AMX) instead of the pure-Rust `gemm` crate - ~2-5x faster for the CPU path
@@ -241,8 +311,13 @@ debug = 1
 
 [profile.release]
 panic = "abort"
-codegen-units = 1
-lto = true
+# ⚠️ hosted runner 内存约束：ubuntu-22.04-arm 仅 4 核 / 16GB 无 swap，
+# `lto = true` + `codegen-units = 1` 的 full-LTO 链接阶段峰值内存会超出
+# 16GB（candle/lancedb/tokenizers 等重依赖），OOM 杀掉 rustc/linker 导致
+# runner "lost communication"。改用 thin-LTO（内存约为 full 的 1/4）+ 并行
+# codegen units，产物体积差距 1-3% 以内。
+codegen-units = 16
+lto = "thin"
 opt-level = "s"
 # ⚠️ 使用 "debuginfo" 而非 true（即 "symbols"）
 # strip = true 会移除 __TAURI_BUNDLE_TYPE 符号，导致 Tauri CLI 无法注入 bundle 类型信息
